@@ -1,6 +1,5 @@
 # =============================================================================
-# BLUESTAR IRONCLAD v2026 – Version corrigée et fonctionnelle
-# Conservatoire du style visuel sombre / bleu / vert / rouge des versions précédentes
+# BLUESTAR SCANNER - Version corrigée et stable - Décembre 2025
 # =============================================================================
 
 import streamlit as st
@@ -12,17 +11,17 @@ import logging
 from datetime import datetime
 
 # =============================================================================
-# CONFIGURATION PAGE & STYLE (très proche des versions précédentes)
+# CONFIGURATION PAGE & STYLE
 # =============================================================================
 
 st.set_page_config(
-    page_title="Bluestar Ironclad 2026",
+    page_title="Bluestar Scanner",
     layout="wide",
-    page_icon="🛡️",
+    page_icon="📈",
     initial_sidebar_state="expanded"
 )
 
-# Style inspiré des versions précédentes (sombre + gradient bleu + badges)
+# Style sombre inspiré des versions précédentes
 st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
@@ -31,34 +30,35 @@ st.markdown("""
         background-color: #0f1117;
         background-image: radial-gradient(at 50% 0%, #1f2937 0%, #0f1117 70%);
     }
-    .main .block-container { max-width: 1100px; padding-top: 1.5rem; }
+    .main .block-container { max-width: 1100px; padding-top: 1.8rem; }
     h1 {
         background: linear-gradient(90deg, #00d2ff 0%, #3a7bd5 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
-        font-weight: 900; font-size: 2.6em; text-align: center;
+        font-weight: 900; font-size: 2.7em; text-align: center;
+        margin-bottom: 0.4em;
     }
     .stButton>button {
+        width: 100%; border-radius: 8px; height: 3em;
         background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%);
-        color: white; border-radius: 8px; font-weight: 600;
+        color: white; font-weight: 600; border: none;
     }
-    .metric-box {
-        background: rgba(30,41,59,0.6);
+    .metric-container {
+        background: rgba(30,41,59,0.65);
         border: 1px solid #334155;
         border-radius: 8px;
-        padding: 12px;
-        text-align: center;
+        padding: 14px;
+        margin: 8px 0;
     }
-    .signal-buy  { border-left: 5px solid #10b981; background: rgba(16,185,129,0.08); }
-    .signal-sell { border-left: 5px solid #ef4444; background: rgba(239,68,68,0.08); }
+    .buy-side   { border-left: 5px solid #10b981; }
+    .sell-side  { border-left: 5px solid #ef4444; }
     .badge {
         padding: 4px 10px;
         border-radius: 6px;
-        font-size: 0.78em;
+        font-size: 0.82em;
         font-weight: 600;
-        margin: 0 4px;
+        margin-left: 8px;
         color: white;
-        display: inline-block;
     }
     .badge-high { background: #10b981; }
     .badge-med  { background: #f59e0b; }
@@ -68,7 +68,7 @@ st.markdown("""
 logging.basicConfig(level=logging.INFO)
 
 # =============================================================================
-# CLIENT OANDA - corrigé
+# CLIENT OANDA - Version sans problème de hash pour Streamlit cache
 # =============================================================================
 
 class OandaClient:
@@ -79,18 +79,21 @@ class OandaClient:
                 environment=st.secrets.get("OANDA_ENVIRONMENT", "practice")
             )
         except Exception as e:
-            st.error(f"Configuration API Oanda invalide : {e}")
+            st.error(f"Erreur de configuration API Oanda : {str(e)}")
             st.stop()
 
-    @st.cache_data(ttl=90, show_spinner=False)
-    def get_candles(self, instrument, granularity, count=300):
+    # Méthode clé : utilisation de _self pour contourner le problème de hash
+    @st.cache_data(ttl=120, show_spinner=False)
+    def get_candles(_self, instrument: str, granularity: str, count: int = 300) -> pd.DataFrame:
+        self = _self  # Liaison explicite avec l'instance
         params = {"count": count, "granularity": granularity, "price": "M"}
         r = instruments.InstrumentsCandles(instrument=instrument, params=params)
+        
         try:
             self.client.request(r)
             data = []
-            for candle in r.response["candles"]:
-                if candle["complete"]:
+            for candle in r.response.get("candles", []):
+                if candle.get("complete"):
                     data.append({
                         "time": pd.to_datetime(candle["time"]),
                         "o": float(candle["mid"]["o"]),
@@ -101,155 +104,148 @@ class OandaClient:
                     })
             if not data:
                 return pd.DataFrame()
-            df = pd.DataFrame(data).set_index("time")
-            return df
+            return pd.DataFrame(data).set_index("time")
+            
         except Exception as e:
             logging.warning(f"Erreur récupération {instrument} {granularity}: {str(e)}")
             return pd.DataFrame()
 
 
-# Liste d'actifs (réduite pour plus de stabilité)
-ASSETS = [
+# Instruments surveillés (liste raisonnable)
+INSTRUMENTS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD",
     "NZD_USD", "USD_CHF", "EUR_JPY", "GBP_JPY", "XAU_USD"
 ]
 
 # =============================================================================
-# INDICATEURS DE BASE
+# Indicateurs de base
 # =============================================================================
 
-def atr(df, period=14):
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
     tr = np.maximum(df["h"] - df["l"],
-                    np.maximum(abs(df["h"] - df["c"].shift()),
-                               abs(df["l"] - df["c"].shift())))
+                   np.maximum(abs(df["h"] - df["c"].shift()),
+                             abs(df["l"] - df["c"].shift())))
     return tr.ewm(span=period, adjust=False).mean().iloc[-1]
 
 
-def rsi(series, period=14):
+def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0).ewm(com=period-1, min_periods=period).mean()
     loss = -delta.clip(upper=0).ewm(com=period-1, min_periods=period).mean()
-    rs = gain / loss
+    rs = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 
-def obv_strength(df):
-    obv = (np.sign(df["c"].diff()) * df["v"]).fillna(0).cumsum()
-    return (obv.iloc[-1] - obv.iloc[-40]) / (obv.iloc[-40:].std() + 1e-9)
-
-
 # =============================================================================
-# LOGIQUE PRINCIPALE DE SIGNAL
+# Logique de détection de signal (version simplifiée mais robuste)
 # =============================================================================
 
-def evaluate_signal(client, instrument):
+def detect_signal(client: OandaClient, instrument: str) -> dict | None:
     try:
-        df_M15 = client.get_candles(instrument, "M15", 250)
-        df_H4  = client.get_candles(instrument, "H4",  120)
-        df_D1  = client.get_candles(instrument, "D",   300)
+        df_m15 = client.get_candles(instrument, "M15", 250)
+        df_h4  = client.get_candles(instrument, "H4",  120)
 
-        if len(df_M15) < 100 or len(df_H4) < 60 or len(df_D1) < 100:
+        if len(df_m15) < 100 or len(df_h4) < 60:
             return None
 
-        # Alignement multi-timeframe
-        trend_D1 = df_D1["c"].iloc[-1] > df_D1["c"].ewm(span=50).mean().iloc[-1]
-        trend_H4 = df_H4["c"].iloc[-1] > df_H4["c"].ewm(span=34).mean().iloc[-1]
+        # Alignement de tendance multi-timeframe
+        trend_h4 = df_h4["c"].iloc[-1] > df_h4["c"].ewm(span=34).mean().iloc[-1]
 
-        if trend_D1 != trend_H4:
+        # Déclencheur RSI M15
+        rsi = calculate_rsi(df_m15["c"])
+        if len(rsi) < 3:
             return None
 
-        # Déclencheur RSI + OBV
-        rsi15 = rsi(df_M15["c"])
-        rsi_cross_up   = (rsi15.iloc[-2] < 45) and (rsi15.iloc[-1] >= 55)
-        rsi_cross_down = (rsi15.iloc[-2] > 55) and (rsi15.iloc[-1] <= 45)
+        rsi_cross_up   = (rsi.iloc[-2] < 45) and (rsi.iloc[-1] >= 55)
+        rsi_cross_down = (rsi.iloc[-2] > 55) and (rsi.iloc[-1] <= 45)
 
         if not (rsi_cross_up or rsi_cross_down):
             return None
 
         direction = "BUY" if rsi_cross_up else "SELL"
-        if direction == "BUY" and not trend_D1:
-            return None
-        if direction == "SELL" and trend_D1:
-            return None
 
-        obv_str = obv_strength(df_M15)
-        if abs(obv_str) < 1.4:
+        # Filtre de cohérence avec la tendance H4
+        if (direction == "BUY" and not trend_h4) or (direction == "SELL" and trend_h4):
             return None
 
-        price = df_M15["c"].iloc[-1]
-        atr_val = atr(df_M15)
+        price = float(df_m15["c"].iloc[-1])
+        atr   = calculate_atr(df_m15)
 
-        conviction = min(0.92, 0.65 + abs(obv_str)*0.12)
+        confidence = 0.72 + (abs(rsi.iloc[-1] - 50) / 80) * 0.18
+        confidence = min(0.94, confidence)
 
         return {
             "instrument": instrument,
             "direction": direction,
             "price": round(price, 5),
-            "conviction": round(conviction, 3),
-            "time": df_M15.index[-1],
-            "atr_pct": round(atr_val / price * 100, 2),
-            "sl": round(price - atr_val * 1.7 if direction=="BUY" else price + atr_val * 1.7, 5),
-            "tp": round(price + atr_val * 3.6 if direction=="BUY" else price - atr_val * 3.6, 5)
+            "confidence": round(confidence, 3),
+            "time": df_m15.index[-1],
+            "atr_pct": round(atr / price * 100, 2),
+            "sl": round(price - atr * 1.65 if direction == "BUY" else price + atr * 1.65, 5),
+            "tp": round(price + atr * 3.5 if direction == "BUY" else price - atr * 3.5, 5)
         }
 
     except Exception as e:
-        logging.error(f"Erreur traitement {instrument}: {str(e)}")
+        logging.error(f"Erreur analyse {instrument}: {str(e)}")
         return None
 
 
 # =============================================================================
-# INTERFACE
+# INTERFACE PRINCIPALE
 # =============================================================================
 
 def main():
-    st.title("🛡️ Bluestar Ironclad Scanner")
+    st.title("Bluestar Market Scanner")
 
     client = OandaClient()
 
-    col_left, col_right = st.columns([7,3])
+    col_config, col_info = st.columns([6, 4])
+    with col_config:
+        min_confidence = st.slider(
+            "Confiance minimale affichée (%)",
+            65, 94, 74, 1
+        ) / 100.0
 
-    with col_left:
-        min_conv = st.slider("Confiance minimale affichée (%)", 65, 92, 74, 1) / 100.0
+    with col_info:
+        st.caption(f"Dernière actualisation : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
-    with col_right:
-        st.caption(f"Dernière mise à jour : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
-
-    if st.button("Lancer l'analyse complète", type="primary"):
-        with st.spinner("Analyse des instruments en cours..."):
+    if st.button("Analyser le marché", type="primary"):
+        with st.spinner("Analyse en cours..."):
             signals = []
-            progress = st.progress(0)
-            for i, instr in enumerate(ASSETS):
-                signal = evaluate_signal(client, instr)
-                if signal and signal["conviction"] >= min_conv:
-                    signals.append(signal)
-                progress.progress((i+1) / len(ASSETS))
+            progress_bar = st.progress(0)
 
-        signals.sort(key=lambda x: -x["conviction"])
+            for i, instr in enumerate(INSTRUMENTS):
+                signal = detect_signal(client, instr)
+                if signal and signal["confidence"] >= min_confidence:
+                    signals.append(signal)
+                progress_bar.progress((i + 1) / len(INSTRUMENTS))
 
         if not signals:
-            st.info("Aucun signal de qualité détecté pour le moment.")
+            st.info("Aucun signal atteignant le seuil de confiance actuel.")
             return
 
-        st.success(f"{len(signals)} signal{'s' if len(signals)>1 else ''} détecté{'s' if len(signals)>1 else ''}")
+        st.success(f"{len(signals)} signal{'s' if len(signals) > 1 else ''} détecté{'s' if len(signals) > 1 else ''}")
+
+        signals.sort(key=lambda x: -x["confidence"])
 
         for s in signals:
-            css = "signal-buy" if s["direction"] == "BUY" else "signal-sell"
-            badge_class = "badge-high" if s["conviction"] >= 0.85 else "badge-med"
+            side_class = "buy-side" if s["direction"] == "BUY" else "sell-side"
+            badge_class = "badge-high" if s["confidence"] >= 0.85 else "badge-med"
 
             with st.container():
                 st.markdown(f"""
-                <div class="metric-box {css}">
-                    <strong>{s['instrument']}  {s['direction']}</strong><br>
+                <div class="metric-container {side_class}">
+                    <strong>{s['instrument']} {s['direction']}</strong><br>
                     Prix : {s['price']:.5f}  
-                    <span class="badge {badge_class}">{int(s['conviction']*100)}%</span>
+                    <span class="badge {badge_class}">{int(s['confidence']*100)}%</span>
                       ATR : {s['atr_pct']}%
                 </div>
                 """, unsafe_allow_html=True)
 
-                cols = st.columns(4)
+                cols = st.columns([1,1,1,1])
                 cols[0].metric("Stop Loss", f"{s['sl']:.5f}")
                 cols[1].metric("Take Profit", f"{s['tp']:.5f}")
-                cols[2].metric("Ratio R:R", f"{abs((s['tp']-s['price'])/(s['price']-s['sl'])):.1f}")
+                cols[2].metric("R:R", f"{abs((s['tp']-s['price'])/(s['price']-s['sl'])):.1f}")
                 cols[3].metric("Heure", s["time"].strftime("%H:%M"))
 
                 st.markdown("---")
