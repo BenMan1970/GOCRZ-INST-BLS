@@ -1,7 +1,6 @@
 # =============================================================================
-# BLUESTAR IRONCLAD v2026 – Scanner institutionnel robuste
-# Objectif : Signaux de haute qualité, faible fréquence, forte asymétrie espérée
-# Philosophie : Moins de signaux, beaucoup plus filtrés – prioriser la robustesse
+# BLUESTAR IRONCLAD v2026 – Version corrigée et fonctionnelle
+# Conservatoire du style visuel sombre / bleu / vert / rouge des versions précédentes
 # =============================================================================
 
 import streamlit as st
@@ -10,37 +9,66 @@ import numpy as np
 import oandapyV20
 import oandapyV20.endpoints.instruments as instruments
 import logging
-from datetime import datetime, timedelta
-from scipy import stats
+from datetime import datetime
 
 # =============================================================================
-# CONFIGURATION GLOBALE & STYLE
+# CONFIGURATION PAGE & STYLE (très proche des versions précédentes)
 # =============================================================================
 
-st.set_page_config(page_title="Bluestar Ironclad 2026", layout="wide", page_icon="🛡️")
+st.set_page_config(
+    page_title="Bluestar Ironclad 2026",
+    layout="wide",
+    page_icon="🛡️",
+    initial_sidebar_state="expanded"
+)
 
-logging.basicConfig(level=logging.INFO)
-
-# Style minimaliste professionnel – sombre & lisible
+# Style inspiré des versions précédentes (sombre + gradient bleu + badges)
 st.markdown("""
     <style>
-    .stApp { background-color: #0d1117; }
+    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
+    * { font-family: 'Roboto', sans-serif; }
+    .stApp {
+        background-color: #0f1117;
+        background-image: radial-gradient(at 50% 0%, #1f2937 0%, #0f1117 70%);
+    }
     .main .block-container { max-width: 1100px; padding-top: 1.5rem; }
-    h1, h2, h3 { color: #e6edf3; }
-    .metric-box { 
-        background: #161b22; 
-        border: 1px solid #30363d; 
-        border-radius: 8px; 
-        padding: 12px 16px;
+    h1 {
+        background: linear-gradient(90deg, #00d2ff 0%, #3a7bd5 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: 900; font-size: 2.6em; text-align: center;
+    }
+    .stButton>button {
+        background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%);
+        color: white; border-radius: 8px; font-weight: 600;
+    }
+    .metric-box {
+        background: rgba(30,41,59,0.6);
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 12px;
         text-align: center;
     }
-    .signal-buy  { border-left: 5px solid #238636; background: rgba(35,134,54,0.12); }
-    .signal-sell { border-left: 5px solid #da2e2e; background: rgba(218,46,46,0.12); }
+    .signal-buy  { border-left: 5px solid #10b981; background: rgba(16,185,129,0.08); }
+    .signal-sell { border-left: 5px solid #ef4444; background: rgba(239,68,68,0.08); }
+    .badge {
+        padding: 4px 10px;
+        border-radius: 6px;
+        font-size: 0.78em;
+        font-weight: 600;
+        margin: 0 4px;
+        color: white;
+        display: inline-block;
+    }
+    .badge-high { background: #10b981; }
+    .badge-med  { background: #f59e0b; }
     </style>
 """, unsafe_allow_html=True)
 
+logging.basicConfig(level=logging.INFO)
+
 # =============================================================================
-# CLÉ API OANDA & CACHE
+# CLIENT OANDA - corrigé
 # =============================================================================
 
 class OandaClient:
@@ -51,11 +79,11 @@ class OandaClient:
                 environment=st.secrets.get("OANDA_ENVIRONMENT", "practice")
             )
         except Exception as e:
-            st.error(f"Erreur configuration API Oanda : {e}")
+            st.error(f"Configuration API Oanda invalide : {e}")
             st.stop()
 
-    @st.cache_data(ttl=60, show_spinner=False)
-    def get_candles(_self, instrument, granularity, count=300):
+    @st.cache_data(ttl=90, show_spinner=False)
+    def get_candles(self, instrument, granularity, count=300):
         params = {"count": count, "granularity": granularity, "price": "M"}
         r = instruments.InstrumentsCandles(instrument=instrument, params=params)
         try:
@@ -71,21 +99,23 @@ class OandaClient:
                         "c": float(candle["mid"]["c"]),
                         "v": int(candle["volume"])
                     })
+            if not data:
+                return pd.DataFrame()
             df = pd.DataFrame(data).set_index("time")
             return df
         except Exception as e:
-            logging.warning(f"Erreur récupération {instrument} {granularity}: {e}")
+            logging.warning(f"Erreur récupération {instrument} {granularity}: {str(e)}")
             return pd.DataFrame()
 
 
+# Liste d'actifs (réduite pour plus de stabilité)
 ASSETS = [
-    "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "NZD_USD", "USD_CHF",
-    "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_AUD", "GBP_JPY", "AUD_JPY", "XAU_USD"
-    # On réduit volontairement le nombre d'instruments pour limiter le bruit
+    "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD",
+    "NZD_USD", "USD_CHF", "EUR_JPY", "GBP_JPY", "XAU_USD"
 ]
 
 # =============================================================================
-# FONCTIONS TECHNIQUES DE BASE – Version 2026 simplifiée & robuste
+# INDICATEURS DE BASE
 # =============================================================================
 
 def atr(df, period=14):
@@ -97,178 +127,133 @@ def atr(df, period=14):
 
 def rsi(series, period=14):
     delta = series.diff()
-    gain = delta.where(delta > 0, 0).ewm(com=period-1, min_periods=period).mean()
-    loss = -delta.where(delta < 0, 0).ewm(com=period-1, min_periods=period).mean()
+    gain = delta.clip(lower=0).ewm(com=period-1, min_periods=period).mean()
+    loss = -delta.clip(upper=0).ewm(com=period-1, min_periods=period).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
 
-def obv_trend_strength(df, period=34):
-    """Simple mais efficace : force directionnelle du OBV"""
+def obv_strength(df):
     obv = (np.sign(df["c"].diff()) * df["v"]).fillna(0).cumsum()
-    return (obv.iloc[-1] - obv.iloc[-period]) / (obv.rolling(period).std().iloc[-1] + 1e-8)
-
-
-def currency_strength_rank(client, timeframe="H4", lookback_days=3):
-    """Ranking relatif très simple mais robuste des devises"""
-    pairs = ["EUR_USD","GBP_USD","AUD_USD","NZD_USD","USD_JPY","USD_CHF","USD_CAD"]
-    changes = {}
-    
-    for pair in pairs:
-        df = client.get_candles(pair, timeframe, 100)
-        if len(df) < 20: continue
-        start = df["c"].iloc[-lookback_days*6]   # approx 6 bougies H4 / jour
-        end   = df["c"].iloc[-1]
-        chg   = (end / start - 1) * 100
-        base, quote = pair.split("_")
-        changes[base]  = changes.get(base, 0) + chg
-        changes[quote] = changes.get(quote, 0) - chg
-    
-    if not changes: return {}
-    scores = pd.Series(changes).sort_values(ascending=False)
-    ranks  = scores.rank(pct=True)
-    return ranks.to_dict()
+    return (obv.iloc[-1] - obv.iloc[-40]) / (obv.iloc[-40:].std() + 1e-9)
 
 
 # =============================================================================
-# LOGIQUE DE SIGNAL – Version "Ironclad" 2026
+# LOGIQUE PRINCIPALE DE SIGNAL
 # =============================================================================
 
-def evaluate_setup(client, instrument):
-    """
-    Critères stricts, faible fréquence attendue (8-25 setups/mois tous instruments)
-    """
+def evaluate_signal(client, instrument):
     try:
-        df_M15 = client.get_candles(instrument, "M15", 300)
-        df_H4  = client.get_candles(instrument, "H4",  200)
-        df_D1  = client.get_candles(instrument, "D",   400)
-        
-        if len(df_M15) < 120 or len(df_H4) < 80 or len(df_D1) < 150:
+        df_M15 = client.get_candles(instrument, "M15", 250)
+        df_H4  = client.get_candles(instrument, "H4",  120)
+        df_D1  = client.get_candles(instrument, "D",   300)
+
+        if len(df_M15) < 100 or len(df_H4) < 60 or len(df_D1) < 100:
             return None
 
-        # 1. Filtre de tendance multi-timeframe (le plus discriminant historiquement)
-        trend_D1  = df_D1["c"].iloc[-1] > df_D1["c"].ewm(span=50).mean().iloc[-1]
-        trend_H4  = df_H4["c"].iloc[-1] > df_H4["c"].ewm(span=34).mean().iloc[-1]
-        mtf_align = trend_D1 == trend_H4
+        # Alignement multi-timeframe
+        trend_D1 = df_D1["c"].iloc[-1] > df_D1["c"].ewm(span=50).mean().iloc[-1]
+        trend_H4 = df_H4["c"].iloc[-1] > df_H4["c"].ewm(span=34).mean().iloc[-1]
 
-        if not mtf_align:
+        if trend_D1 != trend_H4:
             return None
 
-        # 2. Momentum court + absorption (OBV)
-        rsi_M15   = rsi(df_M15["c"], 14)
-        rsi_cross = (rsi_M15.iloc[-2] < 45) & (rsi_M15.iloc[-1] >= 55)  # zone de sortie range
-        
-        obv_strength = obv_trend_strength(df_M15)
-        absorption   = abs(obv_strength) > 1.8
+        # Déclencheur RSI + OBV
+        rsi15 = rsi(df_M15["c"])
+        rsi_cross_up   = (rsi15.iloc[-2] < 45) and (rsi15.iloc[-1] >= 55)
+        rsi_cross_down = (rsi15.iloc[-2] > 55) and (rsi15.iloc[-1] <= 45)
 
-        if not (rsi_cross and absorption):
+        if not (rsi_cross_up or rsi_cross_down):
             return None
 
-        # 3. Contexte de force relative des devises (ranking 72h)
-        cs_rank = currency_strength_rank(client)
-        if not cs_rank:
+        direction = "BUY" if rsi_cross_up else "SELL"
+        if direction == "BUY" and not trend_D1:
             return None
-            
-        base, quote = instrument.split("_")
-        base_rank  = cs_rank.get(base, 0.5)
-        quote_rank = cs_rank.get(quote, 0.5)
-        
-        direction = "LONG" if base_rank > quote_rank + 0.25 else "SHORT"
-        if direction == "LONG" and not trend_D1:   return None
-        if direction == "SHORT" and trend_D1:     return None
-
-        # 4. Volatilité suffisante + non-compression extrême
-        atr_pct = atr(df_H4) / df_H4["c"].iloc[-1] * 100
-        if atr_pct < 0.45 or atr_pct > 3.2:   # on évite les extrêmes
+        if direction == "SELL" and trend_D1:
             return None
 
-        # Score de confiance final (approche logistique simplifiée)
-        conviction = 0.0
-        conviction += 0.40 if mtf_align else -0.3
-        conviction += 0.28 * (obv_strength * (1 if direction=="LONG" else -1))
-        conviction += 0.22 * (base_rank - quote_rank - 0.25) * 4  # normalisation
-        conviction = np.clip(conviction, 0, 1)
-
-        # Conversion en probabilité perçue (calibrée sur backtests 2018-2025)
-        prob = 1 / (1 + np.exp(-8.2 * (conviction - 0.58)))
-
-        if prob < 0.68:
+        obv_str = obv_strength(df_M15)
+        if abs(obv_str) < 1.4:
             return None
 
         price = df_M15["c"].iloc[-1]
         atr_val = atr(df_M15)
+
+        conviction = min(0.92, 0.65 + abs(obv_str)*0.12)
 
         return {
             "instrument": instrument,
             "direction": direction,
             "price": round(price, 5),
             "conviction": round(conviction, 3),
-            "prob": round(prob, 3),
-            "atr_pct": round(atr_pct, 2),
-            "cs_base":  round(base_rank, 2),
-            "cs_quote": round(quote_rank, 2),
             "time": df_M15.index[-1],
-            "sl": round(price - atr_val * 1.6 if direction=="LONG" else price + atr_val * 1.6, 5),
-            "tp": round(price + atr_val * 3.4 if direction=="LONG" else price - atr_val * 3.4, 5)
+            "atr_pct": round(atr_val / price * 100, 2),
+            "sl": round(price - atr_val * 1.7 if direction=="BUY" else price + atr_val * 1.7, 5),
+            "tp": round(price + atr_val * 3.6 if direction=="BUY" else price - atr_val * 3.6, 5)
         }
 
     except Exception as e:
-        logging.error(f"Erreur traitement {instrument}: {e}")
+        logging.error(f"Erreur traitement {instrument}: {str(e)}")
         return None
 
 
 # =============================================================================
-# INTERFACE PRINCIPALE
+# INTERFACE
 # =============================================================================
 
 def main():
-    st.title("🛡️ Bluestar Ironclad – Scanner 2026")
+    st.title("🛡️ Bluestar Ironclad Scanner")
 
     client = OandaClient()
 
-    col1, col2, col3 = st.columns([3,2,2])
-    with col1:
-        min_prob = st.slider("Confiance minimale affichée", 68, 92, 74, 2) / 100
-    with col2:
-        auto_refresh = st.checkbox("Rafraîchissement auto (toutes les 5 min)", value=False)
-    with col3:
-        st.caption(f"Dernier scan : {datetime.now().strftime('%H:%M:%S')}")
+    col_left, col_right = st.columns([7,3])
 
-    if st.button("Lancer le scan maintenant", type="primary") or auto_refresh:
-        with st.spinner("Scan des instruments prioritaires..."):
-            results = []
-            for instr in ASSETS:
-                signal = evaluate_setup(client, instr)
-                if signal and signal["prob"] >= min_prob:
-                    results.append(signal)
+    with col_left:
+        min_conv = st.slider("Confiance minimale affichée (%)", 65, 92, 74, 1) / 100.0
 
-        results.sort(key=lambda x: -x["prob"])
+    with col_right:
+        st.caption(f"Dernière mise à jour : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
-        if not results:
-            st.info("Aucun setup de qualité détecté pour le moment.")
-        else:
-            st.success(f"{len(results)} setup(s) de haute qualité détecté(s)")
+    if st.button("Lancer l'analyse complète", type="primary"):
+        with st.spinner("Analyse des instruments en cours..."):
+            signals = []
+            progress = st.progress(0)
+            for i, instr in enumerate(ASSETS):
+                signal = evaluate_signal(client, instr)
+                if signal and signal["conviction"] >= min_conv:
+                    signals.append(signal)
+                progress.progress((i+1) / len(ASSETS))
 
-            for sig in results:
-                css_class = "signal-buy" if sig["direction"] == "LONG" else "signal-sell"
-                with st.container():
-                    st.markdown(f"""
-                    <div class="metric-box {css_class}">
-                        <strong>{sig["instrument"]} • {sig["direction"]}</strong><br>
-                        Prix : {sig["price"]:.5f}  
-                        | Conviction : {sig["prob"]:.1%}  
-                        | ATR : {sig["atr_pct"]}%  
-                    </div>
-                    """, unsafe_allow_html=True)
+        signals.sort(key=lambda x: -x["conviction"])
 
-                    cols = st.columns([1,1,1,1])
-                    cols[0].metric("Stop", f"{sig['sl']:.5f}")
-                    cols[1].metric("Target", f"{sig['tp']:.5f}")
-                    cols[2].metric("R:R", f"{(abs(sig['tp']-sig['price'])/abs(sig['price']-sig['sl'])):.1f}")
-                    cols[3].metric("CS écart", f"{abs(sig['cs_base'] - sig['cs_quote']):.2f}")
+        if not signals:
+            st.info("Aucun signal de qualité détecté pour le moment.")
+            return
 
-                    st.caption(f"→ {sig['time'].strftime('%Y-%m-%d %H:%M UTC')}")
-                    st.markdown("---")
+        st.success(f"{len(signals)} signal{'s' if len(signals)>1 else ''} détecté{'s' if len(signals)>1 else ''}")
+
+        for s in signals:
+            css = "signal-buy" if s["direction"] == "BUY" else "signal-sell"
+            badge_class = "badge-high" if s["conviction"] >= 0.85 else "badge-med"
+
+            with st.container():
+                st.markdown(f"""
+                <div class="metric-box {css}">
+                    <strong>{s['instrument']}  {s['direction']}</strong><br>
+                    Prix : {s['price']:.5f}  
+                    <span class="badge {badge_class}">{int(s['conviction']*100)}%</span>
+                      ATR : {s['atr_pct']}%
+                </div>
+                """, unsafe_allow_html=True)
+
+                cols = st.columns(4)
+                cols[0].metric("Stop Loss", f"{s['sl']:.5f}")
+                cols[1].metric("Take Profit", f"{s['tp']:.5f}")
+                cols[2].metric("Ratio R:R", f"{abs((s['tp']-s['price'])/(s['price']-s['sl'])):.1f}")
+                cols[3].metric("Heure", s["time"].strftime("%H:%M"))
+
+                st.markdown("---")
+
 
 if __name__ == "__main__":
     main()
