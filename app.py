@@ -1,293 +1,295 @@
-# =============================================================================
-# BLUESTAR SCANNER - Version Réparée - Janvier 2026
-# =============================================================================
+# ============================================================
+# BLUESTAR ULTIMATE V4 — INSTITUTIONAL FINAL (OPTIMIZED)
+# ============================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import oandapyV20
 import oandapyV20.endpoints.instruments as instruments
-from oandapyV20 import API
 import logging
 from datetime import datetime
+from scipy import stats
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# =============================================================================
-# CONFIGURATION PAGE & STYLE
-# =============================================================================
+# ============================================================
+# CONFIGURATION & UI
+# ============================================================
 
 st.set_page_config(
-    page_title="Bluestar Scanner",
-    layout="wide",
-    page_icon="📈",
-    initial_sidebar_state="expanded"
+    page_title="Bluestar Ultimate V4 [Speed]",
+    layout="centered",
+    page_icon="⚡"
 )
-
-# Style CSS amélioré
-st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
-    * { font-family: 'Roboto', sans-serif; }
-    .stApp {
-        background-color: #0f1117;
-        background-image: radial-gradient(at 50% 0%, #1f2937 0%, #0f1117 70%);
-    }
-    .main .block-container { max-width: 1100px; padding-top: 2rem; }
-    h1 {
-        background: linear-gradient(90deg, #00d2ff 0%, #3a7bd5 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        font-weight: 900; font-size: 2.5em; text-align: center;
-        margin-bottom: 1rem;
-    }
-    div.stButton > button {
-        width: 100%; border-radius: 8px; height: 3.5em;
-        background: linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%);
-        color: white; font-weight: 600; border: none;
-        transition: transform 0.1s;
-    }
-    div.stButton > button:hover { transform: scale(1.02); }
-    
-    .metric-box {
-        background: rgba(30,41,59,0.7);
-        border: 1px solid #334155;
-        border-radius: 10px;
-        padding: 15px;
-        margin-bottom: 10px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-    }
-    .buy-border { border-left: 5px solid #10b981; }
-    .sell-border { border-left: 5px solid #ef4444; }
-    
-    .signal-header { font-size: 1.2em; font-weight: bold; color: #e2e8f0; }
-    .badge {
-        padding: 3px 8px; border-radius: 4px; font-size: 0.8em; font-weight: bold; margin-left: 10px; color: #fff; vertical-align: middle;
-    }
-    .bg-green { background-color: #10b981; }
-    .bg-orange { background-color: #f59e0b; }
-    .bg-red { background-color: #ef4444; }
-    </style>
-""", unsafe_allow_html=True)
 
 logging.basicConfig(level=logging.INFO)
 
-# =============================================================================
-# GESTION API OANDA (Optimisé pour Streamlit)
-# =============================================================================
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700;900&display=swap');
+* { font-family: 'Roboto', sans-serif; }
+.stApp {
+    background-color: #0f1117;
+    background-image: radial-gradient(at 50% 0%, #1f2937 0%, #0f1117 70%);
+}
+.metric-card {
+    background-color: #1e293b;
+    border-radius: 10px;
+    padding: 15px;
+    border: 1px solid #334155;
+    margin-bottom: 10px;
+}
+h1 {
+    background: linear-gradient(90deg, #00d2ff 0%, #3a7bd5 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-weight: 900; font-size: 2.5em; text-align: center;
+}
+</style>
+""", unsafe_allow_html=True)
 
-@st.cache_resource
-def get_oanda_client():
-    """Crée une connexion persistante à l'API Oanda."""
-    try:
-        # Vérification de la présence des secrets
-        if "OANDA_ACCESS_TOKEN" not in st.secrets:
-            st.error("⚠️ Clé API manquante ! Veuillez configurer .streamlit/secrets.toml")
-            st.stop()
-            
-        token = st.secrets["OANDA_ACCESS_TOKEN"]
-        env = st.secrets.get("OANDA_ENVIRONMENT", "practice")
-        return API(access_token=token, environment=env)
-    except Exception as e:
-        st.error(f"Erreur de connexion Oanda : {str(e)}")
-        return None
+# ============================================================
+# DATA ENGINE (CACHED & OPTIMIZED)
+# ============================================================
+
+# On initialise le client une seule fois au niveau global si possible, 
+# ou on recrée léger à chaque appel pour éviter les conflits de threads.
+TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
+ENV = st.secrets.get("OANDA_ENVIRONMENT", "practice")
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_candles(_client, instrument: str, granularity: str, count: int = 300) -> pd.DataFrame:
-    """Récupère les bougies. L'argument _client est ignoré par le hash (underscore)."""
-    if _client is None:
-        return pd.DataFrame()
-        
-    params = {"count": count, "granularity": granularity, "price": "M"}
-    r = instruments.InstrumentsCandles(instrument=instrument, params=params)
-    
+def fetch_candles_optimized(instrument, granularity, count):
+    """Récupère les bougies avec cache natif Streamlit (60s)"""
     try:
-        _client.request(r)
+        client = oandapyV20.API(access_token=TOKEN, environment=ENV)
+        params = {"count": count, "granularity": granularity, "price": "M"}
+        r = instruments.InstrumentsCandles(instrument=instrument, params=params)
+        client.request(r)
+
         data = []
-        for candle in r.response.get("candles", []):
-            if candle.get("complete"):
+        for c in r.response["candles"]:
+            if c["complete"]:
+                mid = c["mid"]
                 data.append({
-                    "time": pd.to_datetime(candle["time"]),
-                    "o": float(candle["mid"]["o"]),
-                    "h": float(candle["mid"]["h"]),
-                    "l": float(candle["mid"]["l"]),
-                    "c": float(candle["mid"]["c"]),
-                    "v": int(candle["volume"])
+                    "time": c["time"], # On garde en string pour perf, converti si besoin
+                    "open": float(mid["o"]),
+                    "high": float(mid["h"]),
+                    "low": float(mid["l"]),
+                    "close": float(mid["c"]),
+                    "volume": int(c["volume"])
                 })
-        if not data:
-            return pd.DataFrame()
-        return pd.DataFrame(data).set_index("time")
         
+        df = pd.DataFrame(data)
+        return df
     except Exception as e:
-        logging.warning(f"Erreur data {instrument} {granularity}: {str(e)}")
+        logging.error(f"Error fetching {instrument} {granularity}: {e}")
         return pd.DataFrame()
 
-# Liste des instruments Forex majeurs
-INSTRUMENTS = [
-    "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD",
-    "NZD_USD", "USD_CHF", "EUR_JPY", "GBP_JPY", "XAU_USD"
+# ============================================================
+# ASSETS
+# ============================================================
+
+ASSETS = [
+    "EUR_USD","GBP_USD","USD_JPY","USD_CHF","AUD_USD","USD_CAD","NZD_USD",
+    "EUR_GBP","EUR_JPY","EUR_CHF","EUR_CAD","EUR_AUD","EUR_NZD",
+    "GBP_JPY","GBP_CHF","GBP_CAD","GBP_AUD","GBP_NZD",
+    "AUD_JPY","AUD_CAD","AUD_CHF","AUD_NZD",
+    "CAD_JPY","CAD_CHF","NZD_JPY","NZD_CAD","NZD_CHF","CHF_JPY",
+    "XAU_USD","US30_USD"
 ]
 
-# =============================================================================
-# INDICATEURS TECHNIQUES
-# =============================================================================
+# ============================================================
+# CALCULATION ENGINES
+# ============================================================
 
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
-    if df.empty: return 0.0
-    h, l, c = df["h"], df["l"], df["c"]
-    tr1 = h - l
-    tr2 = abs(h - c.shift())
-    tr3 = abs(l - c.shift())
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean().iloc[-1]
+class QuantEngine:
+    @staticmethod
+    def atr(df, period=14):
+        high, low, close = df["high"], df["low"], df["close"]
+        tr = pd.concat([
+            high - low,
+            abs(high - close.shift()),
+            abs(low - close.shift())
+        ], axis=1).max(axis=1)
+        return tr.ewm(span=period, adjust=False).mean().iloc[-1]
 
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0).ewm(com=period-1, min_periods=period).mean()
-    loss = -delta.clip(upper=0).ewm(com=period-1, min_periods=period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    @staticmethod
+    def rsi(df, period=7):
+        delta = df["close"].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        rs = gain.ewm(alpha=1/period, adjust=False).mean() / \
+             loss.ewm(alpha=1/period, adjust=False).mean()
+        return 100 - (100 / (1 + rs))
 
-# =============================================================================
-# MOTEUR DE DÉTECTION
-# =============================================================================
+    @staticmethod
+    def zscore_structure(df, lookback=20):
+        if len(df) < lookback: return 0
+        # Optimisation : calcul manuel plus rapide que scipy pour un simple zscore sur array
+        vals = df["close"].iloc[-lookback:].values
+        z = (vals[-1] - np.mean(vals)) / np.std(vals)
+        if z > 1.5: return 1
+        if z < -1.5: return -1
+        return 0
 
-def detect_signal(client, instrument: str) -> dict | None:
+class InstitutionalEngine:
+    @staticmethod
+    def get_regime_and_obv(df_h4, df_m5):
+        # ADX Calculation (H4)
+        high, low, close = df_h4["high"], df_h4["low"], df_h4["close"]
+        tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
+        atr = tr.ewm(span=14, adjust=False).mean()
+        up, down = high.diff(), -low.diff()
+        plus_dm = np.where((up > down) & (up > 0), up, 0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0)
+        plus_di = 100 * pd.Series(plus_dm).ewm(span=14, adjust=False).mean() / atr
+        minus_di = 100 * pd.Series(minus_dm).ewm(span=14, adjust=False).mean() / atr
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx_val = dx.ewm(span=14, adjust=False).mean().iloc[-1]
+
+        # Regime Logic
+        regime_mult = 0.0
+        if adx_val >= 22: regime_mult = 1.0
+        elif adx_val >= 15: regime_mult = 0.7
+        # else Range (0.0)
+        
+        # OBV Calculation (M5)
+        change = df_m5["close"].diff()
+        direction = np.where(change > 0, df_m5["volume"], np.where(change < 0, -df_m5["volume"], 0))
+        obv = pd.Series(direction).cumsum()
+        ma_obv = obv.rolling(20).mean()
+        
+        obv_mult = 1.0
+        if not ma_obv.dropna().empty:
+            obv_mult = 1.15 if obv.iloc[-1] > ma_obv.iloc[-1] else 0.85
+
+        return regime_mult, obv_mult
+
+# ============================================================
+# CORE LOGIC (SINGLE ASSET PROCESSING)
+# ============================================================
+
+def process_asset(sym, min_conf):
+    """Traite un seul actif. Fonction conçue pour le multi-threading."""
     try:
-        # Récupération M15 et H4
-        df_m15 = fetch_candles(client, instrument, "M15", 200)
-        df_h4  = fetch_candles(client, instrument, "H4",  100)
+        # 1. Fetch Data (Parallel & Cached)
+        # Note: D1 est peu utilisé dans ton calcul final, je l'ai retiré pour gagner 33% de vitesse
+        # Si tu en as besoin, décommente la ligne D1.
+        df_m5 = fetch_candles_optimized(sym, "M5", 150)
+        df_h4 = fetch_candles_optimized(sym, "H4", 100)
+        # df_d = fetch_candles_optimized(sym, "D", 100) 
 
-        if len(df_m15) < 50 or len(df_h4) < 50:
+        if df_m5.empty or df_h4.empty:
             return None
 
-        # 1. Tendance de fond (H4) via EMA 50
-        ema_h4 = df_h4["c"].ewm(span=50, adjust=False).mean().iloc[-1]
-        price_h4 = df_h4["c"].iloc[-1]
-        trend_bullish = price_h4 > ema_h4
-
-        # 2. Signal RSI (M15)
-        rsi = calculate_rsi(df_m15["c"])
-        if len(rsi) < 15: return None
+        # 2. Fast Filter: RSI Cross
+        rsi = QuantEngine.rsi(df_m5)
+        rsi_prev, rsi_curr = rsi.iloc[-2], rsi.iloc[-1]
         
-        last_rsi = rsi.iloc[-1]
-        prev_rsi = rsi.iloc[-2]
+        direction = None
+        if rsi_prev < 50 <= rsi_curr: direction = "BUY"
+        elif rsi_prev > 50 >= rsi_curr: direction = "SELL"
+        else: return None # Pas de signal, on sort vite
 
-        # Détection croisement zones 30/70
-        signal_buy = (prev_rsi < 30 and last_rsi >= 30) or (prev_rsi < 40 and last_rsi >= 40 and trend_bullish)
-        signal_sell = (prev_rsi > 70 and last_rsi <= 70) or (prev_rsi > 60 and last_rsi <= 60 and not trend_bullish)
+        # 3. Deep Analysis
+        regime_mult, obv_mult = InstitutionalEngine.get_regime_and_obv(df_h4, df_m5)
+        if regime_mult == 0: return None # Marché en range, on filtre
 
-        if not (signal_buy or signal_sell):
+        # 4. Probability Computation
+        rsi_mom = rsi_curr - rsi_prev
+        base_prob = 0.6 + min(abs(rsi_mom) / 10, 0.2)
+        
+        z = QuantEngine.zscore_structure(df_h4)
+        z_conf = 1.15 if (direction == "BUY" and z > 0) or (direction == "SELL" and z < 0) else 0.9
+        
+        final_prob = base_prob * regime_mult * obv_mult * z_conf
+        final_prob = min(final_prob, 0.99)
+
+        if final_prob < min_conf:
             return None
 
-        direction = "BUY" if signal_buy else "SELL"
-        
-        # Filtre de tendance : On ne prend que dans le sens du H4 pour plus de sécurité
-        if direction == "BUY" and not trend_bullish: return None
-        if direction == "SELL" and trend_bullish: return None
-
-        # Calculs Stop Loss / Take Profit via ATR
-        price = float(df_m15["c"].iloc[-1])
-        atr = calculate_atr(df_m15)
-        
-        # Confiance basée sur la force du mouvement
-        confidence = 0.70
-        if (direction == "BUY" and last_rsi < 45) or (direction == "SELL" and last_rsi > 55):
-            confidence += 0.15 # Meilleur point d'entrée
-        
-        sl_mult = 1.5
-        tp_mult = 3.0
-        
-        sl = price - (atr * sl_mult) if direction == "BUY" else price + (atr * sl_mult)
-        tp = price + (atr * tp_mult) if direction == "BUY" else price - (atr * tp_mult)
+        # 5. Risk Management
+        price = df_m5["close"].iloc[-1]
+        atr = QuantEngine.atr(df_m5)
+        sl = price - atr * 1.5 if direction == "BUY" else price + atr * 1.5
+        tp = price + atr * 3.0 if direction == "BUY" else price - atr * 3.0
 
         return {
-            "instrument": instrument,
-            "direction": direction,
+            "symbol": sym,
+            "type": direction,
             "price": price,
-            "confidence": min(0.95, confidence),
-            "time": df_m15.index[-1],
-            "atr": atr,
+            "prob": final_prob,
+            "time": df_m5["time"].iloc[-1],
             "sl": sl,
-            "tp": tp
+            "tp": tp,
+            "rr": 2.0
         }
 
     except Exception as e:
-        # logging.error(f"Erreur analyse {instrument}: {e}") # Décommenter pour debug
         return None
 
-# =============================================================================
-# INTERFACE PRINCIPALE
-# =============================================================================
+# ============================================================
+# MAIN APP
+# ============================================================
 
 def main():
-    st.title("⚡ Bluestar Market Scanner")
-    st.caption(f"Date système : {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    st.title("⚡ BLUESTAR V4 SPEED")
+    st.caption("Scanner Institutionnel | Multi-Threaded Engine")
 
-    # Initialisation Client API
-    client = get_oanda_client()
-    if not client:
-        st.warning("Client Oanda non initialisé. Vérifiez vos secrets.")
-        return
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        min_conf = st.slider("Confiance minimale (%)", 60, 95, 75) / 100
+    with col2:
+        st.write("")
+        st.write("")
+        scan_btn = st.button("🚀 SCANNER", use_container_width=True)
 
-    # Barre latérale
-    with st.sidebar:
-        st.header("Filtres")
-        min_conf_input = st.slider("Confiance Minimale (%)", 60, 95, 75, 5)
-        min_confidence = min_conf_input / 100.0
+    if scan_btn:
+        results = []
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        st.info("Scanner basé sur une stratégie de suivi de tendance H4 avec entrées M15 sur retournement RSI.")
-
-    # Bouton d'action
-    if st.button("Lancer le Scan", type="primary"):
-        results_container = st.container()
-        
-        with st.spinner("Analyse des marchés en cours..."):
-            signals = []
-            bar = st.progress(0)
+        # ThreadPoolExecutor pour paralléliser les requêtes
+        # max_workers=10 est un bon équilibre pour ne pas se faire bloquer par OANDA
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Lancement des tâches
+            future_to_asset = {executor.submit(process_asset, sym, min_conf): sym for sym in ASSETS}
             
-            for i, pair in enumerate(INSTRUMENTS):
-                sig = detect_signal(client, pair)
-                if sig and sig["confidence"] >= min_confidence:
-                    signals.append(sig)
-                bar.progress((i + 1) / len(INSTRUMENTS))
-            
-            bar.empty()
+            completed = 0
+            for future in as_completed(future_to_asset):
+                sym = future_to_asset[future]
+                completed += 1
+                
+                # Mise à jour UI
+                perc = int(completed / len(ASSETS) * 100)
+                progress_bar.progress(perc)
+                status_text.text(f"Analyse de {sym}... ({completed}/{len(ASSETS)})")
+                
+                res = future.result()
+                if res:
+                    results.append(res)
 
-        # Affichage des résultats
-        if not signals:
-            st.info("Aucun signal détecté pour le moment avec ces critères.")
+        progress_bar.empty()
+        status_text.empty()
+
+        if not results:
+            st.warning("Aucun signal détecté avec cette configuration.")
         else:
-            st.success(f"{len(signals)} opportunités détectées !")
-            signals.sort(key=lambda x: x["confidence"], reverse=True)
-
-            for s in signals:
-                # Définition des classes CSS
-                border_cls = "buy-border" if s["direction"] == "BUY" else "sell-border"
-                color_badge = "bg-green" if s["confidence"] > 0.8 else "bg-orange"
-                icon = "🟢" if s["direction"] == "BUY" else "🔴"
+            results = sorted(results, key=lambda x: x["prob"], reverse=True)
+            st.success(f"{len(results)} Signaux détectés")
+            
+            for s in results:
+                # Design Card
+                color = "#00ff88" if s['type'] == "BUY" else "#ff4b4b"
+                emoji = "🟢" if s['type'] == "BUY" else "🔴"
                 
-                # HTML personnalisé pour chaque carte
-                html_card = f"""
-                <div class="metric-box {border_cls}">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <span class="signal-header">{icon} {s['instrument']}</span>
-                        <span class="badge {color_badge}">Confiance: {int(s['confidence']*100)}%</span>
-                    </div>
-                    <div style="margin-top:8px; color:#cbd5e1;">
-                        Prix: <strong>{s['price']:.5f}</strong>
-                    </div>
-                </div>
-                """
-                st.markdown(html_card, unsafe_allow_html=True)
-
-                # Métriques détaillées
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Stop Loss", f"{s['sl']:.5f}")
-                c2.metric("Take Profit", f"{s['tp']:.5f}")
-                rr = abs(s['tp'] - s['price']) / abs(s['price'] - s['sl'])
-                c3.metric("Ratio R:R", f"1:{rr:.1f}")
-                c4.metric("Heure Signal", s['time'].strftime("%H:%M"))
-                
-                st.markdown("---")
+                with st.expander(f"{emoji} {s['symbol']}  |  {s['type']}  |  Prob: {int(s['prob']*100)}%"):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Prix Entrée", f"{s['price']:.5f}")
+                    c2.metric("Stop Loss", f"{s['sl']:.5f}", delta=f"-{(abs(s['price']-s['sl'])):.5f}", delta_color="inverse")
+                    c3.metric("Take Profit", f"{s['tp']:.5f}", delta=f"+{(abs(s['tp']-s['price'])):.5f}")
+                    
+                    st.caption(f"📅 Signal Time: {s['time']}")
 
 if __name__ == "__main__":
     main()
