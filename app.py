@@ -26,15 +26,9 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 st.set_page_config(page_title="Bluestar Ultimate V5.3 Enhanced", layout="centered", page_icon="🛡️")
 
-LOG_FILE = "bluestar_v53_log.csv"
-
-if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE, mode='w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow([
-            "timestamp", "symbol", "direction", "price", "score", "hma_m5", "ha_status", 
-            "pdh_pdl_status", "fvg_status", "mtf_strict", "adx_m5", "sl", "tp", "rank_score"
-        ])
+# Initialiser les logs en session_state au lieu d'un fichier CSV
+if 'trade_logs' not in st.session_state:
+    st.session_state.trade_logs = []
 
 st.markdown("""
 <style>
@@ -210,7 +204,7 @@ class QuantEngine:
         
         gap_bull = low_3 - high_1
         if gap_bull > min_gap and curr_close > high_1 and vol_curr > vol_mean * 0.8: 
-            return True, "BULL", (high_1, low_3), 1  # Age = 1 (récent)
+            return True, "BULL", (high_1, low_3), 1
         gap_bear = low_1 - high_3
         if gap_bear > min_gap and curr_close < low_1 and vol_curr > vol_mean * 0.8: 
             return True, "BEAR", (high_3, low_1), 1
@@ -233,7 +227,7 @@ class QuantEngine:
                     ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
                     return True, ob_zone, ob_age
                     
-            else:  # SELL
+            else:
                 is_bullish = df['close'].iloc[i] > df['open'].iloc[i]
                 strong_drop = df['close'].iloc[i+1] < df['close'].iloc[i] - (atr * 0.3)
                 if is_bullish and strong_drop and is_significant:
@@ -551,3 +545,366 @@ def calculate_final_rank(signals):
         }
     
     return sorted(signals, key=lambda x: x['final_rank_score'], reverse=True)
+
+
+# ==========================================
+# SCANNER PRINCIPAL AVEC NOUVEAUX TWEAKS
+# ==========================================
+
+def scan_all_markets(client):
+    """Scanner amélioré avec les nouveaux tweaks pro"""
+    signals = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    def process_asset(symbol):
+        try:
+            params = get_asset_params(symbol)
+            
+            # Récupération des données
+            df_m5 = client.get_candles(symbol, "M5", 200)
+            df_h1 = client.get_candles(symbol, "H1", 200)
+            df_h4 = client.get_candles(symbol, "H4", 200)
+            df_d = client.get_candles(symbol, "D", 200)
+            df_w = client.get_candles(symbol, "W", 100)
+            
+            if any(df.empty for df in [df_m5, df_h1, df_h4, df_d, df_w]):
+                return None
+            
+            # Prix live et spread
+            live_price, spread = client.get_realtime_price_and_spread(symbol)
+            if live_price == 0:
+                live_price = df_m5['close'].iloc[-1]
+            
+            # Calculs techniques
+            atr_m5 = QuantEngine.calculate_atr(df_m5)
+            atr_h4 = QuantEngine.calculate_atr(df_h4)
+            adx_m5 = QuantEngine.calculate_adx(df_m5)
+            
+            atr_pct = (atr_m5 / live_price) * 100
+            if atr_pct < params['atr_threshold']:
+                return None
+            
+            # HMA Multi-Timeframe
+            hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
+            hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
+            hma_h4 = QuantEngine.calculate_hma(df_h4['close'], 20)
+            
+            hma_m5_slope = QuantEngine.hma_slope(hma_m5, lookback=5, min_slope=0.0001)
+            hma_h1_slope = QuantEngine.hma_slope(hma_h1, lookback=3, min_slope=0.0002)
+            hma_h4_slope = QuantEngine.hma_slope(hma_h4, lookback=2, min_slope=0.0003)
+            
+            # Détection structures
+            fvg_active, fvg_type, fvg_zone, fvg_age = QuantEngine.detect_smart_fvg(df_m5, atr_m5)
+            
+            # Heikin Ashi
+            ha_status = QuantEngine.calculate_ha_smoothed(df_m5)
+            
+            # PDH/PDL et zones
+            pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
+            if pdh is None or pdl is None:
+                return None
+            
+            mid = (pdh + pdl) / 2
+            is_discount = live_price < mid
+            is_premium = live_price > mid
+            
+            # Institutional Grade
+            inst_grade, inst_trend, inst_score = QuantEngine.get_institutional_grade(df_d, df_w)
+            if inst_grade == "C":
+                return None
+            
+            # Session
+            utc_now = datetime.now(pytz.utc)
+            session = QuantEngine.get_trading_session(utc_now)
+            
+            # Z-Score
+            zscore = QuantEngine.detect_structure_zscore(df_h4)
+            
+            # ==========================================
+            # LOGIQUE BUY
+            # ==========================================
+            if (hma_m5_slope == 1 and hma_h1_slope == 1 and hma_h4_slope == 1 and
+                ha_status == 1 and is_discount and adx_m5 >= 18):
+                
+                ob_active, ob_zone, ob_age = QuantEngine.detect_order_block(df_m5, atr_m5, "BUY")
+                
+                # Confluence count
+                confluence = sum([
+                    hma_m5_slope == 1,
+                    hma_h1_slope == 1,
+                    hma_h4_slope == 1,
+                    ha_status == 1,
+                    is_discount,
+                    fvg_active and fvg_type == "BULL",
+                    ob_active,
+                    adx_m5 >= 20
+                ])
+                
+                prob = min(confluence * 11.5, 95)
+                
+                # SL/TP
+                sl = live_price - (atr_h4 * params['sl_base'])
+                tp = live_price + (atr_h4 * params['tp_rr'] * params['sl_base'])
+                
+                signal = {
+                    'symbol': symbol,
+                    'type': 'BUY',
+                    'price': live_price,
+                    'sl': sl,
+                    'tp': tp,
+                    'prob': prob,
+                    'spread': spread,
+                    'atr_pct': atr_pct,
+                    'confluence': confluence,
+                    'session': session,
+                    'inst_grade': inst_grade,
+                    'inst_score': inst_score,
+                    'details': {
+                        'hma_m5': hma_m5_slope,
+                        'hma_h1_slope': hma_h1_slope,
+                        'hma_h4_slope': hma_h4_slope,
+                        'ha_status': "GREEN",
+                        'adx_val': adx_m5,
+                        'fvg_active': fvg_active,
+                        'fvg_type': fvg_type if fvg_active else None,
+                        'ob_active': ob_active,
+                        'zone_status': f"DISCOUNT ({((mid - live_price)/mid)*100:.2f}%)",
+                        'pdh_pdl': f"{pdl:.5f}/{pdh:.5f}",
+                        'zscore': zscore
+                    }
+                }
+                
+                # ==========================================
+                # NOUVEAUX TWEAKS PRO
+                # ==========================================
+                
+                # 1. Confluence Quality
+                confluence_quality, weights = calculate_confluence_quality(
+                    signal, df_m5, fvg_zone, ob_zone, fvg_age, ob_age
+                )
+                signal['confluence_quality'] = confluence_quality
+                signal['quality_weights'] = weights
+                
+                # 2. Entry Window Timing
+                timing_score, timing_alerts = detect_optimal_entry_window(df_m5, signal)
+                signal['timing_score'] = timing_score
+                signal['timing_alerts'] = timing_alerts
+                
+                # 3. Execution Costs
+                signal = adjust_for_execution_costs(signal)
+                
+                # 4. Level Freshness
+                freshness_score, fresh_warnings = evaluate_level_freshness(df_d, pdh, pdl)
+                signal['freshness_score'] = freshness_score
+                signal['freshness_warnings'] = fresh_warnings
+                
+                # 5. Contextual Metadata
+                metadata = add_contextual_metadata(signal, df_d, df_h4)
+                signal['context'] = metadata
+                
+                return signal
+            
+            # ==========================================
+            # LOGIQUE SELL
+            # ==========================================
+            elif (hma_m5_slope == -1 and hma_h1_slope == -1 and hma_h4_slope == -1 and
+                  ha_status == -1 and is_premium and adx_m5 >= 18):
+                
+                ob_active, ob_zone, ob_age = QuantEngine.detect_order_block(df_m5, atr_m5, "SELL")
+                
+                confluence = sum([
+                    hma_m5_slope == -1,
+                    hma_h1_slope == -1,
+                    hma_h4_slope == -1,
+                    ha_status == -1,
+                    is_premium,
+                    fvg_active and fvg_type == "BEAR",
+                    ob_active,
+                    adx_m5 >= 20
+                ])
+                
+                prob = min(confluence * 11.5, 95)
+                
+                sl = live_price + (atr_h4 * params['sl_base'])
+                tp = live_price - (atr_h4 * params['tp_rr'] * params['sl_base'])
+                
+                signal = {
+                    'symbol': symbol,
+                    'type': 'SELL',
+                    'price': live_price,
+                    'sl': sl,
+                    'tp': tp,
+                    'prob': prob,
+                    'spread': spread,
+                    'atr_pct': atr_pct,
+                    'confluence': confluence,
+                    'session': session,
+                    'inst_grade': inst_grade,
+                    'inst_score': inst_score,
+                    'details': {
+                        'hma_m5': hma_m5_slope,
+                        'hma_h1_slope': hma_h1_slope,
+                        'hma_h4_slope': hma_h4_slope,
+                        'ha_status': "RED",
+                        'adx_val': adx_m5,
+                        'fvg_active': fvg_active,
+                        'fvg_type': fvg_type if fvg_active else None,
+                        'ob_active': ob_active,
+                        'zone_status': f"PREMIUM (+{((live_price - mid)/mid)*100:.2f}%)",
+                        'pdh_pdl': f"{pdl:.5f}/{pdh:.5f}",
+                        'zscore': zscore
+                    }
+                }
+                
+                # Nouveaux tweaks pour SELL
+                confluence_quality, weights = calculate_confluence_quality(
+                    signal, df_m5, fvg_zone, ob_zone, fvg_age, ob_age
+                )
+                signal['confluence_quality'] = confluence_quality
+                signal['quality_weights'] = weights
+                
+                timing_score, timing_alerts = detect_optimal_entry_window(df_m5, signal)
+                signal['timing_score'] = timing_score
+                signal['timing_alerts'] = timing_alerts
+                
+                signal = adjust_for_execution_costs(signal)
+                
+                freshness_score, fresh_warnings = evaluate_level_freshness(df_d, pdh, pdl)
+                signal['freshness_score'] = freshness_score
+                signal['freshness_warnings'] = fresh_warnings
+                
+                metadata = add_contextual_metadata(signal, df_d, df_h4)
+                signal['context'] = metadata
+                
+                return signal
+            
+            return None
+            
+        except Exception as e:
+            return None
+    
+    # Scan parallèle
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(process_asset, symbol): symbol for symbol in ASSETS}
+        
+        for i, future in enumerate(as_completed(futures)):
+            progress_bar.progress((i + 1) / len(ASSETS))
+            status_text.text(f"🔍 Scanning {futures[future]}...")
+            
+            result = future.result()
+            if result:
+                signals.append(result)
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Ranking final avec les nouveaux scores
+    if signals:
+        signals = calculate_final_rank(signals)
+    
+    return signals
+
+
+# ==========================================
+# INTERFACE STREAMLIT
+# ==========================================
+
+def main():
+    st.markdown("<h1>🛡️ BLUESTAR ULTIMATE V5.3 ENHANCED</h1>", unsafe_allow_html=True)
+    
+    client = OandaClient()
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        if st.button("🚀 LANCER LE SCAN", use_container_width=True):
+            with st.spinner("⚡ Analyse en cours..."):
+                signals = scan_all_markets(client)
+            
+            if not signals:
+                st.warning("❌ Aucun signal détecté actuellement")
+                return
+            
+            st.success(f"✅ **{len(signals)} opportunités détectées**")
+            
+            # Affichage des signaux
+            for idx, sig in enumerate(signals, 1):
+                rank_score = sig['final_rank_score']
+                
+                # Badge de qualité
+                if rank_score >= 0.80:
+                    rank_badge = f"<span class='badge badge-gold'>★ RANK #{idx} - PREMIUM ({rank_score:.2f})</span>"
+                elif rank_score >= 0.65:
+                    rank_badge = f"<span class='badge badge-blue'>RANK #{idx} - STRONG ({rank_score:.2f})</span>"
+                else:
+                    rank_badge = f"<span class='badge'>RANK #{idx} - STANDARD ({rank_score:.2f})</span>"
+                
+                with st.expander(
+                    f"{'🟢' if sig['type'] == 'BUY' else '🔴'} {sig['symbol']} - "
+                    f"{sig['type']} @ {sig['price']:.5f} | Score: {sig['prob']:.0f}%",
+                    expanded=(idx <= 3)
+                ):
+                    st.markdown(rank_badge, unsafe_allow_html=True)
+                    
+                    # Métriques principales
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("SL", f"{sig['sl']:.5f}")
+                    col2.metric("TP", f"{sig['tp']:.5f}")
+                    col3.metric("Spread", f"{sig['spread']:.1f} pips")
+                    col4.metric("ATR%", f"{sig['atr_pct']:.2f}%")
+                    
+                    # Confluence Quality
+                    st.markdown("**📊 Confluence Quality**")
+                    st.progress(sig['confluence_quality'])
+                    st.caption(f"Weights: {sig['quality_weights']}")
+                    
+                    # Timing Window
+                    if sig.get('timing_alerts'):
+                        st.markdown("**⏰ Entry Timing**")
+                        for alert in sig['timing_alerts']:
+                            st.info(alert)
+                        st.progress(sig['timing_score'])
+                    
+                    # Spread Warning
+                    st.markdown(f"**💰 Execution Cost:** {sig['spread_warning']}")
+                    
+                    # Freshness
+                    if sig.get('freshness_warnings'):
+                        st.markdown("**🔄 Level Freshness**")
+                        for warn in sig['freshness_warnings']:
+                            st.caption(warn)
+                    
+                    # Context
+                    if sig.get('context'):
+                        st.markdown("**📈 Market Context**")
+                        for key, val in sig['context'].items():
+                            st.caption(f"{key}: {val}")
+                    
+                    # Détails techniques
+                    with st.expander("🔧 Détails techniques"):
+                        st.json({
+                            'HMA_M5': sig['details']['hma_m5'],
+                            'HMA_H1': sig['details']['hma_h1_slope'],
+                            'HMA_H4': sig['details']['hma_h4_slope'],
+                            'HA_Status': sig['details']['ha_status'],
+                            'ADX': sig['details']['adx_val'],
+                            'FVG': sig['details']['fvg_type'],
+                            'OB': sig['details']['ob_active'],
+                            'Zone': sig['details']['zone_status'],
+                            'Session': sig['session'],
+                            'Grade': sig['inst_grade']
+                        })
+                    
+                    # Rank Breakdown
+                    with st.expander("🎯 Rank Breakdown"):
+                        st.json(sig['rank_breakdown'])
+    
+    with col2:
+        st.markdown("### ⚙️ Infos")
+        st.caption(f"🕐 {datetime.now().strftime('%H:%M:%S')}")
+        st.caption(f"📊 {len(ASSETS)} marchés")
+
+
+if __name__ == "__main__":
+    main()
