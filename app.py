@@ -427,7 +427,7 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
 # ==========================================
 # LOGIQUE V5.3 (STRICT MTF + ADX M5)
 # ==========================================
-def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, spread_pips, current_time_utc, force_open=False):
+def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, adx_filter, mtf_filter, spread_pips, current_time_utc, force_open=False):
     details = {}
     rejection_reason = None
     
@@ -455,8 +455,8 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     elif session in ["LONDON", "NY"]:
         details['session'] = f"✅ {session}"
     
-    # Filtre ADX Strict sur M5
-    if strict_mode and adx_val < 20:
+    # Filtre ADX si activé
+    if adx_filter and adx_val < 20:
         return 0, {}, atr_pct, f"ADX M5 {adx_val:.1f} < 20"
     
     # HMA & HA M5
@@ -497,7 +497,7 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
         details['zone_status'] = "PREMIUM (Above Midnight → PDL)"
         details['target'] = f"PDL: {pdl:.5f}"
         
-    # MTF ALIGNEMENT STRICT (AND NON OR)
+    # MTF ALIGNEMENT selon filtre choisi
     hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
     slope_h1 = QuantEngine.hma_slope(hma_h1)
     
@@ -505,15 +505,44 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     slope_h4 = QuantEngine.hma_slope(hma_h4)
     
     mtf_aligned = False
-    if direction == "BUY":
-        if slope_h1 > 0 and slope_h4 > 0 and "BULL" in inst_trend: 
-            mtf_aligned = True
-    else:
-        if slope_h1 < 0 and slope_h4 < 0 and "BEAR" in inst_trend: 
-            mtf_aligned = True
+    
+    if mtf_filter == "Strict (D+H4+H1)":
+        # Mode strict: tous alignés
+        if direction == "BUY":
+            if slope_h1 > 0 and slope_h4 > 0 and "BULL" in inst_trend: 
+                mtf_aligned = True
+        else:
+            if slope_h1 < 0 and slope_h4 < 0 and "BEAR" in inst_trend: 
+                mtf_aligned = True
+    
+    elif mtf_filter == "Flexible (D+H4 OR H4+H1)":
+        # Mode flexible: Daily+H4 OU H4+H1
+        if direction == "BUY":
+            condition1 = slope_h4 > 0 and "BULL" in inst_trend  # D+H4
+            condition2 = slope_h1 > 0 and slope_h4 > 0          # H4+H1
+            if condition1 or condition2:
+                mtf_aligned = True
+        else:
+            condition1 = slope_h4 < 0 and "BEAR" in inst_trend  # D+H4
+            condition2 = slope_h1 < 0 and slope_h4 < 0          # H4+H1
+            if condition1 or condition2:
+                mtf_aligned = True
+    
+    elif mtf_filter == "Light (H4 only)":
+        # Mode light: H4 seul suffit
+        if direction == "BUY":
+            if slope_h4 > 0:
+                mtf_aligned = True
+        else:
+            if slope_h4 < 0:
+                mtf_aligned = True
+    
+    elif mtf_filter == "Off":
+        # Pas de filtre MTF
+        mtf_aligned = True
         
     if not mtf_aligned:
-        return 0, {}, atr_pct, "MTF Misaligned (Need D+H4+H1 aligned)"
+        return 0, {}, atr_pct, f"MTF Misaligned ({mtf_filter})"
         
     # CONFLUENCE: FVG OU OB OU Support/Resistance
     confluence_found = False
@@ -575,13 +604,14 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     details['confluence'] = " + ".join(confluence_type)
     details['fvg_active'] = fvg_active
     details['ob_active'] = ob_active
+    details['mtf_mode'] = mtf_filter
     
     return min(score, 1.0), details, atr_pct, None
 
 # ==========================================
 # SCANNER V5.3
 # ==========================================
-def run_scan_v53_blue(api, min_prob, strict_mode, current_time_utc, force_open=False):
+def run_scan_v53_blue(api, min_prob, adx_filter, mtf_filter, current_time_utc, force_open=False):
     cs_scores = get_currency_strength_rsi(api)
     signals = []
     rejected_log = []
@@ -614,7 +644,7 @@ def run_scan_v53_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
             
             for direction in ["BUY", "SELL"]:
                 prob, details, atr_pct, reject_reason = calculate_signal_probability_v53(
-                    df_m5, df_h1, df_h4, df_d, df_w, sym, direction, strict_mode, spread_pips, current_time_utc, force_open
+                    df_m5, df_h1, df_h4, df_d, df_w, sym, direction, None, adx_filter, mtf_filter, spread_pips, current_time_utc, force_open
                 )
                 
                 if reject_reason: 
@@ -683,7 +713,8 @@ def display_sig_v53(s):
             f"<span class='badge badge-blue'>HMA: {'🟢 Up' if d['hma_slope']>0 else '🔴 Down'}</span>",
             f"<span class='badge badge-blue'>HA: {'🟢 Bull' if d['ha_status']>0 else '🔴 Bear'}</span>",
             f"<span class='badge badge-gold'>{d['inst_grade']}</span>",
-            f"<span class='badge'>ADX M5: {d['adx_val']:.1f}</span>"
+            f"<span class='badge'>ADX M5: {d['adx_val']:.1f}</span>",
+            f"<span class='badge'>MTF: {d.get('mtf_mode', 'N/A')}</span>"
         ]
         
         # Badge confluence (important!)
@@ -729,7 +760,7 @@ def display_sig_v53(s):
 # ==========================================
 def main():
     st.title("🛡️ BLUESTAR ULTIMATE V5.3")
-    st.markdown("<p style='text-align:center;color:#94a3b8;'>Scanner institutionnel | MTF Strict | OB + FVG Detection</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;color:#94a3b8;'>Scanner institutionnel | MTF Flexible | OB + FVG Detection</p>", unsafe_allow_html=True)
     
     current_time_utc = datetime.now(pytz.utc)
     session = QuantEngine.get_trading_session(current_time_utc)
@@ -751,35 +782,48 @@ def main():
     """, unsafe_allow_html=True)
     
     with st.sidebar:
-        st.header("⚙️ Configuration")
-        strict_mode = st.checkbox("🔥 Strict Mode (ADX M5 > 20)", value=True)
-        min_prob = st.slider("Score Minimum", 60, 95, 75, 5)
+        st.header("⚙️ Filtres")
         
-        st.markdown("---")
-        st.markdown("### 📋 Checklist manuelle")
-        st.markdown("""
-        Avant d'entrer en position:
-        - ✅ Vérifier graphique H4/H1
-        - ✅ Confirmer FVG/OB sur TradingView
-        - ✅ Checker calendrier économique
-        - ✅ Valider spread acceptable
-        - ✅ Vérifier liquidité du marché
-        """)
+        # Filtre MTF (remplace strict_mode)
+        mtf_filter = st.selectbox(
+            "🎯 Alignement Multi-Timeframe",
+            ["Strict (D+H4+H1)", "Flexible (D+H4 OR H4+H1)", "Light (H4 only)", "Off"],
+            index=0,
+            help="Strict = tous alignés | Flexible = 2 sur 3 | Light = H4 seul | Off = pas de filtre"
+        )
+        
+        # Filtre ADX séparé
+        adx_filter = st.checkbox(
+            "🔥 Filtre ADX > 20 (M5)", 
+            value=True,
+            help="Exige ADX supérieur à 20 sur M5 pour confirmer la tendance"
+        )
+        
+        min_prob = st.slider("Score Minimum", 60, 95, 75, 5)
         
     if st.button("🔍 LANCER LE SCAN V5.3"):
         with st.spinner("🔄 Scan en cours..."):
             api = OandaClient()
-            results, logs = run_scan_v53_blue(api, min_prob/100, strict_mode, current_time_utc)
+            results, logs = run_scan_v53_blue(api, min_prob/100, adx_filter, mtf_filter, current_time_utc)
         
         if not results:
             st.warning("⚠️ Aucun signal trouvé avec les critères actuels.")
+            
+            # Suggestions pour avoir plus de signaux
+            st.info("""
+            **💡 Suggestions pour obtenir plus de signaux:**
+            - Essayer mode MTF **Flexible** ou **Light**
+            - Désactiver le filtre ADX temporairement
+            - Réduire le score minimum à 70
+            """)
+            
             with st.expander("📋 Logs de rejet (pourquoi pas de signaux)"):
-                for log in logs[:20]:  # Afficher 20 premiers rejets
+                for log in logs[:25]:  # Afficher 25 premiers rejets
                     st.text(log)
         else:
-            st.success(f"✅ **{len(results)} Signal(s) détecté(s)** - Vérifiez manuellement sur vos graphiques !")
+            st.success(f"✅ **{len(results)} Signal(s) détecté(s)** - Vérifiez sur vos graphiques !")
             
-            st.info("💡 **Rappel:** Ce scanner est un outil de PRÉ-SÉLECTION. Validez toujours manuellement avant d'entrer en position.")
+            st.info(f"🎯 **Filtre actif:** MTF = {mtf_filter} | ADX = {'ON' if adx_filter else 'OFF'}")
             
             for r in results: 
                 display_sig_v53(r)
