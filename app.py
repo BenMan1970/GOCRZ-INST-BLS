@@ -14,7 +14,7 @@ import pytz
 import warnings
 
 # ==========================================
-# CONFIGURATION & STYLE (THEME BLEU V5.1 FIX)
+# CONFIGURATION & STYLE (THEME BLEU V5.1 FINAL)
 # ==========================================
 warnings.simplefilter(action='ignore', category=FutureWarning)
 st.set_page_config(page_title="Bluestar Ultimate V5.1", layout="centered", page_icon="🛡️")
@@ -135,11 +135,9 @@ def get_asset_params(symbol):
     return {'type': 'FOREX', 'atr_threshold': 0.035, 'sl_base': 1.5, 'tp_rr': 2.0}
 
 # ==========================================
-# MOTEUR D'INDICATEURS (V4.6 Strict + HA Smoothed)
+# MOTEUR D'INDICATEURS V5.1 (ADX OFFICIEL TV)
 # ==========================================
 class QuantEngine:
-    # --- V4.6 ORIGINAL FUNCTIONS ---
-    
     @staticmethod
     def calculate_atr(df, period=14):
         if len(df) < period + 1: return 0
@@ -149,18 +147,44 @@ class QuantEngine:
 
     @staticmethod
     def calculate_adx(df, period=14):
+        """
+        Calcul ADX officiel TradingView (ta.rma).
+        Alpha = 1/period (Wilder's Smoothing).
+        """
         if len(df) < period * 2: return 0
-        high, low, close = df['high'], df['low'], df['close']
-        plus_dm = high.diff()
-        minus_dm = -low.diff()
-        tr = pd.concat([high-low, abs(high-close.shift()), abs(low-close.shift())], axis=1).max(axis=1)
-        atr = tr.ewm(span=period, adjust=False).mean()
-        plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-        minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
-        plus_di = 100 * pd.Series(plus_dm).ewm(span=period, adjust=False).mean() / atr
-        minus_di = 100 * pd.Series(minus_dm).ewm(span=period, adjust=False).mean() / atr
-        dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
-        adx = dx.ewm(span=period, adjust=False).mean()
+        
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        # --- dirmov(len) ---
+        up = high.diff()
+        down = -low.diff()
+
+        plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+
+        tr = pd.concat([
+            high - low, 
+            abs(high - close.shift()), 
+            abs(low - close.shift())
+        ], axis=1).max(axis=1)
+
+        # ta.rma correspond à Wilder's Smoothing : alpha = 1 / period
+        alpha = 1 / period
+        truerange = tr.ewm(alpha=alpha, adjust=False).mean()
+
+        plus = 100 * pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean() / truerange
+        minus = 100 * pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean() / truerange
+
+        # --- adx(dilen, adxlen) ---
+        sum_val = plus + minus
+        
+        # Gestion de la division par zéro comme dans Pine: (sum == 0 ? 1 : sum)
+        dx = 100 * np.abs(plus - minus) / sum_val.replace(0, 1)
+
+        adx = dx.ewm(alpha=alpha, adjust=False).mean()
+
         return adx.iloc[-1]
 
     @staticmethod
@@ -232,7 +256,7 @@ class QuantEngine:
         
         if final_score >= 95: final_grade = "A+"
         elif final_score >= 85: final_grade = "A"
-        elif final_score >= 70: final_grade = "B"  # FIX: Was final_grade typo
+        elif final_score >= 70: final_grade = "B"
         else: final_grade = "C"
         return final_grade, trend_d, final_score
 
@@ -263,8 +287,6 @@ class QuantEngine:
         except: return 0
         return 0 
 
-    # --- NOUVELLE FONCTION DEMANDÉE ---
-    
     @staticmethod
     def calculate_ha_smoothed(df, period=3):
         ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
@@ -280,7 +302,7 @@ class QuantEngine:
         else: return -1 # Bear
 
 # ==========================================
-# CURRENCY STRENGTH (V4.6)
+# CURRENCY STRENGTH
 # ==========================================
 def get_currency_strength_rsi(api):
     now = datetime.now()
@@ -338,7 +360,7 @@ def get_currency_strength_rsi(api):
     return final_scores
 
 # ==========================================
-# FILTRE CORRÉLATION (ÉTENDU)
+# FILTRE CORRÉLATION
 # ==========================================
 def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
     if not existing_signals: return False
@@ -368,37 +390,34 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
     return False
 
 # ==========================================
-# LOGIQUE V5.1 (STRICT ICT) - CORRECTED
+# LOGIQUE V5.1
 # ==========================================
 def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, spread_pips, force_open=False):
     details = {}
     rejection_reason = None
     
-    # 0. Params de base
     atr = QuantEngine.calculate_atr(df_m5)
     atr_pct = (atr / df_m5['close'].iloc[-1]) * 100
     params = get_asset_params(symbol)
     
-    # 1. Indicateurs V4.6
     pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
     midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
-    adx_val = QuantEngine.calculate_adx(df_h4)
+    adx_val = QuantEngine.calculate_adx(df_h4) # Utilisation de la fonction officielle TV
     z_score = QuantEngine.detect_structure_zscore(df_h4)
     fvg_active, fvg_type = QuantEngine.detect_smart_fvg(df_m5, atr)
     inst_grade, inst_trend, _ = QuantEngine.get_institutional_grade(df_d, df_w)
     
     curr_price = df_m5['close'].iloc[-1]
     
-    # 2. Filtre ADX (Strict Mode)
+    # Filtre ADX Strict (ADX > 20)
     if strict_mode and adx_val < 20:
         return 0, {}, atr_pct, "ADX < 20 (Strict)"
     
-    # 3. HMA & HA M5 (Trigger)
+    # HMA & HA M5
     hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
     hma_slope_m5 = QuantEngine.hma_slope(hma_m5)
     ha_status_m5 = QuantEngine.calculate_ha_smoothed(df_m5)
     
-    # Trigger Check
     if direction == "BUY":
         if not (hma_slope_m5 > 0 and ha_status_m5 > 0):
             return 0, {}, atr_pct, "No M5 Trigger (HMA/HA)"
@@ -406,7 +425,7 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
         if not (hma_slope_m5 < 0 and ha_status_m5 < 0):
             return 0, {}, atr_pct, "No M5 Trigger (HMA/HA)"
             
-    # 4. Zones (Midnight + PDH/PDL)
+    # Zones
     if pdh is None or midnight_open is None: return 0, {}, atr_pct, "Missing Levels"
     
     daily_range = pdh - pdl
@@ -421,7 +440,7 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
         if curr_price < (pdh - (daily_range * 0.30)): return 0, {}, atr_pct, "Not Near PDH"
         details['zone_status'] = "PREMIUM (Near PDH)"
         
-    # 5. MTF Alignment (D1, H4, H1)
+    # MTF Alignment
     hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
     slope_h1 = QuantEngine.hma_slope(hma_h1)
     
@@ -439,7 +458,7 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     if not mtf_aligned:
         return 0, {}, atr_pct, "MTF Misaligned"
         
-    # 6. Structure (FVG / Support)
+    # Structure
     structure_valid = False
     if direction == "BUY":
         if fvg_active and fvg_type == "BULL": structure_valid = True
@@ -452,7 +471,7 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     if not structure_valid:
         return 0, {}, atr_pct, "No Structure/FVG Support"
         
-    # 7. Scoring
+    # Scoring
     score = 0.7 
     if adx_val > 25: score += 0.1
     if abs(z_score) < 0.5: score += 0.1 
@@ -552,7 +571,7 @@ def run_scan_v51_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
     return sorted(signals, key=lambda x: x['prob'], reverse=True), rejected_log
 
 # ==========================================
-# AFFICHAGE V5.1
+# AFFICHAGE
 # ==========================================
 def display_sig_v51(s):
     is_buy = s['type'] == 'BUY'
@@ -591,7 +610,7 @@ def display_sig_v51(s):
 # ==========================================
 def main():
     st.title("🛡️ BLUESTAR ULTIMATE V5.1")
-    st.markdown("<p style='text-align:center;color:#94a3b8;'>Strict ICT | V4.6 Indicators + HA Smoothed</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;color:#94a3b8;'>Strict ICT | ADX TV Official</p>", unsafe_allow_html=True)
     
     st.sidebar.markdown(f"🕒 UTC: {datetime.now(pytz.utc).strftime('%H:%M')}")
     
