@@ -14,19 +14,19 @@ import pytz
 import warnings
 
 # ==========================================
-# CONFIGURATION & STYLE (THEME BLEU V5.0)
+# CONFIGURATION & STYLE (THEME BLEU V5.1)
 # ==========================================
 warnings.simplefilter(action='ignore', category=FutureWarning)
-st.set_page_config(page_title="Bluestar Ultimate V5.0", layout="centered", page_icon="🛡️")
+st.set_page_config(page_title="Bluestar Ultimate V5.1", layout="centered", page_icon="🛡️")
 
-LOG_FILE = "bluestar_v5_log.csv"
+LOG_FILE = "bluestar_v51_log.csv"
 
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, mode='w', newline='') as file:
         writer = csv.writer(file)
         writer.writerow([
-            "timestamp", "symbol", "direction", "price", "score", "hma_slope", "ha_status", 
-            "midnight_pos", "pdl_prox", "pdh_prox", "sl", "tp"
+            "timestamp", "symbol", "direction", "price", "score", "hma_m5", "ha_status", 
+            "pdh_pdl_status", "fvg_status", "h1_h4_align", "sl", "tp"
         ])
 
 st.markdown("""
@@ -53,7 +53,6 @@ st.markdown("""
     .badge-session { background: linear-gradient(135deg, #db2777 0%, #ec4899 100%); }
     .badge-blue { background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%); }
     .badge-gold { background: linear-gradient(135deg, #fbbf24 0%, #d97706 100%); color: black; }
-    .timestamp-box { background: rgba(59, 130, 246, 0.1); border-left: 3px solid #3b82f6; padding: 8px 12px; border-radius: 6px; font-size: 0.85em; color: #93c5fd; margin: 10px 0; font-family: 'Courier New', monospace; }
     .inst-label { color:#94a3b8; font-size:0.8em; text-transform: uppercase; letter-spacing: 1px; }
     .inst-val { font-size: 1.1em; font-weight: 700; color: #f1f5f9; }
 </style>
@@ -63,7 +62,6 @@ st.markdown("""
 # CLIENT API & SESSION STATE
 # ==========================================
 if 'cache' not in st.session_state: st.session_state.cache = {}
-if 'signal_history' not in st.session_state: st.session_state.signal_history = {}
 if 'cs_data' not in st.session_state: st.session_state.cs_data = {'data': None, 'time': None}
 
 class OandaClient:
@@ -137,55 +135,17 @@ def get_asset_params(symbol):
     return {'type': 'FOREX', 'atr_threshold': 0.035, 'sl_base': 1.5, 'tp_rr': 2.0}
 
 # ==========================================
-# MOTEUR D'INDICATEURS V2 (Sans RSI/Volume)
+# MOTEUR D'INDICATEURS (V4.6 Strict + HA Smoothed)
 # ==========================================
 class QuantEngine:
+    # --- V4.6 ORIGINAL FUNCTIONS ---
+    
     @staticmethod
     def calculate_atr(df, period=14):
         if len(df) < period + 1: return 0
         h, l, c = df['high'], df['low'], df['close']
         tr = pd.concat([h-l, abs(h-c.shift(1)), abs(l-c.shift(1))], axis=1).max(axis=1)
         return tr.ewm(span=period, adjust=False).mean().iloc[-1]
-
-    @staticmethod
-    def calculate_hma(series, period=20):
-        if len(series) < period: return pd.Series([])
-        half = int(period / 2)
-        sqrt_p = int(np.sqrt(period))
-        wma_half = series.rolling(half).mean()
-        wma_full = series.rolling(period).mean()
-        diff = 2 * wma_half - wma_full
-        hma = diff.rolling(sqrt_p).mean()
-        return hma
-
-    @staticmethod
-    def get_hma_color_trend(hma_series):
-        # Retourne 1 si haussier (croissant), -1 si baissier, 0 si plat
-        if len(hma_series) < 5: return 0
-        # On regarde la pente sur 3 bougies
-        slope = hma_series.iloc[-1] - hma_series.iloc[-3]
-        if slope > 0: return 1
-        elif slope < 0: return -1
-        return 0
-
-    @staticmethod
-    def calculate_ha_smoothed(df, period=3):
-        # Calcul standard Heiken Ashi
-        ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
-        ha_open = np.zeros(len(df))
-        ha_open[0] = (df['open'].iloc[0] + df['close'].iloc[0]) / 2
-        for i in range(1, len(df)):
-            ha_open[i] = (ha_open[i-1] + ha_close[i-1]) / 2
-        ha_high = df['high'].combine(pd.Series(ha_open), max).combine(ha_close, max)
-        ha_low = df['low'].combine(pd.Series(ha_open), min).combine(ha_close, min)
-        
-        # Lissage (EMA sur les données HA)
-        smooth_open = pd.Series(ha_open).ewm(span=period).mean()
-        smooth_close = ha_close.ewm(span=period).mean()
-        
-        # Détermination de la couleur de la dernière bougie lissée
-        if smooth_close.iloc[-1] > smooth_open.iloc[-1]: return 1 # Bull
-        else: return -1 # Bear
 
     @staticmethod
     def calculate_adx(df, period=14):
@@ -204,62 +164,131 @@ class QuantEngine:
         return adx.iloc[-1]
 
     @staticmethod
+    def calculate_hma(series, period=20):
+        if len(series) < period: return pd.Series([])
+        half = int(period / 2)
+        sqrt_p = int(np.sqrt(period))
+        weights_half = np.arange(1, half + 1)
+        weights_full = np.arange(1, period + 1)
+        weights_sqrt = np.arange(1, sqrt_p + 1)
+        wma_half = series.rolling(half).apply(lambda x: np.dot(x, weights_half) / weights_half.sum(), raw=True)
+        wma_full = series.rolling(period).apply(lambda x: np.dot(x, weights_full) / weights_full.sum(), raw=True)
+        diff = 2 * wma_half - wma_full
+        hma = diff.rolling(sqrt_p).apply(lambda x: np.dot(x, weights_sqrt) / weights_sqrt.sum(), raw=True)
+        return hma
+
+    @staticmethod
+    def hma_slope(hma_series, lookback=5, min_slope=0):
+        if len(hma_series) < lookback + 1: return 0
+        slope = (hma_series.iloc[-1] - hma_series.iloc[-1 - lookback]) / hma_series.iloc[-1]
+        if slope > min_slope: return 1
+        elif slope < -min_slope: return -1
+        return 0
+
+    @staticmethod
+    def detect_smart_fvg(df, atr):
+        # LOGIQUE ORIGINALE V4.6
+        if len(df) < 4: return False, 0
+        curr_close = df['close'].iloc[-1]
+        min_gap = atr * 0.5
+        high_1 = df['high'].iloc[-3]
+        low_1 = df['low'].iloc[-3]
+        high_3 = df['high'].iloc[-1]
+        low_3 = df['low'].iloc[-1]
+        vol_mean = df['volume'].rolling(20).mean().iloc[-1]
+        vol_curr = df['volume'].iloc[-1]
+        
+        gap_bull = low_3 - high_1
+        if gap_bull > min_gap and curr_close > high_1 and vol_curr > vol_mean * 0.8: return True, "BULL"
+        gap_bear = low_1 - high_3
+        if gap_bear > min_gap and curr_close < low_1 and vol_curr > vol_mean * 0.8: return True, "BEAR"
+        return False, None
+
+    @staticmethod
+    def get_institutional_grade(df_d, df_w):
+        # LOGIQUE ORIGINALE V4.6
+        def analyze_tf(df):
+            if len(df) < 50: return "C", "NEUTRAL", 0
+            close = df['close']
+            price = close.iloc[-1]
+            sma200 = close.rolling(200).mean().iloc[-1] if len(df) >= 200 else close.rolling(50).mean().iloc[-1]
+            ema50 = close.ewm(span=50).mean().iloc[-1]
+            ema21 = close.ewm(span=21).mean().iloc[-1]
+            above_sma = price > sma200
+            ema50_above_sma = ema50 > sma200
+            ema21_above_50 = ema21 > ema50
+            price_above_21 = price > ema21
+            
+            if above_sma and ema50_above_sma and ema21_above_50 and price_above_21: return "A+", "BULLISH", 100
+            if not above_sma and not ema50_above_sma and not ema21_above_50 and not price_above_21: return "A+", "BEARISH", 100
+            if above_sma and ema50_above_sma: return "A", "BULLISH", 85
+            if not above_sma and not ema50_above_sma: return "A", "BEARISH", 85
+            if not above_sma and ema50_above_sma: return "B", "RETRACEMENT_BULL", 70
+            if above_sma and not ema50_above_sma: return "B", "RETRACEMENT_BEAR", 70
+            return "C", "NEUTRAL", 50
+
+        grade_d, trend_d, score_d = analyze_tf(df_d)
+        grade_w, trend_w, score_w = analyze_tf(df_w)
+        if grade_w == "C": return "C", "NEUTRAL", 0
+        final_score = (score_d * 0.6) + (score_w * 0.4)
+        
+        if final_score >= 95: final_grade = "A+"
+        elif final_score >= 85: final_grade = "A"
+        elif final_grade >= 70: final_grade = "B"
+        else: final_grade = "C"
+        return final_grade, trend_d, final_score
+
+    @staticmethod
+    def get_midnight_open_ny(df):
+        # LOGIQUE ORIGINALE V4.6 (Légèrement adaptée pour renvoyer aussi PDH/PDL si besoin)
+        try:
+            ny_tz = pytz.timezone('America/New_York')
+            df_ny = df.copy()
+            df_ny['time'] = pd.to_datetime(df_ny['time'], utc=True).dt.tz_convert(ny_tz)
+            midnight_candle = df_ny[df_ny['time'].dt.hour == 0]
+            if not midnight_candle.empty: return midnight_candle.iloc[-1]['open']
+            else: return None
+        except Exception: return None
+    
+    @staticmethod
+    def get_pdh_pdl(df_d):
+        # NOUVEAU (Helper simple pour PDH/PDL)
+        if len(df_d) < 2: return None, None
+        return df_d['high'].iloc[-2], df_d['low'].iloc[-2]
+
+    @staticmethod
     def detect_structure_zscore(df, lookback=20):
+        # LOGIQUE ORIGINALE V4.6
         if len(df) < lookback + 1: return 0
         window = df['close'].iloc[-lookback:]
         try:
             z_score = stats.zscore(window)[-1]
-            return z_score
+            if z_score > 1.5: return 1 
+            if z_score < -1.5: return -1 
         except: return 0
+        return 0 
 
+    # --- NOUVELLE FONCTION DEMANDÉE ---
+    
     @staticmethod
-    def get_context_levels(df_m5, df_d):
-        """
-        Retourne (PDH, PDL, Midnight_Open NY, Current_Price)
-        """
-        # 1. PDH / PDL depuis Daily
-        # df_d contient D[-1] (hier) et D[0] (aujourd'hui en cours)
-        # On veut hier (index -2 si quotidien, -1 si intraday et qu'on a la bougie d'hier fermée)
-        # En général df_d[-1] est la bougie en cours si 'D', ou la dernière fermée si 'D' dans past.
-        # Supposons que df_d inclut la bougie en cours. L'hier est -2.
-        if len(df_d) < 2: return None, None, None, None
+    def calculate_ha_smoothed(df, period=3):
+        # Calcul standard Heiken Ashi
+        ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
+        ha_open = np.zeros(len(df))
+        ha_open[0] = (df['open'].iloc[0] + df['close'].iloc[0]) / 2
+        for i in range(1, len(df)):
+            ha_open[i] = (ha_open[i-1] + ha_close[i-1]) / 2
         
-        pdh = df_d['high'].iloc[-2]
-        pdl = df_d['low'].iloc[-2]
+        # Lissage via EMA
+        smooth_open = pd.Series(ha_open).ewm(span=period).mean()
+        smooth_close = ha_close.ewm(span=period).mean()
         
-        # 2. Midnight Open NY
-        try:
-            ny_tz = pytz.timezone('America/New_York')
-            df_ny = df_m5.copy()
-            df_ny['time'] = pd.to_datetime(df_ny['time'], utc=True).dt.tz_convert(ny_tz)
-            
-            # On cherche la bougie à 00:00 NY de la session actuelle
-            # On filtre par heure 0
-            midnight_candles = df_ny[df_ny['time'].dt.hour == 0]
-            if not midnight_candles.empty:
-                # On prend le close de la dernière bougie de minuit trouvée (ou open, ici open)
-                midnight_open = midnight_candles.iloc[-1]['open']
-            else:
-                # Fallback : Open du jour actuel en Daily
-                midnight_open = df_d['open'].iloc[-1]
-                
-            current_price = df_m5['close'].iloc[-1]
-            return pdh, pdl, midnight_open, current_price
-        except Exception as e:
-            logging.error(f"Erreur Context Levels: {e}")
-            return None, None, None, None
-
-    @staticmethod
-    def check_session_killzone(current_dt_utc, force_open=False):
-        if force_open: return "24/7_FORCED"
-        hour = current_dt_utc.hour
-        if 7 <= hour < 13: return "LDN_SESSION"
-        if 13 <= hour < 16: return "NY_OVERLAP"
-        if 16 <= hour < 22: return "NY_SESSION"
-        return None
+        # Vérification de la couleur de la dernière bougie
+        if smooth_close.iloc[-1] > smooth_open.iloc[-1]: return 1 # Bull
+        else: return -1 # Bear
 
 # ==========================================
-# CURRENCY STRENGTH (Inchangé car efficace)
+# CURRENCY STRENGTH (V4.6)
 # ==========================================
 def get_currency_strength_rsi(api):
     now = datetime.now()
@@ -317,7 +346,7 @@ def get_currency_strength_rsi(api):
     return final_scores
 
 # ==========================================
-# FILTRE CORRÉLATION ÉTENDU
+# FILTRE CORRÉLATION (ÉTENDU)
 # ==========================================
 def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
     if not existing_signals: return False
@@ -326,7 +355,6 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
     if "_" not in new_sym: return False
     base, quote = new_sym.split('_')
     
-    # Matrice étendue V5.0
     CORRELATION_MAP = {
         'EUR_USD':  { 'GBP_USD': 0.9, 'AUD_USD': 0.85, 'USD_CHF': -0.9, 'NZD_USD': 0.8, 'EUR_GBP': -0.8 },
         'GBP_USD':  { 'EUR_USD': 0.9, 'EUR_GBP': -0.8, 'GBP_JPY': 0.8, 'GBP_AUD': 0.7 },
@@ -343,125 +371,119 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
         if new_sym == ex_sym: return True 
         if new_sym in CORRELATION_MAP and ex_sym in CORRELATION_MAP[new_sym]:
             corr = CORRELATION_MAP[new_sym][ex_sym]
-            if corr > 0.85 and new_type != ex_type: return True # Forte corr, sens opposé = conflit
-            if corr < -0.85 and new_type == ex_type: return True # Forte negative, meme sens = conflit
+            if corr > 0.85 and new_type != ex_type: return True 
+            if corr < -0.85 and new_type == ex_type: return True 
     return False
 
 # ==========================================
-# LOGIQUE DE PROBABILITÉ V5.0
+# LOGIQUE V5.1 (STRICT ICT)
 # ==========================================
-def calculate_signal_probability_v5(df_m5, df_h4, df_d, df_w, symbol, current_time_utc, spread_pips, force_open=False):
-    # 1. Setup de base
+def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, spread_pips, force_open=False):
+    details = {}
+    rejection_reason = None
+    
+    # 0. Params de base
     atr = QuantEngine.calculate_atr(df_m5)
     atr_pct = (atr / df_m5['close'].iloc[-1]) * 100
     params = get_asset_params(symbol)
     
-    if atr_pct < params['atr_threshold'] * 0.3:
-        return 0, {}, atr_pct, "Low Volatility (ATR)"
-    
-    session = QuantEngine.check_session_killzone(current_time_utc, force_open)
-    if session is None and not force_open:
-        return 0, {}, atr_pct, "Off Session"
-    
-    # 2. Calcul des indicateurs
-    hma_series = QuantEngine.calculate_hma(df_m5['close'], 20)
-    hma_trend = QuantEngine.get_hma_color_trend(hma_series)
-    
-    ha_trend = QuantEngine.calculate_ha_smoothed(df_m5)
-    
+    # 1. Indicateurs V4.6
+    pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
+    midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
     adx_val = QuantEngine.calculate_adx(df_h4)
     z_score = QuantEngine.detect_structure_zscore(df_h4)
+    fvg_active, fvg_type = QuantEngine.detect_smart_fvg(df_m5, atr)
+    inst_grade, inst_trend, _ = QuantEngine.get_institutional_grade(df_d, df_w)
     
-    pdh, pdl, midnight_open, curr_price = QuantEngine.get_context_levels(df_m5, df_d)
+    curr_price = df_m5['close'].iloc[-1]
     
-    # 3. Détermination de la direction potentielle (Trigger HMA + HA)
-    # On ne trade que si HMA et HA sont d'accord
-    direction_candidate = None
-    if hma_trend == 1 and ha_trend == 1:
-        direction_candidate = "BUY"
-    elif hma_trend == -1 and ha_trend == -1:
-        direction_candidate = "SELL"
+    # 2. Filtre ADX (Strict Mode)
+    if strict_mode and adx_val < 20:
+        return 0, {}, atr_pct, "ADX < 20 (Strict)"
     
-    if direction_candidate is None:
-        return 0, {}, atr_pct, "Indicateurs non alignés"
-        
-    # 4. Filtrage par Zones (PDH/PDL + Midnight)
-    # Logique demandée : Achat proche PDL et sous Midnight. Vente proche PDH et au dessus Midnight.
-    daily_range = pdh - pdl
+    # 3. HMA & HA M5 (Trigger)
+    hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
+    hma_slope_m5 = QuantEngine.hma_slope(hma_m5)
+    ha_status_m5 = QuantEngine.calculate_ha_smoothed(df_m5)
     
-    if direction_candidate == "BUY":
-        # Proximité PDL : Le prix doit être dans le tiers bas de la journée précédente
-        dist_to_pdl = (curr_price - pdl) / daily_range if daily_range > 0 else 1
-        
-        # Check Midnight
-        under_midnight = curr_price < midnight_open
-        
-        if dist_to_pdl > 0.4: return 0, {}, atr_pct, "Trop loin PDL"
-        if not under_midnight: return 0, {}, atr_pct, "Dessus Midnight (No Buy)"
-        if z_score > 2.0: return 0, {}, atr_pct, "Z-Score Trop Haut"
-        
-    else: # SELL
-        # Proximité PDH : Prix doit être dans le tiers haut
-        dist_to_pdh = (pdh - curr_price) / daily_range if daily_range > 0 else 1
-        
-        # Check Midnight
-        above_midnight = curr_price > midnight_open
-        
-        if dist_to_pdh > 0.4: return 0, {}, atr_pct, "Trop loin PDH"
-        if not above_midnight: return 0, {}, atr_pct, "Dessous Midnight (No Sell)"
-        if z_score < -2.0: return 0, {}, atr_pct, "Z-Score Trop Bas"
-
-    # 5. Scoring (0 à 1)
-    prob_factors = []
-    weights = []
-    details = {}
-    
-    # ADX Score
-    adx_score = min((adx_val - 15) / 15, 1.0) if adx_val > 15 else 0
-    prob_factors.append(adx_score)
-    weights.append(0.2)
-    details['adx_val'] = adx_val
-    
-    # Session Bonus
-    session_score = 1.0 if session in ["LDN_SESSION", "NY_OVERLAP"] else 0.6
-    prob_factors.append(session_score)
-    weights.append(0.1)
-    
-    # Structure Score (Inverse du Z-Score pour la sécurité)
-    # Plus on est proche de 0, mieux c'est pour l'entrée
-    structure_score = max(0, 1 - (abs(z_score)/2.0))
-    prob_factors.append(structure_score)
-    weights.append(0.2)
-    details['structure_z'] = z_score
-    
-    # HMA/HA Alignment (Ici c'est 1 car on a passé le filtre, mais on peut pondérer la pente)
-    slope_strength = abs(hma_series.iloc[-1] - hma_series.iloc[-5])
-    trend_score = min(slope_strength / (atr * 2), 1.0) # Pente relative à l'ATR
-    prob_factors.append(trend_score)
-    weights.append(0.3)
-    details['hma_slope'] = hma_trend
-    
-    # Zone Proximity Score (Plus c'est proche, mieux c'est)
-    if direction_candidate == "BUY":
-        prox_score = 1.0 - ((curr_price - pdl)/daily_range) if daily_range > 0 else 0.5
+    # Trigger Check
+    if direction == "BUY":
+        if not (hma_slope_m5 > 0 and ha_status_m5 > 0):
+            return 0, {}, atr_pct, "No M5 Trigger (HMA/HA)"
     else:
-        prox_score = 1.0 - ((pdh - curr_price)/daily_range) if daily_range > 0 else 0.5
-    prob_factors.append(prox_score)
-    weights.append(0.2)
+        if not (hma_slope_m5 < 0 and ha_status_m5 < 0):
+            return 0, {}, atr_pct, "No M5 Trigger (HMA/HA)"
+            
+    # 4. Zones (Midnight + PDH/PDL)
+    if pdh is None or midnight_open is None: return 0, {}, atr_pct, "Missing Levels"
     
-    total_weight = sum(weights)
-    weighted_prob = sum(p * w for p, w in zip(prob_factors, weights)) / total_weight
+    daily_range = pdh - pdl
+    if daily_range == 0: daily_range = atr # Fallback
     
-    # Ajout des details pour l'affichage
-    details['ha_status'] = ha_trend
-    details['midnight_pos'] = "Under" if direction_candidate == "BUY" else "Above"
+    if direction == "BUY":
+        if curr_price > midnight_open: return 0, {}, atr_pct, "Price > Midnight"
+        # Proche PDL ?
+        if curr_price > (pdl + (daily_range * 0.30)): return 0, {}, atr_pct, "Not Near PDL"
+        details['zone_status'] = "DISCOUNT (Near PDL)"
+    else:
+        if curr_price < midnight_open: return 0, {}, atr_pct, "Price < Midnight"
+        if curr_price < (pdh - (daily_range * 0.30)): return 0, {}, atr_pct, "Not Near PDH"
+        details['zone_status'] = "PREMIUM (Near PDH)"
+        
+    # 5. MTF Alignment (D1, H4, H1)
+    # H1 / H4 Alignment via HMA
+    hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
+    slope_h1 = QuantEngine.hma_slope(hma_h1)
     
-    return max(0, min(1.0, weighted_prob)), details, atr_pct, None, direction_candidate
+    hma_h4 = QuantEngine.calculate_hma(df_h4['close'], 20)
+    slope_h4 = QuantEngine.hma_slope(hma_h4)
+    
+    mtf_aligned = False
+    if direction == "BUY":
+        if slope_h1 > 0 and slope_h4 > 0: mtf_aligned = True
+        if "BULL" in inst_trend: mtf_aligned = True # Bonus D1
+    else:
+        if slope_h1 < 0 and slope_h4 < 0: mtf_aligned = True
+        if "BEAR" in inst_trend: mtf_aligned = True
+        
+    if not mtf_aligned:
+        return 0, {}, atr_pct, "MTF Misaligned"
+        
+    # 6. Structure (FVG / Support)
+    structure_valid = False
+    if direction == "BUY":
+        if fvg_active and fvg_type == "BULL": structure_valid = True
+    else:
+        if fvg_active and fvg_type == "BEAR": structure_valid = True
+        
+    # Si pas de FVG, on accepte si ZScore est modéré (pas une extension extrême)
+    if not structure_valid:
+        if abs(z_score) < 1.0: structure_valid = True
+        
+    if not structure_valid:
+        return 0, {}, atr_pct, "No Structure/FVG Support"
+        
+    # 7. Scoring
+    score = 0.7 # Base pour tout ce qui est passé
+    if adx_val > 25: score += 0.1
+    if abs(z_score) < 0.5: score += 0.1 # Clean structure
+    if "A+" in inst_grade: score += 0.1
+    
+    details['adx_val'] = adx_val
+    details['z_score'] = z_score
+    details['inst_grade'] = inst_grade
+    details['hma_slope'] = hma_slope_m5
+    details['ha_status'] = ha_status_m5
+    details['midnight'] = midnight_open
+    details['pdh_pdl'] = f"{pdl:.5f}/{pdh:.5f}"
+    details['fvg_active'] = fvg_active
+    
+    return min(score, 1.0), details, atr_pct, None
 
 # ==========================================
-# SCANNER
+# SCANNER V5.1
 # ==========================================
-def run_scan_v50_blue(api, min_prob, strict_mode, current_time_utc, force_open=False):
+def run_scan_v51_blue(api, min_prob, strict_mode, current_time_utc, force_open=False):
     cs_scores = get_currency_strength_rsi(api)
     signals = []
     rejected_log = []
@@ -471,84 +493,71 @@ def run_scan_v50_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
     
     for i, sym in enumerate(ASSETS):
         progress_bar.progress((i+1)/len(ASSETS))
-        status_text.markdown(f"⏳ Analyse: **{sym}** ({i+1}/{len(ASSETS)})")
+        status_text.markdown(f"⏳ Scan V5.1: **{sym}** ({i+1}/{len(ASSETS)})")
         
         try:
-            # Fetch Data
-            df_d_raw = api.get_candles(sym, "D", 250) # Besoin de D pour PDH/PDL
-            time.sleep(0.02)
-            df_m5 = api.get_candles(sym, "M5", 200) # M5 pour précision entry et HA
-            time.sleep(0.02)
+            # Fetch Data (D1, H4, H1, M5)
+            df_d_raw = api.get_candles(sym, "D", 250)
+            time.sleep(0.05)
             df_h4 = api.get_candles(sym, "H4", 100)
+            time.sleep(0.05)
+            df_h1 = api.get_candles(sym, "H1", 50)
+            time.sleep(0.05)
+            df_m5 = api.get_candles(sym, "M5", 200)
             
-            if df_m5.empty or df_h4.empty or df_d_raw.empty: 
-                rejected_log.append(f"{sym}: Données vides")
-                continue
+            if df_m5.empty or df_h1.empty or df_h4.empty or df_d_raw.empty: continue
             
-            # Process Daily
             df_d = df_d_raw.iloc[-100:].copy()
             df_w = df_d_raw.set_index('time').resample('W-FRI').agg({
                 'open':'first', 'high':'max', 'low':'min', 'close':'last'
             }).dropna().reset_index()
             
-            _, spread_pips = api.get_realtime_spread(sym)
+            spread_raw, spread_pips = api.get_realtime_spread(sym)
             
-            # Calcul Probabilité V5
-            # Note: La fonction determine elle-même la direction interne
-            prob, details, atr_pct, reject_reason, direction = calculate_signal_probability_v5(
-                df_m5, df_h4, df_d, df_w, sym, current_time_utc, spread_pips, force_open
-            )
-            
-            if reject_reason:
-                rejected_log.append(f"{sym}: {reject_reason}")
-                continue
+            # Scan Directions (Check both BUY and SELL triggers)
+            for direction in ["BUY", "SELL"]:
+                prob, details, atr_pct, reject_reason = calculate_signal_probability_v51(
+                    df_m5, df_h1, df_h4, df_d, df_w, sym, direction, strict_mode, spread_pips, force_open
+                )
                 
-            if prob < min_prob: 
-                rejected_log.append(f"{sym}: Score Faible ({prob:.2f})")
-                continue
-            
-            # Strict Mode sur structure ou spread ?
-            if strict_mode and spread_pips > 3.0: 
-                rejected_log.append(f"{sym}: Strict Spread")
-                continue
-
-            # Corrélation
-            temp_signal_obj = {'symbol': sym, 'type': direction}
-            if check_dynamic_correlation_conflict(temp_signal_obj, signals, cs_scores): 
-                rejected_log.append(f"{sym}: Corrélation")
-                continue
-            
-            # Currency Strength Alignment
-            cs_aligned = False
-            if "_" in sym:
-                base, quote = sym.split('_')
-                if cs_scores and base in cs_scores and quote in cs_scores:
-                    gap = cs_scores.get(base, 0) - cs_scores.get(quote, 0)
-                    if direction == "BUY" and gap > 0: cs_aligned = True
-                    elif direction == "SELL" and gap < 0: cs_aligned = True
-            elif "XAU" in sym or "US30" in sym: cs_aligned = True 
-
-            # Calcul SL/TP
-            price = df_m5['close'].iloc[-1]
-            atr = QuantEngine.calculate_atr(df_m5)
-            params = get_asset_params(sym)
-            
-            sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
-            tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
-            
-            signals.append({
-                'symbol': sym,
-                'type': direction,
-                'price': price,
-                'prob': prob,
-                'score_display': prob * 10,
-                'details': details,
-                'atr_pct': atr_pct,
-                'detection_time': datetime.now(),
-                'sl': sl, 'tp': tp, 'rr': params['tp_rr'],
-                'cs_aligned': cs_aligned, 'spread': spread_pips
-            })
-            
+                if reject_reason: 
+                    rejected_log.append(f"{sym} {direction}: {reject_reason}")
+                    continue
+                    
+                if prob < min_prob: 
+                    rejected_log.append(f"{sym} {direction}: Score {prob:.2f}")
+                    continue
+                
+                # Correlation Check
+                temp_signal = {'symbol': sym, 'type': direction}
+                if check_dynamic_correlation_conflict(temp_signal, signals, cs_scores):
+                    rejected_log.append(f"{sym} {direction}: Corrélation")
+                    continue
+                
+                # CS Alignment Check
+                cs_aligned = False
+                if "_" in sym:
+                    base, quote = sym.split('_')
+                    if cs_scores and base in cs_scores and quote in cs_scores:
+                        gap = cs_scores.get(base, 0) - cs_scores.get(quote, 0)
+                        if direction == "BUY" and gap > 0: cs_aligned = True
+                        elif direction == "SELL" and gap < 0: cs_aligned = True
+                
+                price = df_m5['close'].iloc[-1]
+                atr = QuantEngine.calculate_atr(df_m5)
+                params = get_asset_params(sym)
+                
+                sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
+                tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
+                
+                signals.append({
+                    'symbol': sym, 'type': direction, 'price': price,
+                    'prob': prob, 'score_display': prob * 10,
+                    'details': details, 'atr_pct': atr_pct,
+                    'sl': sl, 'tp': tp, 'rr': params['tp_rr'],
+                    'cs_aligned': cs_aligned, 'spread': spread_pips
+                })
+                
         except Exception as e:
             logging.warning(f"Erreur scan {sym}: {e}")
             continue
@@ -558,107 +567,64 @@ def run_scan_v50_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
     return sorted(signals, key=lambda x: x['prob'], reverse=True), rejected_log
 
 # ==========================================
-# AFFICHAGE V5.0
+# AFFICHAGE V5.1
 # ==========================================
-def display_sig_v5(s):
+def display_sig_v51(s):
     is_buy = s['type'] == 'BUY'
     col_type = "#10b981" if is_buy else "#ef4444"
     bg = "linear-gradient(90deg, #064e3b 0%, #065f46 100%)" if is_buy else "linear-gradient(90deg, #7f1d1d 0%, #991b1b 100%)"
     
-    sc = s['score_display']
-    
-    # Label basé sur le score et le contexte
-    label = "TACTICAL"
-    if sc >= 8.0: label = "INSTITUTIONAL 💎"
-    elif sc >= 7.0: label = "STRATEGIC ⭐"
-
-    with st.expander(f"{s['symbol']}  |  {s['type']}  |  {label}  [{sc:.1f}/10]", expanded=True):
+    with st.expander(f"{s['symbol']}  |  {s['type']}  |  SCORE {s['score_display']:.1f}", expanded=True):
         st.markdown(f"""
-        <div style="background:{bg};padding:15px;border-radius:8px;border:2px solid {col_type};
-                    display:flex;justify-content:space-between;align-items:center;">
-            <div>
-                <span style="font-size:1.8em;font-weight:900;color:white;">{s['symbol']}</span>
-                <span style="background:rgba(255,255,255,0.2);padding:2px 8px;border-radius:4px;color:white;margin-left:10px;">{s['type']}</span>
-            </div>
-            <div style="text-align:right;">
-                <div style="font-size:1.4em;font-weight:bold;color:white;">{s['price']:.5f}</div>
-                <div style="font-size:0.75em;color:#cbd5e1;">SPR: {s['spread']:.1f} | ATR: {s['atr_pct']:.3f}%</div>
-            </div>
+        <div style="background:{bg};padding:15px;border-radius:8px;border:2px solid {col_type};margin-bottom:10px;">
+            <span style="font-size:1.5em;font-weight:900;color:white;">{s['symbol']}</span>
+            <span style="float:right;color:white;font-size:1.2em;">{s['price']:.5f}</span>
         </div>""", unsafe_allow_html=True)
         
-        badges = []
-        # Badge HMA Status
-        hma_txt = "📈 HMA BULL" if s['details']['hma_slope'] > 0 else "📉 HMA BEAR"
-        badges.append(f"<span class='badge badge-blue'>{hma_txt}</span>")
+        d = s['details']
+        badges = [
+            f"<span class='badge badge-blue'>HMA: {'Up' if d['hma_slope']>0 else 'Down'}</span>",
+            f"<span class='badge badge-blue'>HA: {'Bull' if d['ha_status']>0 else 'Bear'}</span>",
+            f"<span class='badge badge-gold'>{d['inst_grade']}</span>",
+            f"<span class='badge'>ADX: {d['adx_val']:.1f}</span>"
+        ]
+        if s['cs_aligned']: badges.append("<span class='badge badge-session'>CS OK</span>")
+        if d['fvg_active']: badges.append("<span class='badge'>FVG ACTIVE</span>")
         
-        # Badge HA Status
-        ha_txt = "🟢 HA BULL" if s['details']['ha_status'] > 0 else "🔴 HA BEAR"
-        badges.append(f"<span class='badge badge-blue'>{ha_txt}</span>")
+        st.markdown(f"<div style='text-align:center;margin-bottom:10px'>{' '.join(badges)}</div>", unsafe_allow_html=True)
         
-        if s['cs_aligned']: badges.append("<span class='badge badge-gold'>CS ALIGNÉ</span>")
+        c1, c2 = st.columns(2)
+        c1.metric("Zone", d['zone_status'])
+        c2.metric("PDH / PDL", d['pdh_pdl'])
         
-        st.markdown(f"<div style='margin-top:10px;text-align:center'>{' '.join(badges)}</div>", unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # Bloc Context
-        c1, c2, c3, c4 = st.columns(4)
-        
-        with c1:
-            st.markdown("<div class='inst-label'>ADX TREND</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='inst-val'>{s['details']['adx_val']:.1f}</div>", unsafe_allow_html=True)
-            
-        with c2:
-            st.markdown("<div class='inst-label'>MIDNIGHT POS</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='inst-val'>{s['details']['midnight_pos']}</div>", unsafe_allow_html=True)
-
-        with c3:
-            st.markdown("<div class='inst-label'>STRUCTURE Z</div>", unsafe_allow_html=True)
-            z = s['details']['structure_z']
-            col_z = "#f87171" if abs(z) > 1.5 else "#60a5fa"
-            st.markdown(f"<div class='inst-val' style='color:{col_z}'>{z:.2f}</div>", unsafe_allow_html=True)
-
-        with c4:
-            st.markdown("<div class='inst-label'>RISK / REWARD</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='inst-val' style='color:#f59e0b'>1 : {s['rr']}</div>", unsafe_allow_html=True)
-            
-        st.write("")
-        ex1, ex2 = st.columns(2)
-        ex1.info(f"🛑 **SL:** {s['sl']:.5f}")
-        ex2.success(f"🎯 **TP:** {s['tp']:.5f}")
+        col_sl, col_tp = st.columns(2)
+        col_sl.info(f"🛑 SL: {s['sl']:.5f}")
+        col_tp.success(f"🎯 TP: {s['tp']:.5f}")
 
 # ==========================================
 # MAIN
 # ==========================================
 def main():
-    st.title("🛡️ BLUESTAR ULTIMATE V5.0")
-    st.markdown("<p style='text-align:center;color:#94a3b8;'>HMA/HA Trend + PDH/PDL/Midnight Logic</p>", unsafe_allow_html=True)
+    st.title("🛡️ BLUESTAR ULTIMATE V5.1")
+    st.markdown("<p style='text-align:center;color:#94a3b8;'>Strict ICT | V4.6 Indicators + HA Smoothed</p>", unsafe_allow_html=True)
     
-    st.sidebar.markdown(f"🕒 **Heure UTC Scanner:** {datetime.now(pytz.utc).strftime('%H:%M')}")
-
+    st.sidebar.markdown(f"🕒 UTC: {datetime.now(pytz.utc).strftime('%H:%M')}")
+    
     with st.sidebar:
-        st.header("⚙️ Configuration V5")
-        col_st, col_fo = st.columns(2)
-        strict_mode = col_st.checkbox("🔥 Strict", value=False)
-        force_open = col_fo.checkbox("🔓 24/7", value=False)
-        min_prob_display = st.slider("Confiance Min (%)", 50, 95, 75, 5)
+        st.header("⚙️ Config V5.1")
+        strict_mode = st.checkbox("🔥 Strict Mode (ADX > 20)", value=True)
+        min_prob = st.slider("Score Min", 60, 95, 75, 5)
         
-    if st.button("🔍 Lancer le Scan V5", type="primary"):
+    if st.button("🔍 Scan V5.1"):
         api = OandaClient()
-        current_sim_time = datetime.now(pytz.utc)
-        
-        with st.spinner("Analyse V5 (HMA/HA + Context Zones)..."):
-            results, logs = run_scan_v50_blue(api, min_prob_display/100.0, strict_mode, current_sim_time, force_open)
+        results, logs = run_scan_v51_blue(api, min_prob/100, strict_mode, datetime.now(pytz.utc))
         
         if not results:
-            st.warning("Aucun signal haute probabilité détecté.")
-            if logs:
-                with st.expander("Logs de diagnostic"):
-                    st.write(logs)
+            st.warning("Aucun signal V5.1.")
+            if logs: st.write(logs)
         else:
-            st.success(f"{len(results)} Opportunités détectées")
-            for sig in results:
-                display_sig_v5(sig)
+            st.success(f"{len(results)} Signaux")
+            for r in results: display_sig_v51(r)
 
 if __name__ == "__main__":
     main()
