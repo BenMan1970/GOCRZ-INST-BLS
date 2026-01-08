@@ -313,14 +313,14 @@ class QuantEngine:
 
     @staticmethod
     def detect_structure_zscore(df, lookback=20):
+        """Z-score pour détecter support/resistance statistique"""
         if len(df) < lookback + 1: return 0
         window = df['close'].iloc[-lookback:]
         try:
             z_score = stats.zscore(window)[-1]
-            if z_score > 1.5: return 1 
-            if z_score < -1.5: return -1 
-        except: return 0
-        return 0 
+            return z_score  # Retourne la valeur brute pour analyse
+        except: 
+            return 0 
 
     @staticmethod
     def calculate_ha_smoothed(df, period=3):
