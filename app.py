@@ -26,7 +26,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 st.set_page_config(page_title="Bluestar Ultimate V5.3 Enhanced", layout="centered", page_icon="🛡️")
 
-# Initialiser les logs en session_state au lieu d'un fichier CSV
+# Utiliser session_state au lieu de fichier CSV
 if 'trade_logs' not in st.session_state:
     st.session_state.trade_logs = []
 
@@ -192,7 +192,7 @@ class QuantEngine:
 
     @staticmethod
     def detect_smart_fvg(df, atr):
-        if len(df) < 4: return False, None, None, 0
+        if len(df) < 4: return False, None, None
         curr_close = df['close'].iloc[-1]
         min_gap = atr * 0.5
         high_1 = df['high'].iloc[-3]
@@ -204,37 +204,36 @@ class QuantEngine:
         
         gap_bull = low_3 - high_1
         if gap_bull > min_gap and curr_close > high_1 and vol_curr > vol_mean * 0.8: 
-            return True, "BULL", (high_1, low_3), 1
+            return True, "BULL", (high_1, low_3)
         gap_bear = low_1 - high_3
         if gap_bear > min_gap and curr_close < low_1 and vol_curr > vol_mean * 0.8: 
-            return True, "BEAR", (high_3, low_1), 1
-        return False, None, None, 0
+            return True, "BEAR", (high_3, low_1)
+        return False, None, None
 
     @staticmethod
     def detect_order_block(df, atr, direction):
-        if len(df) < 6: return False, None, 0
+        if len(df) < 6: return False, None
         
         for i in range(-5, -1):
             candle_body = abs(df['close'].iloc[i] - df['open'].iloc[i])
             impulse_body = abs(df['close'].iloc[i+1] - df['open'].iloc[i+1])
             is_significant = impulse_body > (candle_body * 1.5)
-            ob_age = abs(i)
             
             if direction == "BUY":
                 is_bearish = df['close'].iloc[i] < df['open'].iloc[i]
                 strong_rally = df['close'].iloc[i+1] > df['close'].iloc[i] + (atr * 0.3)
                 if is_bearish and strong_rally and is_significant:
                     ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
-                    return True, ob_zone, ob_age
+                    return True, ob_zone
                     
             else:
                 is_bullish = df['close'].iloc[i] > df['open'].iloc[i]
                 strong_drop = df['close'].iloc[i+1] < df['close'].iloc[i] - (atr * 0.3)
                 if is_bullish and strong_drop and is_significant:
                     ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
-                    return True, ob_zone, ob_age
+                    return True, ob_zone
                     
-        return False, None, 0
+        return False, None
 
     @staticmethod
     def is_price_in_zone(price, zone):
@@ -324,587 +323,633 @@ class QuantEngine:
         else: return -1
 
 # ==========================================
-# NOUVEAUX TWEAKS PRO
+# NOUVEAUX TWEAKS PRO (AJOUTÉS)
 # ==========================================
 
-def calculate_confluence_quality(signal, df_m5, fvg_zone, ob_zone, fvg_age, ob_age):
-    """Score la QUALITÉ de chaque élément de confluence"""
-    quality_score = 0
-    weights = {}
-    
-    price = signal['price']
-    
-    # FVG Quality
-    if signal['details'].get('fvg_active') and fvg_zone:
-        fvg_center = (fvg_zone[0] + fvg_zone[1]) / 2
-        distance_ratio = abs(price - fvg_center) / abs(fvg_zone[1] - fvg_zone[0])
-        fvg_quality = max(0, 1 - distance_ratio)
-        quality_score += fvg_quality * 0.20
-        weights['fvg_q'] = f"{fvg_quality:.2f}"
-    
-    # Order Block Quality
-    if signal['details'].get('ob_active') and ob_zone:
-        ob_quality = max(0, 1 - (ob_age / 20))
-        quality_score += ob_quality * 0.20
-        weights['ob_q'] = f"{ob_quality:.2f}"
-    
-    # ADX Quality (progressive)
-    adx = signal['details']['adx_val']
-    if adx >= 20:
-        adx_quality = min(1.0, (adx - 20) / 30)
-        quality_score += adx_quality * 0.15
-        weights['adx_q'] = f"{adx_quality:.2f}"
-    
-    # Zone Quality (distance à PDL/PDH)
-    pdh_pdl_str = signal['details']['pdh_pdl']
-    if '/' in pdh_pdl_str:
-        pdl = float(pdh_pdl_str.split('/')[0])
-        pdh = float(pdh_pdl_str.split('/')[1])
-        
-        if 'DISCOUNT' in signal['details']['zone_status']:
-            distance_to_pdl = abs(price - pdl) / price
-            zone_quality = max(0, 1 - (distance_to_pdl * 100))
-            quality_score += zone_quality * 0.25
-            weights['zone_q'] = f"{zone_quality:.2f}"
-        elif 'PREMIUM' in signal['details']['zone_status']:
-            distance_to_pdh = abs(price - pdh) / price
-            zone_quality = max(0, 1 - (distance_to_pdh * 100))
-            quality_score += zone_quality * 0.25
-            weights['zone_q'] = f"{zone_quality:.2f}"
-    
-    # MTF Strength
-    hma_h1_slope = signal['details'].get('hma_h1_slope', 0)
-    hma_h4_slope = signal['details'].get('hma_h4_slope', 0)
-    mtf_strength = (abs(hma_h1_slope) + abs(hma_h4_slope)) / 2
-    quality_score += min(mtf_strength * 10, 0.20)
-    weights['mtf_str'] = f"{mtf_strength:.3f}"
-    
-    return quality_score, weights
-
-
-def detect_optimal_entry_window(df_m5, signal):
-    """Identifie si on est dans la fenêtre idéale d'entrée"""
-    timing_score = 0
-    alerts = []
-    
-    # HMA juste passé au vert
-    hma_series = QuantEngine.calculate_hma(df_m5['close'], 20)
-    if len(hma_series) >= 5:
-        for i in range(-3, 0):
-            if signal['type'] == 'BUY':
-                if hma_series.iloc[i-1] < hma_series.iloc[i-2] and hma_series.iloc[i] > hma_series.iloc[i-1]:
-                    alerts.append("🎯 HMA Fresh Cross")
-                    timing_score += 0.3
-                    break
-            else:
-                if hma_series.iloc[i-1] > hma_series.iloc[i-2] and hma_series.iloc[i] < hma_series.iloc[i-1]:
-                    alerts.append("🎯 HMA Fresh Cross")
-                    timing_score += 0.3
-                    break
-    
-    # HA vient de changer
-    ha_changes = []
-    for i in range(-5, -1):
-        ha_curr = QuantEngine.calculate_ha_smoothed(df_m5.iloc[:i+1])
-        ha_changes.append(ha_curr)
-    
-    if len(ha_changes) >= 3:
-        if signal['type'] == 'BUY' and ha_changes[-1] > 0 and ha_changes[-2] <= 0:
-            alerts.append("⚡ HA Just Green")
-            timing_score += 0.3
-        elif signal['type'] == 'SELL' and ha_changes[-1] < 0 and ha_changes[-2] >= 0:
-            alerts.append("⚡ HA Just Red")
-            timing_score += 0.3
-    
-    # Volume spike
-    vol_avg = df_m5['volume'].rolling(20).mean().iloc[-1]
-    vol_current = df_m5['volume'].iloc[-1]
-    if vol_current > vol_avg * 1.3:
-        alerts.append("📊 Vol Spike")
-        timing_score += 0.2
-    
-    return min(timing_score, 1.0), alerts
-
-
-def adjust_for_execution_costs(signal):
-    """Downgrade le signal si spread mange le profit potentiel"""
-    spread_pips = signal['spread']
-    distance_to_tp = abs(signal['tp'] - signal['price'])
-    
-    if "JPY" in signal['symbol']:
+def evaluate_spread_impact(spread_pips, tp_distance, symbol):
+    """Évalue l'impact du spread sur le potentiel de profit"""
+    if "JPY" in symbol:
         pip_value = 0.01
-    elif any(x in signal['symbol'] for x in ['XAU', 'XAG']):
+    elif any(x in symbol for x in ['XAU', 'XAG']):
         pip_value = 0.01
     else:
         pip_value = 0.0001
     
-    tp_pips = distance_to_tp / pip_value
+    tp_pips = tp_distance / pip_value
     spread_ratio = spread_pips / tp_pips if tp_pips > 0 else 0
     
     if spread_ratio > 0.15:
-        signal['spread_warning'] = f"⚠️ HIGH ({spread_ratio*100:.1f}%)"
-        signal['adjusted_score'] = signal['prob'] * 0.7
+        return 0.7, f"⚠️ HIGH ({spread_ratio*100:.1f}%)"
     elif spread_ratio > 0.10:
-        signal['spread_warning'] = f"⚠️ Mod ({spread_ratio*100:.1f}%)"
-        signal['adjusted_score'] = signal['prob'] * 0.85
+        return 0.85, f"⚠️ Mod ({spread_ratio*100:.1f}%)"
     else:
-        signal['spread_warning'] = f"✅ Low ({spread_ratio*100:.1f}%)"
-        signal['adjusted_score'] = signal['prob']
+        return 1.0, f"✅ Low ({spread_ratio*100:.1f}%)"
+
+
+def check_entry_timing(df_m5, direction):
+    """Détecte si on est dans une fenêtre d'entrée optimale"""
+    timing_alerts = []
+    timing_score = 0.5
     
-    signal['spread_ratio'] = spread_ratio
-    return signal
+    # Volume spike
+    try:
+        vol_avg = df_m5['volume'].rolling(20).mean().iloc[-1]
+        vol_current = df_m5['volume'].iloc[-1]
+        if vol_current > vol_avg * 1.3:
+            timing_alerts.append("📊 Vol Spike")
+            timing_score += 0.2
+    except:
+        pass
+    
+    # HMA fresh cross (simplifié)
+    try:
+        hma_series = QuantEngine.calculate_hma(df_m5['close'], 20)
+        if len(hma_series) >= 3:
+            recent_slope = hma_series.iloc[-1] - hma_series.iloc[-3]
+            if direction == "BUY" and recent_slope > 0:
+                timing_alerts.append("🎯 HMA Momentum")
+                timing_score += 0.15
+            elif direction == "SELL" and recent_slope < 0:
+                timing_alerts.append("🎯 HMA Momentum")
+                timing_score += 0.15
+    except:
+        pass
+    
+    return min(timing_score, 1.0), timing_alerts
 
 
-def evaluate_level_freshness(df_d, pdh, pdl):
-    """PDH/PDL récemment testé = moins fiable"""
-    freshness_score = 1.0
+def evaluate_level_quality(df_d, pdh, pdl):
+    """Évalue la fraîcheur des niveaux PDH/PDL"""
+    quality_score = 1.0
     warnings = []
     
-    last_5_days = df_d.tail(5)
-    pdh_tests = sum(1 for h in last_5_days['high'] if abs(h - pdh) / pdh < 0.002)
-    pdl_tests = sum(1 for l in last_5_days['low'] if abs(l - pdl) / pdl < 0.002)
-    
-    if pdh_tests > 2:
-        warnings.append(f"PDH tested {pdh_tests}x")
-        freshness_score *= 0.8
-    
-    if pdl_tests > 2:
-        warnings.append(f"PDL tested {pdl_tests}x")
-        freshness_score *= 0.8
-    
-    for i in range(-1, -6, -1):
-        if abs(df_d['high'].iloc[i] - pdh) / pdh < 0.002:
-            days_since = abs(i)
-            if days_since == 1:
-                warnings.append("PDH Fresh")
-                freshness_score *= 1.1
-            break
-    
-    return freshness_score, warnings
-
-
-def add_contextual_metadata(signal, df_d, df_h4):
-    """Info contextuelle pour décision manuelle"""
-    metadata = {}
-    
-    # Tendance D
-    sma_50_d = df_d['close'].rolling(50).mean().iloc[-1]
-    price_vs_sma = ((signal['price'] - sma_50_d) / sma_50_d) * 100
-    metadata['d_trend'] = f"{'📈' if price_vs_sma > 0 else '📉'} {price_vs_sma:+.2f}% vs SMA50"
-    
-    # Dernière bougie H4
-    last_h4 = df_h4.iloc[-1]
-    h4_candle_size = abs(last_h4['close'] - last_h4['open'])
-    h4_atr = QuantEngine.calculate_atr(df_h4)
-    candle_strength = h4_candle_size / h4_atr if h4_atr > 0 else 0
-    
-    if candle_strength > 1.5:
-        metadata['h4_candle'] = f"🔥 Strong ({'Bull' if last_h4['close'] > last_h4['open'] else 'Bear'}) {candle_strength:.1f}x"
-    else:
-        metadata['h4_candle'] = f"Weak H4 {candle_strength:.1f}x"
-    
-    # Volatilité
-    current_atr = signal['atr_pct']
-    avg_atr_20 = df_d['close'].pct_change().abs().rolling(20).mean().iloc[-1] * 100
-    vol_ratio = current_atr / avg_atr_20 if avg_atr_20 > 0 else 1
-    
-    if vol_ratio > 1.3:
-        metadata['volatility'] = f"⚡ High Vol {vol_ratio:.1f}x"
-    elif vol_ratio < 0.7:
-        metadata['volatility'] = f"😴 Low Vol {vol_ratio:.1f}x"
-    else:
-        metadata['volatility'] = f"✅ Normal {vol_ratio:.1f}x"
-    
-    return metadata
-
-
-def calculate_final_rank(signals):
-    """Combine tous les scores pour ranking intelligent"""
-    for sig in signals:
-        base_score = sig.get('adjusted_score', sig['prob'])
-        confluence_quality = sig.get('confluence_quality', 0.5)
-        timing_score = sig.get('timing_score', 0.5)
-        freshness = sig.get('freshness_score', 1.0)
-        spread_penalty = 1.0 - sig.get('spread_ratio', 0)
+    try:
+        last_5_days = df_d.tail(5)
+        pdh_tests = sum(1 for h in last_5_days['high'] if abs(h - pdh) / pdh < 0.002)
+        pdl_tests = sum(1 for l in last_5_days['low'] if abs(l - pdl) / pdl < 0.002)
         
-        final_score = (
-            base_score * 0.35 +
-            confluence_quality * 0.25 +
-            timing_score * 0.20 +
-            freshness * 0.10 +
-            spread_penalty * 0.10
-        )
+        if pdh_tests > 2:
+            warnings.append(f"PDH tested {pdh_tests}x")
+            quality_score *= 0.85
         
-        sig['final_rank_score'] = final_score
-        sig['rank_breakdown'] = {
-            'base': f"{base_score:.2f}",
-            'confl_q': f"{confluence_quality:.2f}",
-            'timing': f"{timing_score:.2f}",
-            'fresh': f"{freshness:.2f}",
-            'spread': f"{spread_penalty:.2f}"
-        }
+        if pdl_tests > 2:
+            warnings.append(f"PDL tested {pdl_tests}x")
+            quality_score *= 0.85
+        
+        # Check freshness
+        if abs(df_d['high'].iloc[-1] - pdh) / pdh < 0.002:
+            warnings.append("PDH Fresh")
+            quality_score *= 1.1
+    except:
+        pass
     
-    return sorted(signals, key=lambda x: x['final_rank_score'], reverse=True)
+    return quality_score, warnings
 
 
 # ==========================================
-# SCANNER PRINCIPAL AVEC NOUVEAUX TWEAKS
+# CURRENCY STRENGTH
 # ==========================================
+def get_currency_strength_rsi(api):
+    now = datetime.now()
+    if st.session_state.cs_data.get('time') and (now - st.session_state.cs_data['time']).total_seconds() < 900:
+        return st.session_state.cs_data['data']
 
-def scan_all_markets(client):
-    """Scanner amélioré avec les nouveaux tweaks pro"""
+    forex_pairs = [p for p in ASSETS if "_" in p and "XAU" not in p and "XAG" not in p and "US30" not in p and "NAS100" not in p and "SPX500" not in p and "DE30" not in p]
+    prices = {}
+    
+    for pair in forex_pairs[:15]: 
+        try:
+            df = api.get_candles(pair, "H1", 50)
+            if df is not None and not df.empty: prices[pair] = df['close']
+            time.sleep(0.01) 
+        except Exception: continue
+
+    if not prices: return None
+    df_prices = pd.DataFrame(prices).ffill().bfill()
+    
+    def normalize_score(rsi_value): return ((rsi_value - 50) / 50 + 1) * 5
+
+    def calculate_rsi_series(series, period=14):
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).fillna(0)
+        loss = (-delta.where(delta < 0, 0)).fillna(0)
+        avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, 0.0001)
+        return 100 - (100 / (1 + rs))
+
+    currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
+    final_scores = {}
+
+    for curr in currencies:
+        total_score = 0.0; count = 0
+        opponents = [c for c in currencies if c != curr]
+        for opp in opponents:
+            pair_direct = f"{curr}_{opp}"
+            pair_inverse = f"{opp}_{curr}"
+            rsi_val = None
+            if pair_direct in df_prices.columns:
+                rsi_series = calculate_rsi_series(df_prices[pair_direct])
+                if not rsi_series.empty: rsi_val = rsi_series.iloc[-1]
+            elif pair_inverse in df_prices.columns:
+                inverted_price = 1 / df_prices[pair_inverse]
+                rsi_series = calculate_rsi_series(inverted_price)
+                if not rsi_series.empty: rsi_val = rsi_series.iloc[-1]
+            if rsi_val is not None:
+                total_score += normalize_score(rsi_val)
+                count +=1
+        
+        if count > 0: final_scores[curr] = total_score / count
+        else: final_scores[curr] = 5.0
+
+    st.session_state.cs_data = {'data': final_scores, 'time': now}
+    return final_scores
+
+# ==========================================
+# FILTRE CORRÉLATION
+# ==========================================
+def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
+    if not existing_signals: return False
+    new_sym = new_signal['symbol']
+    new_type = new_signal['type']
+    if "_" not in new_sym: return False
+    base, quote = new_sym.split('_')
+    
+    CORRELATION_MAP = {
+        'EUR_USD':  { 'GBP_USD': 0.9, 'AUD_USD': 0.85, 'USD_CHF': -0.9, 'NZD_USD': 0.8, 'EUR_GBP': -0.8 },
+        'GBP_USD':  { 'EUR_USD': 0.9, 'EUR_GBP': -0.8, 'GBP_JPY': 0.8, 'GBP_AUD': 0.7 },
+        'USD_JPY':  { 'USD_CHF': 0.7, 'EUR_JPY': 0.8, 'GBP_JPY': 0.8, 'CAD_JPY': 0.7 },
+        'AUD_USD':  { 'EUR_USD': 0.85, 'NZD_USD': 0.9, 'AUD_JPY': 0.8, 'AUD_NZD': 0.95 },
+        'NZD_USD':  { 'AUD_USD': 0.9, 'EUR_NZD': 0.8, 'NZD_JPY': 0.8, 'AUD_NZD': 0.95 },
+        'USD_CAD':  { 'USD_CHF': 0.7, 'AUD_CAD': 0.8, 'CAD_JPY': 0.7, 'EUR_CAD': 0.8 },
+        'USD_CHF':  { 'EUR_USD': -0.9, 'USD_JPY': 0.7, 'USD_CAD': 0.7, 'GBP_CHF': 0.8 },
+    }
+    
+    for existing in existing_signals:
+        ex_sym = existing['symbol']
+        ex_type = existing['type']
+        if new_sym == ex_sym: return True 
+        if new_sym in CORRELATION_MAP and ex_sym in CORRELATION_MAP[new_sym]:
+            corr = CORRELATION_MAP[new_sym][ex_sym]
+            if corr > 0.85 and new_type != ex_type: return True 
+            if corr < -0.85 and new_type == ex_type: return True 
+    return False
+
+# ==========================================
+# LOGIQUE V5.3 ENHANCED (AVEC TWEAKS)
+# ==========================================
+def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, adx_filter, mtf_filter, live_price_raw, spread_pips, current_time_utc, force_open=False):
+    details = {}
+    rejection_reason = None
+    
+    atr = QuantEngine.calculate_atr(df_m5)
+    
+    # Utilisation du prix LIVE
+    curr_price = live_price_raw if live_price_raw > 0 else df_m5['close'].iloc[-1]
+    
+    atr_pct = (atr / curr_price) * 100
+    params = get_asset_params(symbol)
+    
+    pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
+    midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
+    
+    # Calcul ADX H1 et M5
+    adx_m5 = QuantEngine.calculate_adx(df_m5)
+    adx_h1 = QuantEngine.calculate_adx(df_h1)
+    
+    z_score = QuantEngine.detect_structure_zscore(df_h4)
+    fvg_active, fvg_type, fvg_zone = QuantEngine.detect_smart_fvg(df_m5, atr)
+    ob_active, ob_zone = QuantEngine.detect_order_block(df_m5, atr, direction)
+    inst_grade, inst_trend, _ = QuantEngine.get_institutional_grade(df_d, df_w)
+    
+    # SESSION FILTER
+    session = QuantEngine.get_trading_session(current_time_utc)
+    if session == "ASIAN":
+        details['session_warning'] = "⚠️ ASIAN (Low liquidity)"
+    elif session in ["LONDON", "NY"]:
+        details['session'] = f"✅ {session}"
+    
+    # Filtre ADX: UNIQUEMENT SUR H1
+    if adx_filter:
+        if adx_h1 < 20:
+             return 0, {}, atr_pct, f"ADX H1 {adx_h1:.1f} < 20 (Weak Trend)", {}
+    
+    # HMA & HA M5
+    hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
+    hma_slope_m5 = QuantEngine.hma_slope(hma_m5)
+    ha_status_m5 = QuantEngine.calculate_ha_smoothed(df_m5)
+    
+    if direction == "BUY":
+        if not (hma_slope_m5 > 0 and ha_status_m5 > 0):
+            return 0, {}, atr_pct, "No M5 Trigger (HMA/HA)", {}
+    else:
+        if not (hma_slope_m5 < 0 and ha_status_m5 < 0):
+            return 0, {}, atr_pct, "No M5 Trigger (HMA/HA)", {}
+            
+    # Zones (Utilisation du prix LIVE)
+    if pdh is None or midnight_open is None: 
+        return 0, {}, atr_pct, "Missing Levels", {}
+    
+    daily_range = pdh - pdl
+    if daily_range == 0: daily_range = atr 
+    
+    if direction == "BUY":
+        if curr_price > midnight_open: 
+            return 0, {}, atr_pct, "Price > Midnight (Need Below for BUY)", {}
+        if curr_price > (pdl + (daily_range * 0.40)): 
+            return 0, {}, atr_pct, "Not in Discount Zone (Far from PDL)", {}
+        details['zone_status'] = "DISCOUNT (Below Midnight → PDH)"
+        details['target'] = f"PDH: {pdh:.5f}"
+    else:
+        if curr_price < midnight_open: 
+            return 0, {}, atr_pct, "Price < Midnight (Need Above for SELL)", {}
+        if curr_price < (pdh - (daily_range * 0.40)): 
+            return 0, {}, atr_pct, "Not in Premium Zone (Far from PDH)", {}
+        details['zone_status'] = "PREMIUM (Above Midnight → PDL)"
+        details['target'] = f"PDL: {pdl:.5f}"
+        
+    # MTF ALIGNEMENT
+    hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
+    slope_h1 = QuantEngine.hma_slope(hma_h1)
+    
+    hma_h4 = QuantEngine.calculate_hma(df_h4['close'], 20)
+    slope_h4 = QuantEngine.hma_slope(hma_h4)
+    
+    mtf_aligned = False
+    
+    if mtf_filter == "Strict (D+H4+H1)":
+        if direction == "BUY":
+            if slope_h1 > 0 and slope_h4 > 0 and "BULL" in inst_trend: mtf_aligned = True
+        else:
+            if slope_h1 < 0 and slope_h4 < 0 and "BEAR" in inst_trend: mtf_aligned = True
+    
+    elif mtf_filter == "Flexible (D+H4 OR H4+H1)":
+        if direction == "BUY":
+            condition1 = slope_h4 > 0 and "BULL" in inst_trend
+            condition2 = slope_h1 > 0 and slope_h4 > 0
+            if condition1 or condition2: mtf_aligned = True
+        else:
+            condition1 = slope_h4 < 0 and "BEAR" in inst_trend
+            condition2 = slope_h1 < 0 and slope_h4 < 0
+            if condition1 or condition2: mtf_aligned = True
+    
+    elif mtf_filter == "Light (H4 only)":
+        if direction == "BUY":
+            if slope_h4 > 0: mtf_aligned = True
+        else:
+            if slope_h4 < 0: mtf_aligned = True
+    
+    elif mtf_filter == "Off":
+        mtf_aligned = True
+        
+    if not mtf_aligned:
+        return 0, {}, atr_pct, f"MTF Misaligned ({mtf_filter})", {}
+        
+    # CONFLUENCE: FVG OU OB OU Support/Resistance
+    confluence_found = False
+    confluence_type = []
+    
+    if fvg_active:
+        price_in_fvg = QuantEngine.is_price_in_zone(curr_price, fvg_zone)
+        if direction == "BUY" and fvg_type == "BULL" and price_in_fvg:
+            confluence_found = True
+            confluence_type.append("FVG")
+        elif direction == "SELL" and fvg_type == "BEAR" and price_in_fvg:
+            confluence_found = True
+            confluence_type.append("FVG")
+    
+    if ob_active:
+        price_in_ob = QuantEngine.is_price_in_zone(curr_price, ob_zone)
+        if price_in_ob:
+            confluence_found = True
+            confluence_type.append("OB")
+    
+    if not confluence_found:
+        if direction == "BUY" and z_score < -1.0:
+            confluence_found = True
+            confluence_type.append("OVERSOLD")
+        elif direction == "SELL" and z_score > 1.0:
+            confluence_found = True
+            confluence_type.append("OVERBOUGHT")
+        
+    if not confluence_found:
+        return 0, {}, atr_pct, "No Confluence (Need FVG/OB/Support)", {}
+        
+    # Scoring
+    score = 0.70
+    
+    if adx_h1 > 25: score += 0.10
+    if adx_m5 > 30: score += 0.05
+    
+    if len(confluence_type) > 1: score += 0.05
+    
+    if "A+" in inst_grade: score += 0.10
+    elif "A" in inst_grade: score += 0.05
+    
+    if session in ["LONDON", "NY"]: score += 0.05
+    
+    # ============ NOUVEAUX TWEAKS AJOUTÉS ============
+    
+    # 1. Spread Impact
+    params_trade = get_asset_params(symbol)
+    tp = curr_price + (atr * params_trade['tp_rr']) if direction == "BUY" else curr_price - (atr * params_trade['tp_rr'])
+    spread_penalty, spread_warning = evaluate_spread_impact(spread_pips, abs(tp - curr_price), symbol)
+    score = score * spread_penalty
+    details['spread_warning'] = spread_warning
+    
+    # 2. Entry Timing
+    timing_score, timing_alerts = check_entry_timing(df_m5, direction)
+    score = score * (0.9 + (timing_score * 0.1))  # Boost jusqu'à 10%
+    details['timing_alerts'] = timing_alerts
+    
+    # 3. Level Quality
+    level_quality, level_warnings = evaluate_level_quality(df_d, pdh, pdl)
+    score = score * level_quality
+    details['level_warnings'] = level_warnings
+    
+    # =================================================
+    
+    details['adx_val'] = adx_m5
+    details['adx_h1'] = adx_h1
+    details['z_score'] = z_score
+    details['inst_grade'] = inst_grade
+    details['hma_slope'] = hma_slope_m5
+    details['ha_status'] = ha_status_m5
+    details['midnight'] = midnight_open
+    details['pdh_pdl'] = f"{pdl:.5f}/{pdh:.5f}"
+    details['confluence'] = " + ".join(confluence_type)
+    details['fvg_active'] = fvg_active
+    details['ob_active'] = ob_active
+    details['mtf_mode'] = mtf_filter
+    
+    enhanced_metrics = {
+        'spread_impact': spread_penalty,
+        'timing_score': timing_score,
+        'level_quality': level_quality
+    }
+    
+    return min(score, 1.0), details, atr_pct, None, enhanced_metrics
+
+# ==========================================
+# FONCTION HELPER POUR ASYNC
+# ==========================================
+def fetch_asset_data(api, sym):
+    try:
+        df_d_raw = api.get_candles(sym, "D", 250)
+        df_h4 = api.get_candles(sym, "H4", 100)
+        df_h1 = api.get_candles(sym, "H1", 50)
+        df_m5 = api.get_candles(sym, "M5", 200)
+        live_price, spread_pips = api.get_realtime_price_and_spread(sym)
+        return sym, df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips
+    except Exception as e:
+        return sym, None, None, None, None, 0, 0
+
+# ==========================================
+# SCANNER V5.3 ENHANCED
+# ==========================================
+def run_scan_v53_blue(api, min_prob, adx_filter, mtf_filter, current_time_utc, force_open=False):
+    cs_scores = get_currency_strength_rsi(api)
     signals = []
+    rejected_log = []
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
+    status_text.markdown(f"⏳ **Initialisation du scan parallèle...**")
     
-    def process_asset(symbol):
-        try:
-            params = get_asset_params(symbol)
-            
-            # Récupération des données
-            df_m5 = client.get_candles(symbol, "M5", 200)
-            df_h1 = client.get_candles(symbol, "H1", 200)
-            df_h4 = client.get_candles(symbol, "H4", 200)
-            df_d = client.get_candles(symbol, "D", 200)
-            df_w = client.get_candles(symbol, "W", 100)
-            
-            if any(df.empty for df in [df_m5, df_h1, df_h4, df_d, df_w]):
-                return None
-            
-            # Prix live et spread
-            live_price, spread = client.get_realtime_price_and_spread(symbol)
-            if live_price == 0:
-                live_price = df_m5['close'].iloc[-1]
-            
-            # Calculs techniques
-            atr_m5 = QuantEngine.calculate_atr(df_m5)
-            atr_h4 = QuantEngine.calculate_atr(df_h4)
-            adx_m5 = QuantEngine.calculate_adx(df_m5)
-            
-            atr_pct = (atr_m5 / live_price) * 100
-            if atr_pct < params['atr_threshold']:
-                return None
-            
-            # HMA Multi-Timeframe
-            hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
-            hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
-            hma_h4 = QuantEngine.calculate_hma(df_h4['close'], 20)
-            
-            hma_m5_slope = QuantEngine.hma_slope(hma_m5, lookback=5, min_slope=0.0001)
-            hma_h1_slope = QuantEngine.hma_slope(hma_h1, lookback=3, min_slope=0.0002)
-            hma_h4_slope = QuantEngine.hma_slope(hma_h4, lookback=2, min_slope=0.0003)
-            
-            # Détection structures
-            fvg_active, fvg_type, fvg_zone, fvg_age = QuantEngine.detect_smart_fvg(df_m5, atr_m5)
-            
-            # Heikin Ashi
-            ha_status = QuantEngine.calculate_ha_smoothed(df_m5)
-            
-            # PDH/PDL et zones
-            pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
-            if pdh is None or pdl is None:
-                return None
-            
-            mid = (pdh + pdl) / 2
-            is_discount = live_price < mid
-            is_premium = live_price > mid
-            
-            # Institutional Grade
-            inst_grade, inst_trend, inst_score = QuantEngine.get_institutional_grade(df_d, df_w)
-            if inst_grade == "C":
-                return None
-            
-            # Session
-            utc_now = datetime.now(pytz.utc)
-            session = QuantEngine.get_trading_session(utc_now)
-            
-            # Z-Score
-            zscore = QuantEngine.detect_structure_zscore(df_h4)
-            
-            # ==========================================
-            # LOGIQUE BUY
-            # ==========================================
-            if (hma_m5_slope == 1 and hma_h1_slope == 1 and hma_h4_slope == 1 and
-                ha_status == 1 and is_discount and adx_m5 >= 18):
-                
-                ob_active, ob_zone, ob_age = QuantEngine.detect_order_block(df_m5, atr_m5, "BUY")
-                
-                # Confluence count
-                confluence = sum([
-                    hma_m5_slope == 1,
-                    hma_h1_slope == 1,
-                    hma_h4_slope == 1,
-                    ha_status == 1,
-                    is_discount,
-                    fvg_active and fvg_type == "BULL",
-                    ob_active,
-                    adx_m5 >= 20
-                ])
-                
-                prob = min(confluence * 11.5, 95)
-                
-                # SL/TP
-                sl = live_price - (atr_h4 * params['sl_base'])
-                tp = live_price + (atr_h4 * params['tp_rr'] * params['sl_base'])
-                
-                signal = {
-                    'symbol': symbol,
-                    'type': 'BUY',
-                    'price': live_price,
-                    'sl': sl,
-                    'tp': tp,
-                    'prob': prob,
-                    'spread': spread,
-                    'atr_pct': atr_pct,
-                    'confluence': confluence,
-                    'session': session,
-                    'inst_grade': inst_grade,
-                    'inst_score': inst_score,
-                    'details': {
-                        'hma_m5': hma_m5_slope,
-                        'hma_h1_slope': hma_h1_slope,
-                        'hma_h4_slope': hma_h4_slope,
-                        'ha_status': "GREEN",
-                        'adx_val': adx_m5,
-                        'fvg_active': fvg_active,
-                        'fvg_type': fvg_type if fvg_active else None,
-                        'ob_active': ob_active,
-                        'zone_status': f"DISCOUNT ({((mid - live_price)/mid)*100:.2f}%)",
-                        'pdh_pdl': f"{pdl:.5f}/{pdh:.5f}",
-                        'zscore': zscore
-                    }
-                }
-                
-                # ==========================================
-                # NOUVEAUX TWEAKS PRO
-                # ==========================================
-                
-                # 1. Confluence Quality
-                confluence_quality, weights = calculate_confluence_quality(
-                    signal, df_m5, fvg_zone, ob_zone, fvg_age, ob_age
-                )
-                signal['confluence_quality'] = confluence_quality
-                signal['quality_weights'] = weights
-                
-                # 2. Entry Window Timing
-                timing_score, timing_alerts = detect_optimal_entry_window(df_m5, signal)
-                signal['timing_score'] = timing_score
-                signal['timing_alerts'] = timing_alerts
-                
-                # 3. Execution Costs
-                signal = adjust_for_execution_costs(signal)
-                
-                # 4. Level Freshness
-                freshness_score, fresh_warnings = evaluate_level_freshness(df_d, pdh, pdl)
-                signal['freshness_score'] = freshness_score
-                signal['freshness_warnings'] = fresh_warnings
-                
-                # 5. Contextual Metadata
-                metadata = add_contextual_metadata(signal, df_d, df_h4)
-                signal['context'] = metadata
-                
-                return signal
-            
-            # ==========================================
-            # LOGIQUE SELL
-            # ==========================================
-            elif (hma_m5_slope == -1 and hma_h1_slope == -1 and hma_h4_slope == -1 and
-                  ha_status == -1 and is_premium and adx_m5 >= 18):
-                
-                ob_active, ob_zone, ob_age = QuantEngine.detect_order_block(df_m5, atr_m5, "SELL")
-                
-                confluence = sum([
-                    hma_m5_slope == -1,
-                    hma_h1_slope == -1,
-                    hma_h4_slope == -1,
-                    ha_status == -1,
-                    is_premium,
-                    fvg_active and fvg_type == "BEAR",
-                    ob_active,
-                    adx_m5 >= 20
-                ])
-                
-                prob = min(confluence * 11.5, 95)
-                
-                sl = live_price + (atr_h4 * params['sl_base'])
-                tp = live_price - (atr_h4 * params['tp_rr'] * params['sl_base'])
-                
-                signal = {
-                    'symbol': symbol,
-                    'type': 'SELL',
-                    'price': live_price,
-                    'sl': sl,
-                    'tp': tp,
-                    'prob': prob,
-                    'spread': spread,
-                    'atr_pct': atr_pct,
-                    'confluence': confluence,
-                    'session': session,
-                    'inst_grade': inst_grade,
-                    'inst_score': inst_score,
-                    'details': {
-                        'hma_m5': hma_m5_slope,
-                        'hma_h1_slope': hma_h1_slope,
-                        'hma_h4_slope': hma_h4_slope,
-                        'ha_status': "RED",
-                        'adx_val': adx_m5,
-                        'fvg_active': fvg_active,
-                        'fvg_type': fvg_type if fvg_active else None,
-                        'ob_active': ob_active,
-                        'zone_status': f"PREMIUM (+{((live_price - mid)/mid)*100:.2f}%)",
-                        'pdh_pdl': f"{pdl:.5f}/{pdh:.5f}",
-                        'zscore': zscore
-                    }
-                }
-                
-                # Nouveaux tweaks pour SELL
-                confluence_quality, weights = calculate_confluence_quality(
-                    signal, df_m5, fvg_zone, ob_zone, fvg_age, ob_age
-                )
-                signal['confluence_quality'] = confluence_quality
-                signal['quality_weights'] = weights
-                
-                timing_score, timing_alerts = detect_optimal_entry_window(df_m5, signal)
-                signal['timing_score'] = timing_score
-                signal['timing_alerts'] = timing_alerts
-                
-                signal = adjust_for_execution_costs(signal)
-                
-                freshness_score, fresh_warnings = evaluate_level_freshness(df_d, pdh, pdl)
-                signal['freshness_score'] = freshness_score
-                signal['freshness_warnings'] = fresh_warnings
-                
-                metadata = add_contextual_metadata(signal, df_d, df_h4)
-                signal['context'] = metadata
-                
-                return signal
-            
-            return None
-            
-        except Exception as e:
-            return None
+    asset_data = {}
     
-    # Scan parallèle
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(process_asset, symbol): symbol for symbol in ASSETS}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_asset_data, api, sym): sym for sym in ASSETS}
+        completed_count = 0
+        for future in as_completed(futures):
+            sym, df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips = future.result()
+            if df_m5 is not None and not df_m5.empty:
+                asset_data[sym] = (df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips)
+            completed_count += 1
+            progress_bar.progress(completed_count / len(ASSETS))
+            status_text.markdown(f"⏳ Données reçues: {sym} ({completed_count}/{len(ASSETS)})")
+
+    status_text.markdown("⏳ Analyse technique en cours...")
+    
+    for sym in asset_data:
+        df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips = asset_data[sym]
         
-        for i, future in enumerate(as_completed(futures)):
-            progress_bar.progress((i + 1) / len(ASSETS))
-            status_text.text(f"🔍 Scanning {futures[future]}...")
+        if df_m5.empty or df_h1.empty or df_h4.empty or df_d_raw.empty: 
+            continue
+        
+        df_d = df_d_raw.iloc[-100:].copy()
+        df_w = df_d_raw.set_index('time').resample('W-FRI').agg({
+            'open':'first', 'high':'max', 'low':'min', 'close':'last'
+        }).dropna().reset_index()
+        
+        for direction in ["BUY", "SELL"]:
+            prob, details, atr_pct, reject_reason, enhanced_metrics = calculate_signal_probability_v53(
+                df_m5, df_h1, df_h4, df_d, df_w, sym, direction, None, adx_filter, mtf_filter, live_price, spread_pips, current_time_utc, force_open
+            )
             
-            result = future.result()
-            if result:
-                signals.append(result)
-    
+            if reject_reason: 
+                rejected_log.append(f"{sym} {direction}: {reject_reason}")
+                continue
+                
+            if prob < min_prob: 
+                rejected_log.append(f"{sym} {direction}: Score {prob:.2f}")
+                continue
+            
+            temp_signal = {'symbol': sym, 'type': direction}
+            if check_dynamic_correlation_conflict(temp_signal, signals, cs_scores):
+                rejected_log.append(f"{sym} {direction}: Corrélation")
+                continue
+            
+            cs_aligned = False
+            if "_" in sym:
+                base, quote = sym.split('_')
+                if cs_scores and base in cs_scores and quote in cs_scores:
+                    gap = cs_scores.get(base, 0) - cs_scores.get(quote, 0)
+                    if direction == "BUY" and gap > 0: cs_aligned = True
+                    elif direction == "SELL" and gap < 0: cs_aligned = True
+            
+            price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
+            atr = QuantEngine.calculate_atr(df_m5)
+            params = get_asset_params(sym)
+            
+            sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
+            tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
+            
+            signals.append({
+                'symbol': sym, 'type': direction, 'price': price,
+                'prob': prob, 'score_display': prob * 10,
+                'details': details, 'atr_pct': atr_pct,
+                'sl': sl, 'tp': tp, 'rr': params['tp_rr'],
+                'cs_aligned': cs_aligned, 'spread': spread_pips,
+                'enhanced_metrics': enhanced_metrics
+            })
+            
     progress_bar.empty()
     status_text.empty()
-    
-    # Ranking final avec les nouveaux scores
-    if signals:
-        signals = calculate_final_rank(signals)
-    
-    return signals
-
+    return sorted(signals, key=lambda x: x['prob'], reverse=True), rejected_log
 
 # ==========================================
-# INTERFACE STREAMLIT
+# AFFICHAGE ENHANCED
 # ==========================================
+def display_sig_v53(s):
+    is_buy = s['type'] == 'BUY'
+    col_type = "#10b981" if is_buy else "#ef4444"
+    bg = "linear-gradient(90deg, #064e3b 0%, #065f46 100%)" if is_buy else "linear-gradient(90deg, #7f1d1d 0%, #991b1b 100%)"
+    
+    # Calculer un RANK SCORE basé sur les metrics
+    em = s.get('enhanced_metrics', {})
+    rank_score = (
+        s['prob'] * 0.60 +
+        em.get('spread_impact', 1.0) * 0.20 +
+        em.get('timing_score', 0.5) * 0.10 +
+        em.get('level_quality', 1.0) * 0.10
+    )
+    
+    if rank_score >= 0.85:
+        rank_badge = f"<span class='badge badge-gold'>★ PREMIUM ({rank_score:.2f})</span>"
+    elif rank_score >= 0.75:
+        rank_badge = f"<span class='badge badge-blue'>STRONG ({rank_score:.2f})</span>"
+    else:
+        rank_badge = f"<span class='badge'>STANDARD ({rank_score:.2f})</span>"
+    
+    with st.expander(f"{'📈' if is_buy else '📉'} {s['symbol']}  |  {s['type']}  |  SCORE {s['score_display']:.1f}/10", expanded=True):
+        st.markdown(f"""
+        <div style="background:{bg};padding:15px;border-radius:8px;border:2px solid {col_type};margin-bottom:10px;">
+            <span style="font-size:1.5em;font-weight:900;color:white;">{s['symbol']}</span>
+            <span style="float:right;color:white;font-size:1.2em;">{s['price']:.5f}</span>
+        </div>""", unsafe_allow_html=True)
+        
+        st.markdown(f"<div style='text-align:center;margin-bottom:10px'>{rank_badge}</div>", unsafe_allow_html=True)
+        
+        d = s['details']
+        
+        badges = [
+            f"<span class='badge badge-blue'>HMA: {'🟢 Up' if d['hma_slope']>0 else '🔴 Down'}</span>",
+            f"<span class='badge badge-blue'>HA: {'🟢 Bull' if d['ha_status']>0 else '🔴 Bear'}</span>",
+            f"<span class='badge badge-gold'>{d['inst_grade']}</span>",
+            f"<span class='badge'>ADX H1: {d.get('adx_h1', 0):.1f}</span>",
+            f"<span class='badge'>MTF: {d.get('mtf_mode', 'N/A')}</span>"
+        ]
+        
+        if 'confluence' in d:
+            badges.append(f"<span class='badge badge-session'>🎯 {d['confluence']}</span>")
+        
+        if s['cs_aligned']: 
+            badges.append("<span class='badge badge-session'>💪 CS OK</span>")
+        
+        if 'session' in d:
+            badges.append(f"<span class='badge'>{d['session']}</span>")
+        elif 'session_warning' in d:
+            badges.append(f"<span class='badge' style='background:#f59e0b;color:black;'>{d['session_warning']}</span>")
+        
+        st.markdown(f"<div style='text-align:center;margin-bottom:10px'>{' '.join(badges)}</div>", unsafe_allow_html=True)
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Zone", d['zone_status'])
+        c2.metric("PDH / PDL", d['pdh_pdl'])
+        if 'target' in d:
+            c3.metric("Target", d['target'])
+        
+        col_sl, col_tp = st.columns(2)
+        col_sl.info(f"🛑 SL: {s['sl']:.5f} (R:{s['rr']:.1f})")
+        col_tp.success(f"🎯 TP: {s['tp']:.5f}")
+        
+        # NOUVEAUX INDICATEURS ENHANCED
+        st.markdown("---")
+        st.markdown("**📊 Quality Metrics Enhanced**")
+        
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("Spread Impact", d.get('spread_warning', 'N/A'))
+        col_b.metric("Timing Score", f"{em.get('timing_score', 0)*100:.0f}%")
+        col_c.metric("Level Quality", f"{em.get('level_quality', 1)*100:.0f}%")
+        
+        if d.get('timing_alerts'):
+            st.info(" | ".join(d['timing_alerts']))
+        
+        if d.get('level_warnings'):
+            for warn in d['level_warnings']:
+                st.caption(f"🔄 {warn}")
+        
+        with st.expander("📊 Détails techniques"):
+            st.write(f"**Midnight Open:** {d['midnight']:.5f}")
+            st.write(f"**Z-Score H4:** {d['z_score']:.2f}")
+            st.write(f"**Spread:** {s['spread']:.1f} pips")
+            st.write(f"**ATR %:** {s['atr_pct']:.3f}%")
+            st.write(f"**ADX M5:** {d['adx_val']:.1f}")
+            if d.get('fvg_active'):
+                st.success("✅ FVG détecté")
+            if d.get('ob_active'):
+                st.success("✅ Order Block détecté")
 
+# ==========================================
+# MAIN
+# ==========================================
 def main():
-    st.markdown("<h1>🛡️ BLUESTAR ULTIMATE V5.3 ENHANCED</h1>", unsafe_allow_html=True)
+    st.title("🛡️ BLUESTAR ULTIMATE V5.3 ENHANCED")
+    st.markdown("<p style='text-align:center;color:#94a3b8;'>Scanner institutionnel | MTF Flexible | Enhanced Quality Metrics</p>", unsafe_allow_html=True)
     
-    client = OandaClient()
+    current_time_utc = datetime.now(pytz.utc)
+    session = QuantEngine.get_trading_session(current_time_utc)
     
-    col1, col2 = st.columns([3, 1])
+    session_colors = {
+        "ASIAN": "#f59e0b",
+        "LONDON": "#10b981", 
+        "NY": "#3b82f6",
+        "OFF": "#6b7280"
+    }
+    session_color = session_colors.get(session, "#6b7280")
     
-    with col1:
-        if st.button("🚀 LANCER LE SCAN", use_container_width=True):
-            with st.spinner("⚡ Analyse en cours..."):
-                signals = scan_all_markets(client)
+    st.sidebar.markdown(f"""
+        <div style='background:{session_color};padding:10px;border-radius:8px;text-align:center;margin-bottom:15px;'>
+            <div style='font-size:0.8em;color:white;opacity:0.8;'>🕒 UTC: {current_time_utc.strftime('%H:%M')}</div>
+            <div style='font-size:1.1em;font-weight:700;color:white;'>📍 {session} SESSION</div>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    with st.sidebar:
+        st.header("⚙️ Filtres")
+        
+        mtf_filter = st.selectbox(
+            "🎯 Alignement Multi-Timeframe",
+            ["Strict (D+H4+H1)", "Flexible (D+H4 OR H4+H1)", "Light (H4 only)", "Off"],
+            index=0,
+            help="Strict = tous alignés | Flexible = 2 sur 3 | Light = H4 seul | Off = pas de filtre"
+        )
+        
+        adx_filter = st.checkbox(
+            "🔥 Filtre ADX H1", 
+            value=True,
+            help="Exige ADX supérieur à 20 sur H1 pour confirmer la tendance de fond"
+        )
+        
+        min_prob = st.slider("Score Minimum", 60, 95, 75, 5)
+        
+    if st.button("🔍 LANCER LE SCAN V5.3 ENHANCED"):
+        with st.spinner("🔄 Scan en cours..."):
+            api = OandaClient()
+            results, logs = run_scan_v53_blue(api, min_prob/100, adx_filter, mtf_filter, current_time_utc)
+        
+        if not results:
+            st.warning("⚠️ Aucun signal trouvé avec les critères actuels.")
+            st.info("""
+            **💡 Suggestions pour obtenir plus de signaux:**
+            - Essayer mode MTF **Flexible** ou **Light**
+            - Désactiver le filtre ADX temporairement
+            - Réduire le score minimum à 70
+            """)
+            with st.expander("📋 Logs de rejet (pourquoi pas de signaux)"):
+                for log in logs[:25]: 
+                    st.text(log)
+        else:
+            st.success(f"✅ **{len(results)} Signal(s) détecté(s)** - Enhanced Quality Analysis!")
+            st.info(f"🎯 **Filtre actif:** MTF = {mtf_filter} | ADX H1 = {'ON' if adx_filter else 'OFF'}")
             
-            if not signals:
-                st.warning("❌ Aucun signal détecté actuellement")
-                return
+            for r in results: 
+                display_sig_v53(r)
             
-            st.success(f"✅ **{len(signals)} opportunités détectées**")
-            
-            # Affichage des signaux
-            for idx, sig in enumerate(signals, 1):
-                rank_score = sig['final_rank_score']
-                
-                # Badge de qualité
-                if rank_score >= 0.80:
-                    rank_badge = f"<span class='badge badge-gold'>★ RANK #{idx} - PREMIUM ({rank_score:.2f})</span>"
-                elif rank_score >= 0.65:
-                    rank_badge = f"<span class='badge badge-blue'>RANK #{idx} - STRONG ({rank_score:.2f})</span>"
-                else:
-                    rank_badge = f"<span class='badge'>RANK #{idx} - STANDARD ({rank_score:.2f})</span>"
-                
-                with st.expander(
-                    f"{'🟢' if sig['type'] == 'BUY' else '🔴'} {sig['symbol']} - "
-                    f"{sig['type']} @ {sig['price']:.5f} | Score: {sig['prob']:.0f}%",
-                    expanded=(idx <= 3)
-                ):
-                    st.markdown(rank_badge, unsafe_allow_html=True)
-                    
-                    # Métriques principales
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("SL", f"{sig['sl']:.5f}")
-                    col2.metric("TP", f"{sig['tp']:.5f}")
-                    col3.metric("Spread", f"{sig['spread']:.1f} pips")
-                    col4.metric("ATR%", f"{sig['atr_pct']:.2f}%")
-                    
-                    # Confluence Quality
-                    st.markdown("**📊 Confluence Quality**")
-                    st.progress(sig['confluence_quality'])
-                    st.caption(f"Weights: {sig['quality_weights']}")
-                    
-                    # Timing Window
-                    if sig.get('timing_alerts'):
-                        st.markdown("**⏰ Entry Timing**")
-                        for alert in sig['timing_alerts']:
-                            st.info(alert)
-                        st.progress(sig['timing_score'])
-                    
-                    # Spread Warning
-                    st.markdown(f"**💰 Execution Cost:** {sig['spread_warning']}")
-                    
-                    # Freshness
-                    if sig.get('freshness_warnings'):
-                        st.markdown("**🔄 Level Freshness**")
-                        for warn in sig['freshness_warnings']:
-                            st.caption(warn)
-                    
-                    # Context
-                    if sig.get('context'):
-                        st.markdown("**📈 Market Context**")
-                        for key, val in sig['context'].items():
-                            st.caption(f"{key}: {val}")
-                    
-                    # Détails techniques
-                    with st.expander("🔧 Détails techniques"):
-                        st.json({
-                            'HMA_M5': sig['details']['hma_m5'],
-                            'HMA_H1': sig['details']['hma_h1_slope'],
-                            'HMA_H4': sig['details']['hma_h4_slope'],
-                            'HA_Status': sig['details']['ha_status'],
-                            'ADX': sig['details']['adx_val'],
-                            'FVG': sig['details']['fvg_type'],
-                            'OB': sig['details']['ob_active'],
-                            'Zone': sig['details']['zone_status'],
-                            'Session': sig['session'],
-                            'Grade': sig['inst_grade']
-                        })
-                    
-                    # Rank Breakdown
-                    with st.expander("🎯 Rank Breakdown"):
-                        st.json(sig['rank_breakdown'])
-    
-    with col2:
-        st.markdown("### ⚙️ Infos")
-        st.caption(f"🕐 {datetime.now().strftime('%H:%M:%S')}")
-        st.caption(f"📊 {len(ASSETS)} marchés")
-
+            with st.expander("📋 Voir tous les rejets"):
+                for log in logs:
+                    st.text(log)
 
 if __name__ == "__main__":
     main()
