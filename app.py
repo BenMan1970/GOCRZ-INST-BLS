@@ -24,7 +24,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 logging.getLogger().setLevel(logging.ERROR)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-st.set_page_config(page_title="Bluestar Ultimate V5.3", layout="centered", page_icon="🛡️")
+st.set_page_config(page_title="Bluestar Ultimate V5.3 Enhanced", layout="centered", page_icon="🛡️")
 
 LOG_FILE = "bluestar_v53_log.csv"
 
@@ -33,7 +33,7 @@ if not os.path.exists(LOG_FILE):
         writer = csv.writer(file)
         writer.writerow([
             "timestamp", "symbol", "direction", "price", "score", "hma_m5", "ha_status", 
-            "pdh_pdl_status", "fvg_status", "mtf_strict", "adx_m5", "sl", "tp"
+            "pdh_pdl_status", "fvg_status", "mtf_strict", "adx_m5", "sl", "tp", "rank_score"
         ])
 
 st.markdown("""
@@ -60,6 +60,7 @@ st.markdown("""
     .badge-session { background: linear-gradient(135deg, #db2777 0%, #ec4899 100%); }
     .badge-blue { background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%); }
     .badge-gold { background: linear-gradient(135deg, #fbbf24 0%, #d97706 100%); color: black; }
+    .badge-rank { background: linear-gradient(135deg, #10b981 0%, #059669 100%); font-size: 0.85em; }
     .inst-label { color:#94a3b8; font-size:0.8em; text-transform: uppercase; letter-spacing: 1px; }
     .inst-val { font-size: 1.1em; font-weight: 700; color: #f1f5f9; }
 </style>
@@ -197,7 +198,7 @@ class QuantEngine:
 
     @staticmethod
     def detect_smart_fvg(df, atr):
-        if len(df) < 4: return False, None, None
+        if len(df) < 4: return False, None, None, 0
         curr_close = df['close'].iloc[-1]
         min_gap = atr * 0.5
         high_1 = df['high'].iloc[-3]
@@ -209,36 +210,37 @@ class QuantEngine:
         
         gap_bull = low_3 - high_1
         if gap_bull > min_gap and curr_close > high_1 and vol_curr > vol_mean * 0.8: 
-            return True, "BULL", (high_1, low_3)
+            return True, "BULL", (high_1, low_3), 1  # Age = 1 (récent)
         gap_bear = low_1 - high_3
         if gap_bear > min_gap and curr_close < low_1 and vol_curr > vol_mean * 0.8: 
-            return True, "BEAR", (high_3, low_1)
-        return False, None, None
+            return True, "BEAR", (high_3, low_1), 1
+        return False, None, None, 0
 
     @staticmethod
     def detect_order_block(df, atr, direction):
-        if len(df) < 6: return False, None
+        if len(df) < 6: return False, None, 0
         
         for i in range(-5, -1):
             candle_body = abs(df['close'].iloc[i] - df['open'].iloc[i])
             impulse_body = abs(df['close'].iloc[i+1] - df['open'].iloc[i+1])
             is_significant = impulse_body > (candle_body * 1.5)
+            ob_age = abs(i)
             
             if direction == "BUY":
                 is_bearish = df['close'].iloc[i] < df['open'].iloc[i]
                 strong_rally = df['close'].iloc[i+1] > df['close'].iloc[i] + (atr * 0.3)
                 if is_bearish and strong_rally and is_significant:
                     ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
-                    return True, ob_zone
+                    return True, ob_zone, ob_age
                     
             else:  # SELL
                 is_bullish = df['close'].iloc[i] > df['open'].iloc[i]
                 strong_drop = df['close'].iloc[i+1] < df['close'].iloc[i] - (atr * 0.3)
                 if is_bullish and strong_drop and is_significant:
                     ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
-                    return True, ob_zone
+                    return True, ob_zone, ob_age
                     
-        return False, None
+        return False, None, 0
 
     @staticmethod
     def is_price_in_zone(price, zone):
@@ -328,490 +330,224 @@ class QuantEngine:
         else: return -1
 
 # ==========================================
-# CURRENCY STRENGTH
+# NOUVEAUX TWEAKS PRO
 # ==========================================
-def get_currency_strength_rsi(api):
-    now = datetime.now()
-    if st.session_state.cs_data.get('time') and (now - st.session_state.cs_data['time']).total_seconds() < 900:
-        return st.session_state.cs_data['data']
 
-    forex_pairs = [p for p in ASSETS if "_" in p and "XAU" not in p and "XAG" not in p and "US30" not in p and "NAS100" not in p and "SPX500" not in p and "DE30" not in p]
-    prices = {}
+def calculate_confluence_quality(signal, df_m5, fvg_zone, ob_zone, fvg_age, ob_age):
+    """Score la QUALITÉ de chaque élément de confluence"""
+    quality_score = 0
+    weights = {}
     
-    for pair in forex_pairs[:15]: 
-        try:
-            df = api.get_candles(pair, "H1", 50)
-            if df is not None and not df.empty: prices[pair] = df['close']
-            time.sleep(0.01) 
-        except Exception: continue
-
-    if not prices: return None
-    df_prices = pd.DataFrame(prices).ffill().bfill()
+    price = signal['price']
     
-    def normalize_score(rsi_value): return ((rsi_value - 50) / 50 + 1) * 5
-
-    def calculate_rsi_series(series, period=14):
-        delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).fillna(0)
-        loss = (-delta.where(delta < 0, 0)).fillna(0)
-        avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-        rs = avg_gain / avg_loss.replace(0, 0.0001)
-        return 100 - (100 / (1 + rs))
-
-    currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
-    final_scores = {}
-
-    for curr in currencies:
-        total_score = 0.0; count = 0
-        opponents = [c for c in currencies if c != curr]
-        for opp in opponents:
-            pair_direct = f"{curr}_{opp}"
-            pair_inverse = f"{opp}_{curr}"
-            rsi_val = None
-            if pair_direct in df_prices.columns:
-                rsi_series = calculate_rsi_series(df_prices[pair_direct])
-                if not rsi_series.empty: rsi_val = rsi_series.iloc[-1]
-            elif pair_inverse in df_prices.columns:
-                inverted_price = 1 / df_prices[pair_inverse]
-                rsi_series = calculate_rsi_series(inverted_price)
-                if not rsi_series.empty: rsi_val = rsi_series.iloc[-1]
-            if rsi_val is not None:
-                total_score += normalize_score(rsi_val)
-                count +=1
+    # FVG Quality
+    if signal['details'].get('fvg_active') and fvg_zone:
+        fvg_center = (fvg_zone[0] + fvg_zone[1]) / 2
+        distance_ratio = abs(price - fvg_center) / abs(fvg_zone[1] - fvg_zone[0])
+        fvg_quality = max(0, 1 - distance_ratio)
+        quality_score += fvg_quality * 0.20
+        weights['fvg_q'] = f"{fvg_quality:.2f}"
+    
+    # Order Block Quality
+    if signal['details'].get('ob_active') and ob_zone:
+        ob_quality = max(0, 1 - (ob_age / 20))
+        quality_score += ob_quality * 0.20
+        weights['ob_q'] = f"{ob_quality:.2f}"
+    
+    # ADX Quality (progressive)
+    adx = signal['details']['adx_val']
+    if adx >= 20:
+        adx_quality = min(1.0, (adx - 20) / 30)
+        quality_score += adx_quality * 0.15
+        weights['adx_q'] = f"{adx_quality:.2f}"
+    
+    # Zone Quality (distance à PDL/PDH)
+    pdh_pdl_str = signal['details']['pdh_pdl']
+    if '/' in pdh_pdl_str:
+        pdl = float(pdh_pdl_str.split('/')[0])
+        pdh = float(pdh_pdl_str.split('/')[1])
         
-        if count > 0: final_scores[curr] = total_score / count
-        else: final_scores[curr] = 5.0
+        if 'DISCOUNT' in signal['details']['zone_status']:
+            distance_to_pdl = abs(price - pdl) / price
+            zone_quality = max(0, 1 - (distance_to_pdl * 100))
+            quality_score += zone_quality * 0.25
+            weights['zone_q'] = f"{zone_quality:.2f}"
+        elif 'PREMIUM' in signal['details']['zone_status']:
+            distance_to_pdh = abs(price - pdh) / price
+            zone_quality = max(0, 1 - (distance_to_pdh * 100))
+            quality_score += zone_quality * 0.25
+            weights['zone_q'] = f"{zone_quality:.2f}"
+    
+    # MTF Strength
+    hma_h1_slope = signal['details'].get('hma_h1_slope', 0)
+    hma_h4_slope = signal['details'].get('hma_h4_slope', 0)
+    mtf_strength = (abs(hma_h1_slope) + abs(hma_h4_slope)) / 2
+    quality_score += min(mtf_strength * 10, 0.20)
+    weights['mtf_str'] = f"{mtf_strength:.3f}"
+    
+    return quality_score, weights
 
-    st.session_state.cs_data = {'data': final_scores, 'time': now}
-    return final_scores
 
-# ==========================================
-# FILTRE CORRÉLATION
-# ==========================================
-def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
-    if not existing_signals: return False
-    new_sym = new_signal['symbol']
-    new_type = new_signal['type']
-    if "_" not in new_sym: return False
-    base, quote = new_sym.split('_')
+def detect_optimal_entry_window(df_m5, signal):
+    """Identifie si on est dans la fenêtre idéale d'entrée"""
+    timing_score = 0
+    alerts = []
     
-    CORRELATION_MAP = {
-        'EUR_USD':  { 'GBP_USD': 0.9, 'AUD_USD': 0.85, 'USD_CHF': -0.9, 'NZD_USD': 0.8, 'EUR_GBP': -0.8 },
-        'GBP_USD':  { 'EUR_USD': 0.9, 'EUR_GBP': -0.8, 'GBP_JPY': 0.8, 'GBP_AUD': 0.7 },
-        'USD_JPY':  { 'USD_CHF': 0.7, 'EUR_JPY': 0.8, 'GBP_JPY': 0.8, 'CAD_JPY': 0.7 },
-        'AUD_USD':  { 'EUR_USD': 0.85, 'NZD_USD': 0.9, 'AUD_JPY': 0.8, 'AUD_NZD': 0.95 },
-        'NZD_USD':  { 'AUD_USD': 0.9, 'EUR_NZD': 0.8, 'NZD_JPY': 0.8, 'AUD_NZD': 0.95 },
-        'USD_CAD':  { 'USD_CHF': 0.7, 'AUD_CAD': 0.8, 'CAD_JPY': 0.7, 'EUR_CAD': 0.8 },
-        'USD_CHF':  { 'EUR_USD': -0.9, 'USD_JPY': 0.7, 'USD_CAD': 0.7, 'GBP_CHF': 0.8 },
-    }
+    # HMA juste passé au vert
+    hma_series = QuantEngine.calculate_hma(df_m5['close'], 20)
+    if len(hma_series) >= 5:
+        for i in range(-3, 0):
+            if signal['type'] == 'BUY':
+                if hma_series.iloc[i-1] < hma_series.iloc[i-2] and hma_series.iloc[i] > hma_series.iloc[i-1]:
+                    alerts.append("🎯 HMA Fresh Cross")
+                    timing_score += 0.3
+                    break
+            else:
+                if hma_series.iloc[i-1] > hma_series.iloc[i-2] and hma_series.iloc[i] < hma_series.iloc[i-1]:
+                    alerts.append("🎯 HMA Fresh Cross")
+                    timing_score += 0.3
+                    break
     
-    for existing in existing_signals:
-        ex_sym = existing['symbol']
-        ex_type = existing['type']
-        if new_sym == ex_sym: return True 
-        if new_sym in CORRELATION_MAP and ex_sym in CORRELATION_MAP[new_sym]:
-            corr = CORRELATION_MAP[new_sym][ex_sym]
-            if corr > 0.85 and new_type != ex_type: return True 
-            if corr < -0.85 and new_type == ex_type: return True 
-    return False
+    # HA vient de changer
+    ha_changes = []
+    for i in range(-5, -1):
+        ha_curr = QuantEngine.calculate_ha_smoothed(df_m5.iloc[:i+1])
+        ha_changes.append(ha_curr)
+    
+    if len(ha_changes) >= 3:
+        if signal['type'] == 'BUY' and ha_changes[-1] > 0 and ha_changes[-2] <= 0:
+            alerts.append("⚡ HA Just Green")
+            timing_score += 0.3
+        elif signal['type'] == 'SELL' and ha_changes[-1] < 0 and ha_changes[-2] >= 0:
+            alerts.append("⚡ HA Just Red")
+            timing_score += 0.3
+    
+    # Volume spike
+    vol_avg = df_m5['volume'].rolling(20).mean().iloc[-1]
+    vol_current = df_m5['volume'].iloc[-1]
+    if vol_current > vol_avg * 1.3:
+        alerts.append("📊 Vol Spike")
+        timing_score += 0.2
+    
+    return min(timing_score, 1.0), alerts
 
-# ==========================================
-# LOGIQUE V5.3 (STRICT MTF + ADX H1 ONLY)
-# ==========================================
-def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, adx_filter, mtf_filter, live_price_raw, spread_pips, current_time_utc, force_open=False):
-    details = {}
-    rejection_reason = None
+
+def adjust_for_execution_costs(signal):
+    """Downgrade le signal si spread mange le profit potentiel"""
+    spread_pips = signal['spread']
+    distance_to_tp = abs(signal['tp'] - signal['price'])
     
-    atr = QuantEngine.calculate_atr(df_m5)
-    
-    # Utilisation du prix LIVE
-    curr_price = live_price_raw if live_price_raw > 0 else df_m5['close'].iloc[-1]
-    
-    atr_pct = (atr / curr_price) * 100
-    params = get_asset_params(symbol)
-    
-    pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
-    midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
-    
-    # Calcul ADX H1 et M5
-    adx_m5 = QuantEngine.calculate_adx(df_m5)
-    adx_h1 = QuantEngine.calculate_adx(df_h1)
-    
-    z_score = QuantEngine.detect_structure_zscore(df_h4)
-    fvg_active, fvg_type, fvg_zone = QuantEngine.detect_smart_fvg(df_m5, atr)
-    ob_active, ob_zone = QuantEngine.detect_order_block(df_m5, atr, direction)
-    inst_grade, inst_trend, _ = QuantEngine.get_institutional_grade(df_d, df_w)
-    
-    # SESSION FILTER
-    session = QuantEngine.get_trading_session(current_time_utc)
-    if session == "ASIAN":
-        details['session_warning'] = "⚠️ ASIAN (Low liquidity)"
-    elif session in ["LONDON", "NY"]:
-        details['session'] = f"✅ {session}"
-    
-    # Filtre ADX: UNIQUEMENT SUR H1
-    if adx_filter:
-        if adx_h1 < 20:
-             return 0, {}, atr_pct, f"ADX H1 {adx_h1:.1f} < 20 (Weak Trend)"
-    
-    # HMA & HA M5
-    hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
-    hma_slope_m5 = QuantEngine.hma_slope(hma_m5)
-    ha_status_m5 = QuantEngine.calculate_ha_smoothed(df_m5)
-    
-    if direction == "BUY":
-        if not (hma_slope_m5 > 0 and ha_status_m5 > 0):
-            return 0, {}, atr_pct, "No M5 Trigger (HMA/HA)"
+    if "JPY" in signal['symbol']:
+        pip_value = 0.01
+    elif any(x in signal['symbol'] for x in ['XAU', 'XAG']):
+        pip_value = 0.01
     else:
-        if not (hma_slope_m5 < 0 and ha_status_m5 < 0):
-            return 0, {}, atr_pct, "No M5 Trigger (HMA/HA)"
-            
-    # Zones (Utilisation du prix LIVE)
-    if pdh is None or midnight_open is None: 
-        return 0, {}, atr_pct, "Missing Levels"
+        pip_value = 0.0001
     
-    daily_range = pdh - pdl
-    if daily_range == 0: daily_range = atr 
+    tp_pips = distance_to_tp / pip_value
+    spread_ratio = spread_pips / tp_pips if tp_pips > 0 else 0
     
-    if direction == "BUY":
-        if curr_price > midnight_open: 
-            return 0, {}, atr_pct, "Price > Midnight (Need Below for BUY)"
-        if curr_price > (pdl + (daily_range * 0.40)): 
-            return 0, {}, atr_pct, "Not in Discount Zone (Far from PDL)"
-        details['zone_status'] = "DISCOUNT (Below Midnight → PDH)"
-        details['target'] = f"PDH: {pdh:.5f}"
+    if spread_ratio > 0.15:
+        signal['spread_warning'] = f"⚠️ HIGH ({spread_ratio*100:.1f}%)"
+        signal['adjusted_score'] = signal['prob'] * 0.7
+    elif spread_ratio > 0.10:
+        signal['spread_warning'] = f"⚠️ Mod ({spread_ratio*100:.1f}%)"
+        signal['adjusted_score'] = signal['prob'] * 0.85
     else:
-        if curr_price < midnight_open: 
-            return 0, {}, atr_pct, "Price < Midnight (Need Above for SELL)"
-        if curr_price < (pdh - (daily_range * 0.40)): 
-            return 0, {}, atr_pct, "Not in Premium Zone (Far from PDH)"
-        details['zone_status'] = "PREMIUM (Above Midnight → PDL)"
-        details['target'] = f"PDL: {pdl:.5f}"
-        
-    # MTF ALIGNEMENT
-    hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
-    slope_h1 = QuantEngine.hma_slope(hma_h1)
+        signal['spread_warning'] = f"✅ Low ({spread_ratio*100:.1f}%)"
+        signal['adjusted_score'] = signal['prob']
     
-    hma_h4 = QuantEngine.calculate_hma(df_h4['close'], 20)
-    slope_h4 = QuantEngine.hma_slope(hma_h4)
-    
-    mtf_aligned = False
-    
-    if mtf_filter == "Strict (D+H4+H1)":
-        if direction == "BUY":
-            if slope_h1 > 0 and slope_h4 > 0 and "BULL" in inst_trend: mtf_aligned = True
-        else:
-            if slope_h1 < 0 and slope_h4 < 0 and "BEAR" in inst_trend: mtf_aligned = True
-    
-    elif mtf_filter == "Flexible (D+H4 OR H4+H1)":
-        if direction == "BUY":
-            condition1 = slope_h4 > 0 and "BULL" in inst_trend
-            condition2 = slope_h1 > 0 and slope_h4 > 0
-            if condition1 or condition2: mtf_aligned = True
-        else:
-            condition1 = slope_h4 < 0 and "BEAR" in inst_trend
-            condition2 = slope_h1 < 0 and slope_h4 < 0
-            if condition1 or condition2: mtf_aligned = True
-    
-    elif mtf_filter == "Light (H4 only)":
-        if direction == "BUY":
-            if slope_h4 > 0: mtf_aligned = True
-        else:
-            if slope_h4 < 0: mtf_aligned = True
-    
-    elif mtf_filter == "Off":
-        mtf_aligned = True
-        
-    if not mtf_aligned:
-        return 0, {}, atr_pct, f"MTF Misaligned ({mtf_filter})"
-        
-    # CONFLUENCE: FVG OU OB OU Support/Resistance
-    confluence_found = False
-    confluence_type = []
-    
-    # Vérifier FVG
-    if fvg_active:
-        price_in_fvg = QuantEngine.is_price_in_zone(curr_price, fvg_zone)
-        if direction == "BUY" and fvg_type == "BULL" and price_in_fvg:
-            confluence_found = True
-            confluence_type.append("FVG")
-        elif direction == "SELL" and fvg_type == "BEAR" and price_in_fvg:
-            confluence_found = True
-            confluence_type.append("FVG")
-    
-    # Vérifier Order Block
-    if ob_active:
-        price_in_ob = QuantEngine.is_price_in_zone(curr_price, ob_zone)
-        if price_in_ob:
-            confluence_found = True
-            confluence_type.append("OB")
-    
-    # Fallback: Z-score
-    if not confluence_found:
-        if direction == "BUY" and z_score < -1.0:
-            confluence_found = True
-            confluence_type.append("OVERSOLD")
-        elif direction == "SELL" and z_score > 1.0:
-            confluence_found = True
-            confluence_type.append("OVERBOUGHT")
-        
-    if not confluence_found:
-        return 0, {}, atr_pct, "No Confluence (Need FVG/OB/Support)"
-        
-    # Scoring
-    score = 0.70
-    
-    if adx_h1 > 25: score += 0.10
-    if adx_m5 > 30: score += 0.05
-    
-    if len(confluence_type) > 1: score += 0.05
-    
-    if "A+" in inst_grade: score += 0.10
-    elif "A" in inst_grade: score += 0.05
-    
-    if session in ["LONDON", "NY"]: score += 0.05
-    
-    details['adx_val'] = adx_m5
-    details['z_score'] = z_score
-    details['inst_grade'] = inst_grade
-    details['hma_slope'] = hma_slope_m5
-    details['ha_status'] = ha_status_m5
-    details['midnight'] = midnight_open
-    details['pdh_pdl'] = f"{pdl:.5f}/{pdh:.5f}"
-    details['confluence'] = " + ".join(confluence_type)
-    details['fvg_active'] = fvg_active
-    details['ob_active'] = ob_active
-    details['mtf_mode'] = mtf_filter
-    
-    return min(score, 1.0), details, atr_pct, None
+    signal['spread_ratio'] = spread_ratio
+    return signal
 
-# ==========================================
-# FONCTION HELPER POUR ASYNC
-# ==========================================
-def fetch_asset_data(api, sym):
-    try:
-        df_d_raw = api.get_candles(sym, "D", 250)
-        df_h4 = api.get_candles(sym, "H4", 100)
-        df_h1 = api.get_candles(sym, "H1", 50)
-        df_m5 = api.get_candles(sym, "M5", 200)
-        live_price, spread_pips = api.get_realtime_price_and_spread(sym)
-        return sym, df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips
-    except Exception as e:
-        return sym, None, None, None, None, 0, 0
 
-# ==========================================
-# SCANNER V5.3 (PARALLELE)
-# ==========================================
-def run_scan_v53_blue(api, min_prob, adx_filter, mtf_filter, current_time_utc, force_open=False):
-    cs_scores = get_currency_strength_rsi(api)
-    signals = []
-    rejected_log = []
+def evaluate_level_freshness(df_d, pdh, pdl):
+    """PDH/PDL récemment testé = moins fiable"""
+    freshness_score = 1.0
+    warnings = []
     
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    status_text.markdown(f"⏳ **Initialisation du scan parallèle...**")
+    last_5_days = df_d.tail(5)
+    pdh_tests = sum(1 for h in last_5_days['high'] if abs(h - pdh) / pdh < 0.002)
+    pdl_tests = sum(1 for l in last_5_days['low'] if abs(l - pdl) / pdl < 0.002)
     
-    asset_data = {}
+    if pdh_tests > 2:
+        warnings.append(f"PDH tested {pdh_tests}x")
+        freshness_score *= 0.8
     
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_asset_data, api, sym): sym for sym in ASSETS}
-        completed_count = 0
-        for future in as_completed(futures):
-            sym, df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips = future.result()
-            if df_m5 is not None and not df_m5.empty:
-                asset_data[sym] = (df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips)
-            completed_count += 1
-            progress_bar.progress(completed_count / len(ASSETS))
-            status_text.markdown(f"⏳ Données reçues: {sym} ({completed_count}/{len(ASSETS)})")
+    if pdl_tests > 2:
+        warnings.append(f"PDL tested {pdl_tests}x")
+        freshness_score *= 0.8
+    
+    for i in range(-1, -6, -1):
+        if abs(df_d['high'].iloc[i] - pdh) / pdh < 0.002:
+            days_since = abs(i)
+            if days_since == 1:
+                warnings.append("PDH Fresh")
+                freshness_score *= 1.1
+            break
+    
+    return freshness_score, warnings
 
-    status_text.markdown("⏳ Analyse technique en cours...")
-    
-    for sym in asset_data:
-        df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips = asset_data[sym]
-        
-        if df_m5.empty or df_h1.empty or df_h4.empty or df_d_raw.empty: 
-            continue
-        
-        df_d = df_d_raw.iloc[-100:].copy()
-        df_w = df_d_raw.set_index('time').resample('W-FRI').agg({
-            'open':'first', 'high':'max', 'low':'min', 'close':'last'
-        }).dropna().reset_index()
-        
-        for direction in ["BUY", "SELL"]:
-            prob, details, atr_pct, reject_reason = calculate_signal_probability_v53(
-                df_m5, df_h1, df_h4, df_d, df_w, sym, direction, None, adx_filter, mtf_filter, live_price, spread_pips, current_time_utc, force_open
-            )
-            
-            if reject_reason: 
-                rejected_log.append(f"{sym} {direction}: {reject_reason}")
-                continue
-                
-            if prob < min_prob: 
-                rejected_log.append(f"{sym} {direction}: Score {prob:.2f}")
-                continue
-            
-            temp_signal = {'symbol': sym, 'type': direction}
-            if check_dynamic_correlation_conflict(temp_signal, signals, cs_scores):
-                rejected_log.append(f"{sym} {direction}: Corrélation")
-                continue
-            
-            cs_aligned = False
-            if "_" in sym:
-                base, quote = sym.split('_')
-                if cs_scores and base in cs_scores and quote in cs_scores:
-                    gap = cs_scores.get(base, 0) - cs_scores.get(quote, 0)
-                    if direction == "BUY" and gap > 0: cs_aligned = True
-                    elif direction == "SELL" and gap < 0: cs_aligned = True
-            
-            price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
-            atr = QuantEngine.calculate_atr(df_m5)
-            params = get_asset_params(sym)
-            
-            sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
-            tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
-            
-            signals.append({
-                'symbol': sym, 'type': direction, 'price': price,
-                'prob': prob, 'score_display': prob * 10,
-                'details': details, 'atr_pct': atr_pct,
-                'sl': sl, 'tp': tp, 'rr': params['tp_rr'],
-                'cs_aligned': cs_aligned, 'spread': spread_pips
-            })
-            
-    progress_bar.empty()
-    status_text.empty()
-    return sorted(signals, key=lambda x: x['prob'], reverse=True), rejected_log
 
-# ==========================================
-# AFFICHAGE
-# ==========================================
-def display_sig_v53(s):
-    is_buy = s['type'] == 'BUY'
-    col_type = "#10b981" if is_buy else "#ef4444"
-    bg = "linear-gradient(90deg, #064e3b 0%, #065f46 100%)" if is_buy else "linear-gradient(90deg, #7f1d1d 0%, #991b1b 100%)"
+def add_contextual_metadata(signal, df_d, df_h4):
+    """Info contextuelle pour décision manuelle"""
+    metadata = {}
     
-    with st.expander(f"{'📈' if is_buy else '📉'} {s['symbol']}  |  {s['type']}  |  SCORE {s['score_display']:.1f}/10", expanded=True):
-        st.markdown(f"""
-        <div style="background:{bg};padding:15px;border-radius:8px;border:2px solid {col_type};margin-bottom:10px;">
-            <span style="font-size:1.5em;font-weight:900;color:white;">{s['symbol']}</span>
-            <span style="float:right;color:white;font-size:1.2em;">{s['price']:.5f}</span>
-        </div>""", unsafe_allow_html=True)
-        
-        d = s['details']
-        
-        badges = [
-            f"<span class='badge badge-blue'>HMA: {'🟢 Up' if d['hma_slope']>0 else '🔴 Down'}</span>",
-            f"<span class='badge badge-blue'>HA: {'🟢 Bull' if d['ha_status']>0 else '🔴 Bear'}</span>",
-            f"<span class='badge badge-gold'>{d['inst_grade']}</span>",
-            f"<span class='badge'>ADX M5: {d['adx_val']:.1f}</span>",
-            f"<span class='badge'>MTF: {d.get('mtf_mode', 'N/A')}</span>"
-        ]
-        
-        if 'confluence' in d:
-            badges.append(f"<span class='badge badge-session'>🎯 {d['confluence']}</span>")
-        
-        if s['cs_aligned']: 
-            badges.append("<span class='badge badge-session'>💪 CS OK</span>")
-        
-        if 'session' in d:
-            badges.append(f"<span class='badge'>{d['session']}</span>")
-        elif 'session_warning' in d:
-            badges.append(f"<span class='badge' style='background:#f59e0b;color:black;'>{d['session_warning']}</span>")
-        
-        st.markdown(f"<div style='text-align:center;margin-bottom:10px'>{' '.join(badges)}</div>", unsafe_allow_html=True)
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Zone", d['zone_status'])
-        c2.metric("PDH / PDL", d['pdh_pdl'])
-        if 'target' in d:
-            c3.metric("Target", d['target'])
-        
-        col_sl, col_tp = st.columns(2)
-        col_sl.info(f"🛑 SL: {s['sl']:.5f} (R:{s['rr']:.1f})")
-        col_tp.success(f"🎯 TP: {s['tp']:.5f}")
-        
-        with st.expander("📊 Détails techniques"):
-            st.write(f"**Midnight Open:** {d['midnight']:.5f}")
-            st.write(f"**Z-Score H4:** {d['z_score']:.2f}")
-            st.write(f"**Spread:** {s['spread']:.1f} pips")
-            st.write(f"**ATR %:** {s['atr_pct']:.3f}%")
-            if d.get('fvg_active'):
-                st.success("✅ FVG détecté")
-            if d.get('ob_active'):
-                st.success("✅ Order Block détecté")
+    # Tendance D
+    sma_50_d = df_d['close'].rolling(50).mean().iloc[-1]
+    price_vs_sma = ((signal['price'] - sma_50_d) / sma_50_d) * 100
+    metadata['d_trend'] = f"{'📈' if price_vs_sma > 0 else '📉'} {price_vs_sma:+.2f}% vs SMA50"
+    
+    # Dernière bougie H4
+    last_h4 = df_h4.iloc[-1]
+    h4_candle_size = abs(last_h4['close'] - last_h4['open'])
+    h4_atr = QuantEngine.calculate_atr(df_h4)
+    candle_strength = h4_candle_size / h4_atr if h4_atr > 0 else 0
+    
+    if candle_strength > 1.5:
+        metadata['h4_candle'] = f"🔥 Strong ({'Bull' if last_h4['close'] > last_h4['open'] else 'Bear'}) {candle_strength:.1f}x"
+    else:
+        metadata['h4_candle'] = f"Weak H4 {candle_strength:.1f}x"
+    
+    # Volatilité
+    current_atr = signal['atr_pct']
+    avg_atr_20 = df_d['close'].pct_change().abs().rolling(20).mean().iloc[-1] * 100
+    vol_ratio = current_atr / avg_atr_20 if avg_atr_20 > 0 else 1
+    
+    if vol_ratio > 1.3:
+        metadata['volatility'] = f"⚡ High Vol {vol_ratio:.1f}x"
+    elif vol_ratio < 0.7:
+        metadata['volatility'] = f"😴 Low Vol {vol_ratio:.1f}x"
+    else:
+        metadata['volatility'] = f"✅ Normal {vol_ratio:.1f}x"
+    
+    return metadata
 
-# ==========================================
-# MAIN
-# ==========================================
-def main():
-    st.title("🛡️ BLUESTAR ULTIMATE V5.3")
-    st.markdown("<p style='text-align:center;color:#94a3b8;'>Scanner institutionnel | MTF Flexible | OB + FVG Detection</p>", unsafe_allow_html=True)
-    
-    current_time_utc = datetime.now(pytz.utc)
-    session = QuantEngine.get_trading_session(current_time_utc)
-    
-    session_colors = {
-        "ASIAN": "#f59e0b",
-        "LONDON": "#10b981", 
-        "NY": "#3b82f6",
-        "OFF": "#6b7280"
-    }
-    session_color = session_colors.get(session, "#6b7280")
-    
-    st.sidebar.markdown(f"""
-        <div style='background:{session_color};padding:10px;border-radius:8px;text-align:center;margin-bottom:15px;'>
-            <div style='font-size:0.8em;color:white;opacity:0.8;'>🕒 UTC: {current_time_utc.strftime('%H:%M')}</div>
-            <div style='font-size:1.1em;font-weight:700;color:white;'>📍 {session} SESSION</div>
-        </div>
-    """, unsafe_allow_html=True)
-    
-    with st.sidebar:
-        st.header("⚙️ Filtres")
+
+def calculate_final_rank(signals):
+    """Combine tous les scores pour ranking intelligent"""
+    for sig in signals:
+        base_score = sig.get('adjusted_score', sig['prob'])
+        confluence_quality = sig.get('confluence_quality', 0.5)
+        timing_score = sig.get('timing_score', 0.5)
+        freshness = sig.get('freshness_score', 1.0)
+        spread_penalty = 1.0 - sig.get('spread_ratio', 0)
         
-        mtf_filter = st.selectbox(
-            "🎯 Alignement Multi-Timeframe",
-            ["Strict (D+H4+H1)", "Flexible (D+H4 OR H4+H1)", "Light (H4 only)", "Off"],
-            index=0,
-            help="Strict = tous alignés | Flexible = 2 sur 3 | Light = H4 seul | Off = pas de filtre"
+        final_score = (
+            base_score * 0.35 +
+            confluence_quality * 0.25 +
+            timing_score * 0.20 +
+            freshness * 0.10 +
+            spread_penalty * 0.10
         )
         
-        # MODIFICATION DU LABEL ICI
-        adx_filter = st.checkbox(
-            "🔥 Filtre ADX", 
-            value=True,
-            help="Exige ADX supérieur à 20 sur H1 pour confirmer la tendance de fond"
-        )
-        
-        min_prob = st.slider("Score Minimum", 60, 95, 75, 5)
-        
-    if st.button("🔍 LANCER LE SCAN V5.3"):
-        with st.spinner("🔄 Scan en cours..."):
-            api = OandaClient()
-            results, logs = run_scan_v53_blue(api, min_prob/100, adx_filter, mtf_filter, current_time_utc)
-        
-        if not results:
-            st.warning("⚠️ Aucun signal trouvé avec les critères actuels.")
-            st.info("""
-            **💡 Suggestions pour obtenir plus de signaux:**
-            - Essayer mode MTF **Flexible** ou **Light**
-            - Désactiver le filtre ADX temporairement
-            - Réduire le score minimum à 70
-            """)
-            with st.expander("📋 Logs de rejet (pourquoi pas de signaux)"):
-                for log in logs[:25]: 
-                    st.text(log)
-        else:
-            st.success(f"✅ **{len(results)} Signal(s) détecté(s)** - Vérifiez sur vos graphiques !")
-            st.info(f"🎯 **Filtre actif:** MTF = {mtf_filter} | ADX = {'ON (H1)' if adx_filter else 'OFF'}")
-            
-            for r in results: 
-                display_sig_v53(r)
-            
-            with st.expander("📋 Voir tous les rejets"):
-                for log in logs:
-                    st.text(log)
-
-if __name__ == "__main__":
-    main()
-  
+        sig['final_rank_score'] = final_score
+        sig['rank_breakdown'] = {
+            'base': f"{base_score:.2f}",
+            'confl_q': f"{confluence_quality:.2f}",
+            'timing': f"{timing_score:.2f}",
+            'fresh': f"{freshness:.2f}",
+            'spread': f"{spread_penalty:.2f}"
+        }
+    
+    return sorted(signals, key=lambda x: x['final_rank_score'], reverse=True)
