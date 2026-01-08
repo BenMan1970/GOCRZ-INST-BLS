@@ -83,11 +83,9 @@ class OandaClient:
             st.stop()
 
     def get_candles(self, instrument, granularity, count):
-        # Utilisation du cache pour éviter de spammer l'API pour les TFs lents (H4, D)
         key = f"{instrument}_{granularity}_{count}" 
         if key in st.session_state.cache and granularity in ["H4", "D"]:
             ts, data = st.session_state.cache[key]
-            # Cache plus long pour H4/D, court pour M5/H1
             timeout = 300 if granularity in ["H4", "D"] else 30
             if (datetime.now() - ts).total_seconds() < timeout: return data
 
@@ -109,7 +107,6 @@ class OandaClient:
                 st.session_state.cache[key] = (datetime.now(), df)
             return df
         except Exception as e:
-            # logging.error(f"Erreur API get_candles {instrument}: {e}")
             return pd.DataFrame()
 
     def get_realtime_price_and_spread(self, instrument):
@@ -122,8 +119,6 @@ class OandaClient:
             bid = float(price['closeoutBid'])
             ask = float(price['closeoutAsk'])
             spread_raw = ask - bid
-            
-            # Calcul du prix moyen "Live"
             live_price = (bid + ask) / 2
             
             if "JPY" in instrument: pip_mult = 100
@@ -162,7 +157,6 @@ class QuantEngine:
 
     @staticmethod
     def calculate_adx(df, period=14):
-        """Calcul ADX officiel TradingView (ta.rma). Alpha = 1/period."""
         if len(df) < period * 2: return 0
         high, low, close = df['high'], df['low'], df['close']
         up = high.diff()
@@ -223,32 +217,23 @@ class QuantEngine:
 
     @staticmethod
     def detect_order_block(df, atr, direction):
-        """Détecte Order Block avec filtre de taille (MODIFICATION 3)"""
         if len(df) < 6: return False, None
         
         for i in range(-5, -1):
             candle_body = abs(df['close'].iloc[i] - df['open'].iloc[i])
-            next_move = abs(df['close'].iloc[i+1] - df['close'].iloc[i])
             impulse_body = abs(df['close'].iloc[i+1] - df['open'].iloc[i+1])
-            
-            # Filtre de qualité OB (Change 3)
-            # L'impulsion doit être significative par rapport à la bougie OB
             is_significant = impulse_body > (candle_body * 1.5)
             
             if direction == "BUY":
-                # Dernière bougie rouge avant rallye vert
                 is_bearish = df['close'].iloc[i] < df['open'].iloc[i]
                 strong_rally = df['close'].iloc[i+1] > df['close'].iloc[i] + (atr * 0.3)
-                
                 if is_bearish and strong_rally and is_significant:
                     ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
                     return True, ob_zone
                     
             else:  # SELL
-                # Dernière bougie verte avant chute rouge
                 is_bullish = df['close'].iloc[i] > df['open'].iloc[i]
                 strong_drop = df['close'].iloc[i+1] < df['close'].iloc[i] - (atr * 0.3)
-                
                 if is_bullish and strong_drop and is_significant:
                     ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
                     return True, ob_zone
@@ -257,22 +242,15 @@ class QuantEngine:
 
     @staticmethod
     def is_price_in_zone(price, zone):
-        """Vérifie si prix dans zone (low, high)"""
         if zone is None: return False
         return zone[0] <= price <= zone[1]
 
     @staticmethod
     def get_trading_session(current_time_utc):
-        """Identifie la session de trading actuelle"""
         hour = current_time_utc.hour
-        
-        # Asian: 23h-8h UTC
         if 23 <= hour or hour < 8: return "ASIAN"
-        # London: 8h-16h UTC  
         elif 8 <= hour < 16: return "LONDON"
-        # New York: 13h-21h UTC (overlap London 13h-16h)
         elif 13 <= hour < 21: return "NY"
-        # London seule: 8h-13h
         elif 8 <= hour < 13: return "LONDON"
         else: return "OFF"
 
@@ -327,12 +305,11 @@ class QuantEngine:
 
     @staticmethod
     def detect_structure_zscore(df, lookback=20):
-        """Z-score pour détecter support/resistance statistique"""
         if len(df) < lookback + 1: return 0
         window = df['close'].iloc[-lookback:]
         try:
             z_score = stats.zscore(window)[-1]
-            return z_score  # Retourne la valeur brute pour analyse
+            return z_score
         except: 
             return 0 
 
@@ -361,7 +338,6 @@ def get_currency_strength_rsi(api):
     forex_pairs = [p for p in ASSETS if "_" in p and "XAU" not in p and "XAG" not in p and "US30" not in p and "NAS100" not in p and "SPX500" not in p and "DE30" not in p]
     prices = {}
     
-    # Optimisation possible ici aussi, mais laissé séquentiel pour simplifier (c'est le scan principal qui compte)
     for pair in forex_pairs[:15]: 
         try:
             df = api.get_candles(pair, "H1", 50)
@@ -441,7 +417,7 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
     return False
 
 # ==========================================
-# LOGIQUE V5.3 (STRICT MTF + ADX M5 + H1)
+# LOGIQUE V5.3 (STRICT MTF + ADX H1 ONLY)
 # ==========================================
 def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, adx_filter, mtf_filter, live_price_raw, spread_pips, current_time_utc, force_open=False):
     details = {}
@@ -449,7 +425,7 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     
     atr = QuantEngine.calculate_atr(df_m5)
     
-    # MODIFICATION 5: Utilisation du prix LIVE (Tick) pour la logique, au lieu de la dernière clôture
+    # Utilisation du prix LIVE
     curr_price = live_price_raw if live_price_raw > 0 else df_m5['close'].iloc[-1]
     
     atr_pct = (atr / curr_price) * 100
@@ -458,7 +434,7 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
     midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
     
-    # MODIFICATION 2: Calcul ADX H1 (plus stable) ET M5
+    # Calcul ADX H1 et M5 (M5 sert juste au score, pas au filtre bloquant)
     adx_m5 = QuantEngine.calculate_adx(df_m5)
     adx_h1 = QuantEngine.calculate_adx(df_h1)
     
@@ -474,12 +450,11 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     elif session in ["LONDON", "NY"]:
         details['session'] = f"✅ {session}"
     
-    # Filtre ADX: On priorise H1 > 20 pour la tendance de fond (MODIFICATION 2)
+    # Filtre ADX: UNIQUEMENT SUR H1 (Modif demandée)
     if adx_filter:
         if adx_h1 < 20:
              return 0, {}, atr_pct, f"ADX H1 {adx_h1:.1f} < 20 (Weak Trend)"
-        if adx_m5 < 15: # M5 peut être plus bas mais doit exister
-             return 0, {}, atr_pct, f"ADX M5 {adx_m5:.1f} < 15"
+        # Note: Plus de filtre bloquant sur ADX M5 ici.
     
     # HMA & HA M5
     hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
@@ -501,19 +476,15 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     if daily_range == 0: daily_range = atr 
     
     if direction == "BUY":
-        # BUY: Prix EN DESSOUS de midnight
         if curr_price > midnight_open: 
             return 0, {}, atr_pct, "Price > Midnight (Need Below for BUY)"
-        # Prix doit être dans zone discount
         if curr_price > (pdl + (daily_range * 0.40)): 
             return 0, {}, atr_pct, "Not in Discount Zone (Far from PDL)"
         details['zone_status'] = "DISCOUNT (Below Midnight → PDH)"
         details['target'] = f"PDH: {pdh:.5f}"
     else:
-        # SELL: Prix AU DESSUS de midnight
         if curr_price < midnight_open: 
             return 0, {}, atr_pct, "Price < Midnight (Need Above for SELL)"
-        # Prix doit être dans zone premium
         if curr_price < (pdh - (daily_range * 0.40)): 
             return 0, {}, atr_pct, "Not in Premium Zone (Far from PDH)"
         details['zone_status'] = "PREMIUM (Above Midnight → PDL)"
@@ -530,11 +501,9 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     
     if mtf_filter == "Strict (D+H4+H1)":
         if direction == "BUY":
-            if slope_h1 > 0 and slope_h4 > 0 and "BULL" in inst_trend: 
-                mtf_aligned = True
+            if slope_h1 > 0 and slope_h4 > 0 and "BULL" in inst_trend: mtf_aligned = True
         else:
-            if slope_h1 < 0 and slope_h4 < 0 and "BEAR" in inst_trend: 
-                mtf_aligned = True
+            if slope_h1 < 0 and slope_h4 < 0 and "BEAR" in inst_trend: mtf_aligned = True
     
     elif mtf_filter == "Flexible (D+H4 OR H4+H1)":
         if direction == "BUY":
@@ -591,24 +560,20 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     if not confluence_found:
         return 0, {}, atr_pct, "No Confluence (Need FVG/OB/Support)"
         
-    # Scoring raffiné (Intégration ADX H1)
-    score = 0.70  # Base
+    # Scoring
+    score = 0.70
     
-    # Bonus ADX (H1 plus important maintenant)
     if adx_h1 > 25: score += 0.10
-    if adx_m5 > 30: score += 0.05
+    if adx_m5 > 30: score += 0.05 # Bonus score si M5 aligné, mais pas obligatoire
     
-    # Bonus confluence multiple
     if len(confluence_type) > 1: score += 0.05
     
-    # Bonus institutional grade
     if "A+" in inst_grade: score += 0.10
     elif "A" in inst_grade: score += 0.05
     
-    # Bonus session
     if session in ["LONDON", "NY"]: score += 0.05
     
-    details['adx_val'] = adx_m5 # On garde l'affichage M5 pour le momentum court terme
+    details['adx_val'] = adx_m5
     details['z_score'] = z_score
     details['inst_grade'] = inst_grade
     details['hma_slope'] = hma_slope_m5
@@ -623,10 +588,9 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     return min(score, 1.0), details, atr_pct, None
 
 # ==========================================
-# FONCTION HELPER POUR ASYNC (MODIF 1)
+# FONCTION HELPER POUR ASYNC
 # ==========================================
 def fetch_asset_data(api, sym):
-    """Fonction helper pour récupérer toutes les données d'un actif en une fois"""
     try:
         df_d_raw = api.get_candles(sym, "D", 250)
         df_h4 = api.get_candles(sym, "H4", 100)
@@ -638,7 +602,7 @@ def fetch_asset_data(api, sym):
         return sym, None, None, None, None, 0, 0
 
 # ==========================================
-# SCANNER V5.3 (MODIF 1: PARALLELISATION)
+# SCANNER V5.3 (PARALLELE)
 # ==========================================
 def run_scan_v53_blue(api, min_prob, adx_filter, mtf_filter, current_time_utc, force_open=False):
     cs_scores = get_currency_strength_rsi(api)
@@ -647,30 +611,23 @@ def run_scan_v53_blue(api, min_prob, adx_filter, mtf_filter, current_time_utc, f
     
     progress_bar = st.progress(0)
     status_text = st.empty()
-    status_text.markdown(f"⏳ **Initialisation du scan parallèle... (Ceci est beaucoup plus rapide)**")
+    status_text.markdown(f"⏳ **Initialisation du scan parallèle...**")
     
-    # Utilisation de ThreadPoolExecutor pour paralléliser les appels API
-    # Cela permet de récupérer les données des 30+ paires simultanément
     asset_data = {}
     
     with ThreadPoolExecutor(max_workers=10) as executor:
-        # Lancer toutes les requêtes
         futures = {executor.submit(fetch_asset_data, api, sym): sym for sym in ASSETS}
-        
         completed_count = 0
         for future in as_completed(futures):
             sym, df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips = future.result()
-            
             if df_m5 is not None and not df_m5.empty:
                 asset_data[sym] = (df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips)
-            
             completed_count += 1
             progress_bar.progress(completed_count / len(ASSETS))
             status_text.markdown(f"⏳ Données reçues: {sym} ({completed_count}/{len(ASSETS)})")
 
     status_text.markdown("⏳ Analyse technique en cours...")
     
-    # Analyse des données récupérées
     for sym in asset_data:
         df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips = asset_data[sym]
         
@@ -708,7 +665,6 @@ def run_scan_v53_blue(api, min_prob, adx_filter, mtf_filter, current_time_utc, f
                     if direction == "BUY" and gap > 0: cs_aligned = True
                     elif direction == "SELL" and gap < 0: cs_aligned = True
             
-            # Utilisation du prix LIVE pour le signal
             price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
             atr = QuantEngine.calculate_atr(df_m5)
             params = get_asset_params(sym)
@@ -745,7 +701,6 @@ def display_sig_v53(s):
         
         d = s['details']
         
-        # Badges principaux
         badges = [
             f"<span class='badge badge-blue'>HMA: {'🟢 Up' if d['hma_slope']>0 else '🔴 Down'}</span>",
             f"<span class='badge badge-blue'>HA: {'🟢 Bull' if d['ha_status']>0 else '🔴 Bear'}</span>",
@@ -754,14 +709,12 @@ def display_sig_v53(s):
             f"<span class='badge'>MTF: {d.get('mtf_mode', 'N/A')}</span>"
         ]
         
-        # Badge confluence (important!)
         if 'confluence' in d:
             badges.append(f"<span class='badge badge-session'>🎯 {d['confluence']}</span>")
         
         if s['cs_aligned']: 
             badges.append("<span class='badge badge-session'>💪 CS OK</span>")
         
-        # Session info
         if 'session' in d:
             badges.append(f"<span class='badge'>{d['session']}</span>")
         elif 'session_warning' in d:
@@ -769,19 +722,16 @@ def display_sig_v53(s):
         
         st.markdown(f"<div style='text-align:center;margin-bottom:10px'>{' '.join(badges)}</div>", unsafe_allow_html=True)
         
-        # Informations clés en colonnes
         c1, c2, c3 = st.columns(3)
         c1.metric("Zone", d['zone_status'])
         c2.metric("PDH / PDL", d['pdh_pdl'])
         if 'target' in d:
             c3.metric("Target", d['target'])
         
-        # SL/TP
         col_sl, col_tp = st.columns(2)
         col_sl.info(f"🛑 SL: {s['sl']:.5f} (R:{s['rr']:.1f})")
         col_tp.success(f"🎯 TP: {s['tp']:.5f}")
         
-        # Détails supplémentaires
         with st.expander("📊 Détails techniques"):
             st.write(f"**Midnight Open:** {d['midnight']:.5f}")
             st.write(f"**Z-Score H4:** {d['z_score']:.2f}")
@@ -802,7 +752,6 @@ def main():
     current_time_utc = datetime.now(pytz.utc)
     session = QuantEngine.get_trading_session(current_time_utc)
     
-    # Indicateur session en couleur
     session_colors = {
         "ASIAN": "#f59e0b",
         "LONDON": "#10b981", 
@@ -821,7 +770,6 @@ def main():
     with st.sidebar:
         st.header("⚙️ Filtres")
         
-        # Filtre MTF (remplace strict_mode)
         mtf_filter = st.selectbox(
             "🎯 Alignement Multi-Timeframe",
             ["Strict (D+H4+H1)", "Flexible (D+H4 OR H4+H1)", "Light (H4 only)", "Off"],
@@ -829,11 +777,11 @@ def main():
             help="Strict = tous alignés | Flexible = 2 sur 3 | Light = H4 seul | Off = pas de filtre"
         )
         
-        # Filtre ADX séparé
+        # MODIFICATION: Label mis à jour
         adx_filter = st.checkbox(
-            "🔥 Filtre ADX > 20 (M5)", 
+            "🔥 Filtre ADX > 20 (H1 uniquement)", 
             value=True,
-            help="Exige ADX supérieur à 20 sur H1 et M5 pour confirmer la tendance"
+            help="Exige ADX supérieur à 20 sur H1 pour confirmer la tendance de fond"
         )
         
         min_prob = st.slider("Score Minimum", 60, 95, 75, 5)
@@ -845,27 +793,22 @@ def main():
         
         if not results:
             st.warning("⚠️ Aucun signal trouvé avec les critères actuels.")
-            
-            # Suggestions pour avoir plus de signaux
             st.info("""
             **💡 Suggestions pour obtenir plus de signaux:**
             - Essayer mode MTF **Flexible** ou **Light**
             - Désactiver le filtre ADX temporairement
             - Réduire le score minimum à 70
             """)
-            
             with st.expander("📋 Logs de rejet (pourquoi pas de signaux)"):
-                for log in logs[:25]:  # Afficher 25 premiers rejets
+                for log in logs[:25]: 
                     st.text(log)
         else:
             st.success(f"✅ **{len(results)} Signal(s) détecté(s)** - Vérifiez sur vos graphiques !")
-            
-            st.info(f"🎯 **Filtre actif:** MTF = {mtf_filter} | ADX = {'ON' if adx_filter else 'OFF'}")
+            st.info(f"🎯 **Filtre actif:** MTF = {mtf_filter} | ADX = {'ON (H1)' if adx_filter else 'OFF'}")
             
             for r in results: 
                 display_sig_v53(r)
             
-            # Bouton pour voir tous les rejets
             with st.expander("📋 Voir tous les rejets"):
                 for log in logs:
                     st.text(log)
