@@ -8,6 +8,7 @@ import logging
 import time
 import csv
 import os
+import sys
 from datetime import datetime, timedelta
 from scipy import stats 
 import pytz
@@ -17,6 +18,11 @@ import warnings
 # CONFIGURATION & STYLE (THEME BLEU V5.3)
 # ==========================================
 warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# Supprimer les logs système de Streamlit
+logging.getLogger().setLevel(logging.ERROR)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 st.set_page_config(page_title="Bluestar Ultimate V5.3", layout="centered", page_icon="🛡️")
 
 LOG_FILE = "bluestar_v53_log.csv"
@@ -99,7 +105,7 @@ class OandaClient:
                 st.session_state.cache[key] = (datetime.now(), df)
             return df
         except Exception as e:
-            logging.warning(f"Erreur API get_candles {instrument}: {e}")
+            logging.error(f"Erreur API get_candles {instrument}: {e}")
             return pd.DataFrame()
 
     def get_realtime_spread(self, instrument):
@@ -188,7 +194,7 @@ class QuantEngine:
 
     @staticmethod
     def detect_smart_fvg(df, atr):
-        if len(df) < 4: return False, 0
+        if len(df) < 4: return False, None, None
         curr_close = df['close'].iloc[-1]
         min_gap = atr * 0.5
         high_1 = df['high'].iloc[-3]
@@ -199,10 +205,62 @@ class QuantEngine:
         vol_curr = df['volume'].iloc[-1]
         
         gap_bull = low_3 - high_1
-        if gap_bull > min_gap and curr_close > high_1 and vol_curr > vol_mean * 0.8: return True, "BULL"
+        if gap_bull > min_gap and curr_close > high_1 and vol_curr > vol_mean * 0.8: 
+            return True, "BULL", (high_1, low_3)
         gap_bear = low_1 - high_3
-        if gap_bear > min_gap and curr_price < low_1 and vol_curr > vol_mean * 0.8: return True, "BEAR"
+        if gap_bear > min_gap and curr_close < low_1 and vol_curr > vol_mean * 0.8: 
+            return True, "BEAR", (high_3, low_1)
+        return False, None, None
+
+    @staticmethod
+    def detect_order_block(df, atr, direction):
+        """Détecte Order Block: dernière bougie contraire avant impulsion forte"""
+        if len(df) < 6: return False, None
+        
+        for i in range(-5, -1):
+            candle_body = abs(df['close'].iloc[i] - df['open'].iloc[i])
+            next_move = abs(df['close'].iloc[i+1] - df['close'].iloc[i])
+            
+            if direction == "BUY":
+                # Dernière bougie rouge avant rallye vert
+                is_bearish = df['close'].iloc[i] < df['open'].iloc[i]
+                strong_rally = df['close'].iloc[i+1] > df['close'].iloc[i] + (atr * 0.3)
+                
+                if is_bearish and strong_rally:
+                    ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
+                    return True, ob_zone
+                    
+            else:  # SELL
+                # Dernière bougie verte avant chute rouge
+                is_bullish = df['close'].iloc[i] > df['open'].iloc[i]
+                strong_drop = df['close'].iloc[i+1] < df['close'].iloc[i] - (atr * 0.3)
+                
+                if is_bullish and strong_drop:
+                    ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
+                    return True, ob_zone
+                    
         return False, None
+
+    @staticmethod
+    def is_price_in_zone(price, zone):
+        """Vérifie si prix dans zone (low, high)"""
+        if zone is None: return False
+        return zone[0] <= price <= zone[1]
+
+    @staticmethod
+    def get_trading_session(current_time_utc):
+        """Identifie la session de trading actuelle"""
+        hour = current_time_utc.hour
+        
+        # Asian: 23h-8h UTC
+        if 23 <= hour or hour < 8: return "ASIAN"
+        # London: 8h-16h UTC  
+        elif 8 <= hour < 16: return "LONDON"
+        # New York: 13h-21h UTC (overlap London 13h-16h)
+        elif 13 <= hour < 21: return "NY"
+        # London seule: 8h-13h
+        elif 8 <= hour < 13: return "LONDON"
+        else: return "OFF"
 
     @staticmethod
     def get_institutional_grade(df_d, df_w):
@@ -275,8 +333,8 @@ class QuantEngine:
         smooth_open = pd.Series(ha_open).ewm(span=period).mean()
         smooth_close = ha_close.ewm(span=period).mean()
         
-        if smooth_close.iloc[-1] > smooth_open.iloc[-1]: return 1 # Bull
-        else: return -1 # Bear
+        if smooth_close.iloc[-1] > smooth_open.iloc[-1]: return 1
+        else: return -1
 
 # ==========================================
 # CURRENCY STRENGTH
@@ -286,7 +344,7 @@ def get_currency_strength_rsi(api):
     if st.session_state.cs_data.get('time') and (now - st.session_state.cs_data['time']).total_seconds() < 900:
         return st.session_state.cs_data['data']
 
-    forex_pairs = [p for p in ASSETS if "_" in p and "XAU" not in p and "XAG" not in p and "US30" not in p]
+    forex_pairs = [p for p in ASSETS if "_" in p and "XAU" not in p and "XAG" not in p and "US30" not in p and "NAS100" not in p and "SPX500" not in p and "DE30" not in p]
     prices = {}
     for pair in forex_pairs[:15]: 
         try:
@@ -369,7 +427,7 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
 # ==========================================
 # LOGIQUE V5.3 (STRICT MTF + ADX M5)
 # ==========================================
-def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, spread_pips, force_open=False):
+def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, spread_pips, current_time_utc, force_open=False):
     details = {}
     rejection_reason = None
     
@@ -380,14 +438,22 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
     midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
     
-    # CHANGEMENT ICI : ADX CALCULE SUR M5
+    # ADX CALCULE SUR M5
     adx_val = QuantEngine.calculate_adx(df_m5)
     
     z_score = QuantEngine.detect_structure_zscore(df_h4)
-    fvg_active, fvg_type = QuantEngine.detect_smart_fvg(df_m5, atr)
+    fvg_active, fvg_type, fvg_zone = QuantEngine.detect_smart_fvg(df_m5, atr)
+    ob_active, ob_zone = QuantEngine.detect_order_block(df_m5, atr, direction)
     inst_grade, inst_trend, _ = QuantEngine.get_institutional_grade(df_d, df_w)
     
     curr_price = df_m5['close'].iloc[-1]
+    
+    # SESSION FILTER (Optionnel mais recommandé)
+    session = QuantEngine.get_trading_session(current_time_utc)
+    if session == "ASIAN":
+        details['session_warning'] = "⚠️ ASIAN (Low liquidity)"
+    elif session in ["LONDON", "NY"]:
+        details['session'] = f"✅ {session}"
     
     # Filtre ADX Strict sur M5
     if strict_mode and adx_val < 20:
@@ -405,22 +471,33 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
         if not (hma_slope_m5 < 0 and ha_status_m5 < 0):
             return 0, {}, atr_pct, "No M5 Trigger (HMA/HA)"
             
-    # Zones
-    if pdh is None or midnight_open is None: return 0, {}, atr_pct, "Missing Levels"
+    # Zones (logique clarifiée)
+    if pdh is None or midnight_open is None: 
+        return 0, {}, atr_pct, "Missing Levels"
     
     daily_range = pdh - pdl
     if daily_range == 0: daily_range = atr 
     
     if direction == "BUY":
-        if curr_price > midnight_open: return 0, {}, atr_pct, "Price > Midnight"
-        if curr_price > (pdl + (daily_range * 0.30)): return 0, {}, atr_pct, "Not Near PDL"
-        details['zone_status'] = "DISCOUNT (Near PDL)"
+        # BUY: Prix EN DESSOUS de midnight, on vise PDH (direction haussière)
+        if curr_price > midnight_open: 
+            return 0, {}, atr_pct, "Price > Midnight (Need Below for BUY)"
+        # Prix doit être dans zone discount (élargie à 40% pour plus d'opportunités)
+        if curr_price > (pdl + (daily_range * 0.40)): 
+            return 0, {}, atr_pct, "Not in Discount Zone (Far from PDL)"
+        details['zone_status'] = "DISCOUNT (Below Midnight → PDH)"
+        details['target'] = f"PDH: {pdh:.5f}"
     else:
-        if curr_price < midnight_open: return 0, {}, atr_pct, "Price < Midnight"
-        if curr_price < (pdh - (daily_range * 0.30)): return 0, {}, atr_pct, "Not Near PDH"
-        details['zone_status'] = "PREMIUM (Near PDH)"
+        # SELL: Prix AU DESSUS de midnight, on vise PDL (direction baissière)
+        if curr_price < midnight_open: 
+            return 0, {}, atr_pct, "Price < Midnight (Need Above for SELL)"
+        # Prix doit être dans zone premium (élargie à 40%)
+        if curr_price < (pdh - (daily_range * 0.40)): 
+            return 0, {}, atr_pct, "Not in Premium Zone (Far from PDH)"
+        details['zone_status'] = "PREMIUM (Above Midnight → PDL)"
+        details['target'] = f"PDL: {pdl:.5f}"
         
-    # CHANGEMENT ICI : MTF ALIGNEMENT STRICT (AND NON OR)
+    # MTF ALIGNEMENT STRICT (AND NON OR)
     hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
     slope_h1 = QuantEngine.hma_slope(hma_h1)
     
@@ -429,33 +506,64 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     
     mtf_aligned = False
     if direction == "BUY":
-        # Il faut H1, H4 ET Daily alignés
-        if slope_h1 > 0 and slope_h4 > 0 and "BULL" in inst_trend: mtf_aligned = True
+        if slope_h1 > 0 and slope_h4 > 0 and "BULL" in inst_trend: 
+            mtf_aligned = True
     else:
-        # Il faut H1, H4 ET Daily alignés
-        if slope_h1 < 0 and slope_h4 < 0 and "BEAR" in inst_trend: mtf_aligned = True
+        if slope_h1 < 0 and slope_h4 < 0 and "BEAR" in inst_trend: 
+            mtf_aligned = True
         
     if not mtf_aligned:
-        return 0, {}, atr_pct, "MTF Misaligned (Strict)"
+        return 0, {}, atr_pct, "MTF Misaligned (Need D+H4+H1 aligned)"
         
-    # Structure
-    structure_valid = False
-    if direction == "BUY":
-        if fvg_active and fvg_type == "BULL": structure_valid = True
-    else:
-        if fvg_active and fvg_type == "BEAR": structure_valid = True
+    # CONFLUENCE: FVG OU OB OU Support/Resistance
+    confluence_found = False
+    confluence_type = []
+    
+    # Vérifier FVG
+    if fvg_active:
+        price_in_fvg = QuantEngine.is_price_in_zone(curr_price, fvg_zone)
+        if direction == "BUY" and fvg_type == "BULL" and price_in_fvg:
+            confluence_found = True
+            confluence_type.append("FVG")
+        elif direction == "SELL" and fvg_type == "BEAR" and price_in_fvg:
+            confluence_found = True
+            confluence_type.append("FVG")
+    
+    # Vérifier Order Block
+    if ob_active:
+        price_in_ob = QuantEngine.is_price_in_zone(curr_price, ob_zone)
+        if price_in_ob:
+            confluence_found = True
+            confluence_type.append("OB")
+    
+    # Fallback: Z-score structure (support/resistance statistique)
+    if not confluence_found:
+        if direction == "BUY" and z_score < -1.0:  # Prix oversold
+            confluence_found = True
+            confluence_type.append("OVERSOLD")
+        elif direction == "SELL" and z_score > 1.0:  # Prix overbought
+            confluence_found = True
+            confluence_type.append("OVERBOUGHT")
         
-    if not structure_valid:
-        if abs(z_score) < 1.0: structure_valid = True
+    if not confluence_found:
+        return 0, {}, atr_pct, "No Confluence (Need FVG/OB/Support)"
         
-    if not structure_valid:
-        return 0, {}, atr_pct, "No Structure/FVG Support"
-        
-    # Scoring
-    score = 0.7 
-    if adx_val > 25: score += 0.1
-    if abs(z_score) < 0.5: score += 0.1 
-    if "A+" in inst_grade: score += 0.1
+    # Scoring raffiné
+    score = 0.70  # Base
+    
+    # Bonus ADX
+    if adx_val > 25: score += 0.08
+    elif adx_val > 30: score += 0.12
+    
+    # Bonus confluence multiple
+    if len(confluence_type) > 1: score += 0.05
+    
+    # Bonus institutional grade
+    if "A+" in inst_grade: score += 0.10
+    elif "A" in inst_grade: score += 0.05
+    
+    # Bonus session
+    if session in ["LONDON", "NY"]: score += 0.05
     
     details['adx_val'] = adx_val
     details['z_score'] = z_score
@@ -464,7 +572,9 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     details['ha_status'] = ha_status_m5
     details['midnight'] = midnight_open
     details['pdh_pdl'] = f"{pdl:.5f}/{pdh:.5f}"
+    details['confluence'] = " + ".join(confluence_type)
     details['fvg_active'] = fvg_active
+    details['ob_active'] = ob_active
     
     return min(score, 1.0), details, atr_pct, None
 
@@ -492,7 +602,8 @@ def run_scan_v53_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
             time.sleep(0.05)
             df_m5 = api.get_candles(sym, "M5", 200)
             
-            if df_m5.empty or df_h1.empty or df_h4.empty or df_d_raw.empty: continue
+            if df_m5.empty or df_h1.empty or df_h4.empty or df_d_raw.empty: 
+                continue
             
             df_d = df_d_raw.iloc[-100:].copy()
             df_w = df_d_raw.set_index('time').resample('W-FRI').agg({
@@ -503,7 +614,7 @@ def run_scan_v53_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
             
             for direction in ["BUY", "SELL"]:
                 prob, details, atr_pct, reject_reason = calculate_signal_probability_v53(
-                    df_m5, df_h1, df_h4, df_d, df_w, sym, direction, strict_mode, spread_pips, force_open
+                    df_m5, df_h1, df_h4, df_d, df_w, sym, direction, strict_mode, spread_pips, current_time_utc, force_open
                 )
                 
                 if reject_reason: 
@@ -543,7 +654,7 @@ def run_scan_v53_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
                 })
                 
         except Exception as e:
-            logging.warning(f"Erreur scan {sym}: {e}")
+            logging.error(f"Erreur scan {sym}: {e}")
             continue
             
     progress_bar.empty()
@@ -558,7 +669,7 @@ def display_sig_v53(s):
     col_type = "#10b981" if is_buy else "#ef4444"
     bg = "linear-gradient(90deg, #064e3b 0%, #065f46 100%)" if is_buy else "linear-gradient(90deg, #7f1d1d 0%, #991b1b 100%)"
     
-    with st.expander(f"{s['symbol']}  |  {s['type']}  |  SCORE {s['score_display']:.1f}", expanded=True):
+    with st.expander(f"{'📈' if is_buy else '📉'} {s['symbol']}  |  {s['type']}  |  SCORE {s['score_display']:.1f}/10", expanded=True):
         st.markdown(f"""
         <div style="background:{bg};padding:15px;border-radius:8px;border:2px solid {col_type};margin-bottom:10px;">
             <span style="font-size:1.5em;font-weight:900;color:white;">{s['symbol']}</span>
@@ -566,50 +677,117 @@ def display_sig_v53(s):
         </div>""", unsafe_allow_html=True)
         
         d = s['details']
+        
+        # Badges principaux
         badges = [
-            f"<span class='badge badge-blue'>HMA: {'Up' if d['hma_slope']>0 else 'Down'}</span>",
-            f"<span class='badge badge-blue'>HA: {'Bull' if d['ha_status']>0 else 'Bear'}</span>",
+            f"<span class='badge badge-blue'>HMA: {'🟢 Up' if d['hma_slope']>0 else '🔴 Down'}</span>",
+            f"<span class='badge badge-blue'>HA: {'🟢 Bull' if d['ha_status']>0 else '🔴 Bear'}</span>",
             f"<span class='badge badge-gold'>{d['inst_grade']}</span>",
             f"<span class='badge'>ADX M5: {d['adx_val']:.1f}</span>"
         ]
-        if s['cs_aligned']: badges.append("<span class='badge badge-session'>CS OK</span>")
-        if d['fvg_active']: badges.append("<span class='badge'>FVG ACTIVE</span>")
+        
+        # Badge confluence (important!)
+        if 'confluence' in d:
+            badges.append(f"<span class='badge badge-session'>🎯 {d['confluence']}</span>")
+        
+        if s['cs_aligned']: 
+            badges.append("<span class='badge badge-session'>💪 CS OK</span>")
+        
+        # Session info
+        if 'session' in d:
+            badges.append(f"<span class='badge'>{d['session']}</span>")
+        elif 'session_warning' in d:
+            badges.append(f"<span class='badge' style='background:#f59e0b;color:black;'>{d['session_warning']}</span>")
         
         st.markdown(f"<div style='text-align:center;margin-bottom:10px'>{' '.join(badges)}</div>", unsafe_allow_html=True)
         
-        c1, c2 = st.columns(2)
+        # Informations clés en colonnes
+        c1, c2, c3 = st.columns(3)
         c1.metric("Zone", d['zone_status'])
         c2.metric("PDH / PDL", d['pdh_pdl'])
+        if 'target' in d:
+            c3.metric("Target", d['target'])
         
+        # SL/TP
         col_sl, col_tp = st.columns(2)
-        col_sl.info(f"🛑 SL: {s['sl']:.5f}")
+        col_sl.info(f"🛑 SL: {s['sl']:.5f} (R:{s['rr']:.1f})")
         col_tp.success(f"🎯 TP: {s['tp']:.5f}")
+        
+        # Détails supplémentaires
+        with st.expander("📊 Détails techniques"):
+            st.write(f"**Midnight Open:** {d['midnight']:.5f}")
+            st.write(f"**Z-Score H4:** {d['z_score']:.2f}")
+            st.write(f"**Spread:** {s['spread']:.1f} pips")
+            st.write(f"**ATR %:** {s['atr_pct']:.3f}%")
+            if d.get('fvg_active'):
+                st.success("✅ FVG détecté")
+            if d.get('ob_active'):
+                st.success("✅ Order Block détecté")
 
 # ==========================================
 # MAIN
 # ==========================================
 def main():
     st.title("🛡️ BLUESTAR ULTIMATE V5.3")
-    st.markdown("<p style='text-align:center;color:#94a3b8;'>Strict MTF | ADX on M5</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;color:#94a3b8;'>Scanner institutionnel | MTF Strict | OB + FVG Detection</p>", unsafe_allow_html=True)
     
-    st.sidebar.markdown(f"🕒 UTC: {datetime.now(pytz.utc).strftime('%H:%M')}")
+    current_time_utc = datetime.now(pytz.utc)
+    session = QuantEngine.get_trading_session(current_time_utc)
+    
+    # Indicateur session en couleur
+    session_colors = {
+        "ASIAN": "#f59e0b",
+        "LONDON": "#10b981", 
+        "NY": "#3b82f6",
+        "OFF": "#6b7280"
+    }
+    session_color = session_colors.get(session, "#6b7280")
+    
+    st.sidebar.markdown(f"""
+        <div style='background:{session_color};padding:10px;border-radius:8px;text-align:center;margin-bottom:15px;'>
+            <div style='font-size:0.8em;color:white;opacity:0.8;'>🕒 UTC: {current_time_utc.strftime('%H:%M')}</div>
+            <div style='font-size:1.1em;font-weight:700;color:white;'>📍 {session} SESSION</div>
+        </div>
+    """, unsafe_allow_html=True)
     
     with st.sidebar:
-        st.header("⚙️ Config V5.3")
+        st.header("⚙️ Configuration")
         strict_mode = st.checkbox("🔥 Strict Mode (ADX M5 > 20)", value=True)
-        min_prob = st.slider("Score Min", 60, 95, 75, 5)
+        min_prob = st.slider("Score Minimum", 60, 95, 75, 5)
         
-    if st.button("🔍 Scan V5.3"):
-        api = OandaClient()
-        results, logs = run_scan_v53_blue(api, min_prob/100, strict_mode, datetime.now(pytz.utc))
+        st.markdown("---")
+        st.markdown("### 📋 Checklist manuelle")
+        st.markdown("""
+        Avant d'entrer en position:
+        - ✅ Vérifier graphique H4/H1
+        - ✅ Confirmer FVG/OB sur TradingView
+        - ✅ Checker calendrier économique
+        - ✅ Valider spread acceptable
+        - ✅ Vérifier liquidité du marché
+        """)
+        
+    if st.button("🔍 LANCER LE SCAN V5.3"):
+        with st.spinner("🔄 Scan en cours..."):
+            api = OandaClient()
+            results, logs = run_scan_v53_blue(api, min_prob/100, strict_mode, current_time_utc)
         
         if not results:
-            st.warning("Aucun signal V5.3.")
-            if logs: st.write(logs)
+            st.warning("⚠️ Aucun signal trouvé avec les critères actuels.")
+            with st.expander("📋 Logs de rejet (pourquoi pas de signaux)"):
+                for log in logs[:20]:  # Afficher 20 premiers rejets
+                    st.text(log)
         else:
-            st.success(f"{len(results)} Signaux")
-            for r in results: display_sig_v53(r)
+            st.success(f"✅ **{len(results)} Signal(s) détecté(s)** - Vérifiez manuellement sur vos graphiques !")
+            
+            st.info("💡 **Rappel:** Ce scanner est un outil de PRÉ-SÉLECTION. Validez toujours manuellement avant d'entrer en position.")
+            
+            for r in results: 
+                display_sig_v53(r)
+            
+            # Bouton pour voir tous les rejets
+            with st.expander("📋 Voir tous les rejets"):
+                for log in logs:
+                    st.text(log)
 
 if __name__ == "__main__":
     main()
-    
