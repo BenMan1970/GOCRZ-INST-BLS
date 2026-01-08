@@ -14,19 +14,19 @@ import pytz
 import warnings
 
 # ==========================================
-# CONFIGURATION & STYLE (THEME BLEU V5.1 FINAL)
+# CONFIGURATION & STYLE (THEME BLEU V5.3)
 # ==========================================
 warnings.simplefilter(action='ignore', category=FutureWarning)
-st.set_page_config(page_title="Bluestar Ultimate V5.1", layout="centered", page_icon="🛡️")
+st.set_page_config(page_title="Bluestar Ultimate V5.3", layout="centered", page_icon="🛡️")
 
-LOG_FILE = "bluestar_v51_log.csv"
+LOG_FILE = "bluestar_v53_log.csv"
 
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, mode='w', newline='') as file:
         writer = csv.writer(file)
         writer.writerow([
             "timestamp", "symbol", "direction", "price", "score", "hma_m5", "ha_status", 
-            "pdh_pdl_status", "fvg_status", "h1_h4_align", "sl", "tp"
+            "pdh_pdl_status", "fvg_status", "mtf_strict", "adx_m5", "sl", "tp"
         ])
 
 st.markdown("""
@@ -135,7 +135,7 @@ def get_asset_params(symbol):
     return {'type': 'FOREX', 'atr_threshold': 0.035, 'sl_base': 1.5, 'tp_rr': 2.0}
 
 # ==========================================
-# MOTEUR D'INDICATEURS V5.1 (ADX OFFICIEL TV)
+# MOTEUR D'INDICATEURS V5.3
 # ==========================================
 class QuantEngine:
     @staticmethod
@@ -147,44 +147,21 @@ class QuantEngine:
 
     @staticmethod
     def calculate_adx(df, period=14):
-        """
-        Calcul ADX officiel TradingView (ta.rma).
-        Alpha = 1/period (Wilder's Smoothing).
-        """
+        """Calcul ADX officiel TradingView (ta.rma). Alpha = 1/period."""
         if len(df) < period * 2: return 0
-        
-        high = df['high']
-        low = df['low']
-        close = df['close']
-
-        # --- dirmov(len) ---
+        high, low, close = df['high'], df['low'], df['close']
         up = high.diff()
         down = -low.diff()
-
         plus_dm = np.where((up > down) & (up > 0), up, 0.0)
         minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-
-        tr = pd.concat([
-            high - low, 
-            abs(high - close.shift()), 
-            abs(low - close.shift())
-        ], axis=1).max(axis=1)
-
-        # ta.rma correspond à Wilder's Smoothing : alpha = 1 / period
+        tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
         alpha = 1 / period
         truerange = tr.ewm(alpha=alpha, adjust=False).mean()
-
         plus = 100 * pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean() / truerange
         minus = 100 * pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean() / truerange
-
-        # --- adx(dilen, adxlen) ---
         sum_val = plus + minus
-        
-        # Gestion de la division par zéro comme dans Pine: (sum == 0 ? 1 : sum)
         dx = 100 * np.abs(plus - minus) / sum_val.replace(0, 1)
-
         adx = dx.ewm(alpha=alpha, adjust=False).mean()
-
         return adx.iloc[-1]
 
     @staticmethod
@@ -224,7 +201,7 @@ class QuantEngine:
         gap_bull = low_3 - high_1
         if gap_bull > min_gap and curr_close > high_1 and vol_curr > vol_mean * 0.8: return True, "BULL"
         gap_bear = low_1 - high_3
-        if gap_bear > min_gap and curr_close < low_1 and vol_curr > vol_mean * 0.8: return True, "BEAR"
+        if gap_bear > min_gap and curr_price < low_1 and vol_curr > vol_mean * 0.8: return True, "BEAR"
         return False, None
 
     @staticmethod
@@ -390,9 +367,9 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
     return False
 
 # ==========================================
-# LOGIQUE V5.1
+# LOGIQUE V5.3 (STRICT MTF + ADX M5)
 # ==========================================
-def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, spread_pips, force_open=False):
+def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, spread_pips, force_open=False):
     details = {}
     rejection_reason = None
     
@@ -402,16 +379,19 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     
     pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
     midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
-    adx_val = QuantEngine.calculate_adx(df_h4) # Utilisation de la fonction officielle TV
+    
+    # CHANGEMENT ICI : ADX CALCULE SUR M5
+    adx_val = QuantEngine.calculate_adx(df_m5)
+    
     z_score = QuantEngine.detect_structure_zscore(df_h4)
     fvg_active, fvg_type = QuantEngine.detect_smart_fvg(df_m5, atr)
     inst_grade, inst_trend, _ = QuantEngine.get_institutional_grade(df_d, df_w)
     
     curr_price = df_m5['close'].iloc[-1]
     
-    # Filtre ADX Strict (ADX > 20)
+    # Filtre ADX Strict sur M5
     if strict_mode and adx_val < 20:
-        return 0, {}, atr_pct, "ADX < 20 (Strict)"
+        return 0, {}, atr_pct, f"ADX M5 {adx_val:.1f} < 20"
     
     # HMA & HA M5
     hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
@@ -440,7 +420,7 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
         if curr_price < (pdh - (daily_range * 0.30)): return 0, {}, atr_pct, "Not Near PDH"
         details['zone_status'] = "PREMIUM (Near PDH)"
         
-    # MTF Alignment
+    # CHANGEMENT ICI : MTF ALIGNEMENT STRICT (AND NON OR)
     hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
     slope_h1 = QuantEngine.hma_slope(hma_h1)
     
@@ -449,14 +429,14 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     
     mtf_aligned = False
     if direction == "BUY":
-        if slope_h1 > 0 and slope_h4 > 0: mtf_aligned = True
-        if "BULL" in inst_trend: mtf_aligned = True 
+        # Il faut H1, H4 ET Daily alignés
+        if slope_h1 > 0 and slope_h4 > 0 and "BULL" in inst_trend: mtf_aligned = True
     else:
-        if slope_h1 < 0 and slope_h4 < 0: mtf_aligned = True
-        if "BEAR" in inst_trend: mtf_aligned = True
+        # Il faut H1, H4 ET Daily alignés
+        if slope_h1 < 0 and slope_h4 < 0 and "BEAR" in inst_trend: mtf_aligned = True
         
     if not mtf_aligned:
-        return 0, {}, atr_pct, "MTF Misaligned"
+        return 0, {}, atr_pct, "MTF Misaligned (Strict)"
         
     # Structure
     structure_valid = False
@@ -489,9 +469,9 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     return min(score, 1.0), details, atr_pct, None
 
 # ==========================================
-# SCANNER V5.1
+# SCANNER V5.3
 # ==========================================
-def run_scan_v51_blue(api, min_prob, strict_mode, current_time_utc, force_open=False):
+def run_scan_v53_blue(api, min_prob, strict_mode, current_time_utc, force_open=False):
     cs_scores = get_currency_strength_rsi(api)
     signals = []
     rejected_log = []
@@ -501,7 +481,7 @@ def run_scan_v51_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
     
     for i, sym in enumerate(ASSETS):
         progress_bar.progress((i+1)/len(ASSETS))
-        status_text.markdown(f"⏳ Scan V5.1: **{sym}** ({i+1}/{len(ASSETS)})")
+        status_text.markdown(f"⏳ Scan V5.3: **{sym}** ({i+1}/{len(ASSETS)})")
         
         try:
             df_d_raw = api.get_candles(sym, "D", 250)
@@ -522,7 +502,7 @@ def run_scan_v51_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
             spread_raw, spread_pips = api.get_realtime_spread(sym)
             
             for direction in ["BUY", "SELL"]:
-                prob, details, atr_pct, reject_reason = calculate_signal_probability_v51(
+                prob, details, atr_pct, reject_reason = calculate_signal_probability_v53(
                     df_m5, df_h1, df_h4, df_d, df_w, sym, direction, strict_mode, spread_pips, force_open
                 )
                 
@@ -573,7 +553,7 @@ def run_scan_v51_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
 # ==========================================
 # AFFICHAGE
 # ==========================================
-def display_sig_v51(s):
+def display_sig_v53(s):
     is_buy = s['type'] == 'BUY'
     col_type = "#10b981" if is_buy else "#ef4444"
     bg = "linear-gradient(90deg, #064e3b 0%, #065f46 100%)" if is_buy else "linear-gradient(90deg, #7f1d1d 0%, #991b1b 100%)"
@@ -590,7 +570,7 @@ def display_sig_v51(s):
             f"<span class='badge badge-blue'>HMA: {'Up' if d['hma_slope']>0 else 'Down'}</span>",
             f"<span class='badge badge-blue'>HA: {'Bull' if d['ha_status']>0 else 'Bear'}</span>",
             f"<span class='badge badge-gold'>{d['inst_grade']}</span>",
-            f"<span class='badge'>ADX: {d['adx_val']:.1f}</span>"
+            f"<span class='badge'>ADX M5: {d['adx_val']:.1f}</span>"
         ]
         if s['cs_aligned']: badges.append("<span class='badge badge-session'>CS OK</span>")
         if d['fvg_active']: badges.append("<span class='badge'>FVG ACTIVE</span>")
@@ -609,27 +589,27 @@ def display_sig_v51(s):
 # MAIN
 # ==========================================
 def main():
-    st.title("🛡️ BLUESTAR ULTIMATE V5.1")
-    st.markdown("<p style='text-align:center;color:#94a3b8;'>Strict ICT | ADX TV Official</p>", unsafe_allow_html=True)
+    st.title("🛡️ BLUESTAR ULTIMATE V5.3")
+    st.markdown("<p style='text-align:center;color:#94a3b8;'>Strict MTF | ADX on M5</p>", unsafe_allow_html=True)
     
     st.sidebar.markdown(f"🕒 UTC: {datetime.now(pytz.utc).strftime('%H:%M')}")
     
     with st.sidebar:
-        st.header("⚙️ Config V5.1")
-        strict_mode = st.checkbox("🔥 Strict Mode (ADX > 20)", value=True)
+        st.header("⚙️ Config V5.3")
+        strict_mode = st.checkbox("🔥 Strict Mode (ADX M5 > 20)", value=True)
         min_prob = st.slider("Score Min", 60, 95, 75, 5)
         
-    if st.button("🔍 Scan V5.1"):
+    if st.button("🔍 Scan V5.3"):
         api = OandaClient()
-        results, logs = run_scan_v51_blue(api, min_prob/100, strict_mode, datetime.now(pytz.utc))
+        results, logs = run_scan_v53_blue(api, min_prob/100, strict_mode, datetime.now(pytz.utc))
         
         if not results:
-            st.warning("Aucun signal V5.1.")
+            st.warning("Aucun signal V5.3.")
             if logs: st.write(logs)
         else:
             st.success(f"{len(results)} Signaux")
-            for r in results: display_sig_v51(r)
+            for r in results: display_sig_v53(r)
 
 if __name__ == "__main__":
     main()
-   
+    
