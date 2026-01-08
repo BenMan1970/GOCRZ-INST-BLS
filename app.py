@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from scipy import stats 
 import pytz
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
 # CONFIGURATION & STYLE (THEME BLEU V5.3)
@@ -82,10 +83,13 @@ class OandaClient:
             st.stop()
 
     def get_candles(self, instrument, granularity, count):
+        # Utilisation du cache pour éviter de spammer l'API pour les TFs lents (H4, D)
         key = f"{instrument}_{granularity}_{count}" 
-        if key in st.session_state.cache:
+        if key in st.session_state.cache and granularity in ["H4", "D"]:
             ts, data = st.session_state.cache[key]
-            if (datetime.now() - ts).total_seconds() < 60: return data
+            # Cache plus long pour H4/D, court pour M5/H1
+            timeout = 300 if granularity in ["H4", "D"] else 30
+            if (datetime.now() - ts).total_seconds() < timeout: return data
 
         try:
             params = {"count": count, "granularity": granularity, "price": "M"}
@@ -105,10 +109,11 @@ class OandaClient:
                 st.session_state.cache[key] = (datetime.now(), df)
             return df
         except Exception as e:
-            logging.error(f"Erreur API get_candles {instrument}: {e}")
+            # logging.error(f"Erreur API get_candles {instrument}: {e}")
             return pd.DataFrame()
 
-    def get_realtime_spread(self, instrument):
+    def get_realtime_price_and_spread(self, instrument):
+        """Récupère le prix live (Bid/Ask) pour éviter la latence des bougies fermées"""
         try:
             params = {"instruments": instrument}
             r = pricing.PricingInfo(accountID=self.account_id, params=params)
@@ -118,10 +123,14 @@ class OandaClient:
             ask = float(price['closeoutAsk'])
             spread_raw = ask - bid
             
+            # Calcul du prix moyen "Live"
+            live_price = (bid + ask) / 2
+            
             if "JPY" in instrument: pip_mult = 100
             elif ("XAU" in instrument or "XAG" in instrument or "XPT" in instrument): pip_mult = 100
             else: pip_mult = 10000
-            return spread_raw, spread_raw * pip_mult
+            
+            return live_price, spread_raw * pip_mult
         except Exception: return 0, 0
 
 ASSETS = [
@@ -214,19 +223,24 @@ class QuantEngine:
 
     @staticmethod
     def detect_order_block(df, atr, direction):
-        """Détecte Order Block: dernière bougie contraire avant impulsion forte"""
+        """Détecte Order Block avec filtre de taille (MODIFICATION 3)"""
         if len(df) < 6: return False, None
         
         for i in range(-5, -1):
             candle_body = abs(df['close'].iloc[i] - df['open'].iloc[i])
             next_move = abs(df['close'].iloc[i+1] - df['close'].iloc[i])
+            impulse_body = abs(df['close'].iloc[i+1] - df['open'].iloc[i+1])
+            
+            # Filtre de qualité OB (Change 3)
+            # L'impulsion doit être significative par rapport à la bougie OB
+            is_significant = impulse_body > (candle_body * 1.5)
             
             if direction == "BUY":
                 # Dernière bougie rouge avant rallye vert
                 is_bearish = df['close'].iloc[i] < df['open'].iloc[i]
                 strong_rally = df['close'].iloc[i+1] > df['close'].iloc[i] + (atr * 0.3)
                 
-                if is_bearish and strong_rally:
+                if is_bearish and strong_rally and is_significant:
                     ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
                     return True, ob_zone
                     
@@ -235,7 +249,7 @@ class QuantEngine:
                 is_bullish = df['close'].iloc[i] > df['open'].iloc[i]
                 strong_drop = df['close'].iloc[i+1] < df['close'].iloc[i] - (atr * 0.3)
                 
-                if is_bullish and strong_drop:
+                if is_bullish and strong_drop and is_significant:
                     ob_zone = (df['low'].iloc[i], df['high'].iloc[i])
                     return True, ob_zone
                     
@@ -346,6 +360,8 @@ def get_currency_strength_rsi(api):
 
     forex_pairs = [p for p in ASSETS if "_" in p and "XAU" not in p and "XAG" not in p and "US30" not in p and "NAS100" not in p and "SPX500" not in p and "DE30" not in p]
     prices = {}
+    
+    # Optimisation possible ici aussi, mais laissé séquentiel pour simplifier (c'est le scan principal qui compte)
     for pair in forex_pairs[:15]: 
         try:
             df = api.get_candles(pair, "H1", 50)
@@ -425,39 +441,45 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
     return False
 
 # ==========================================
-# LOGIQUE V5.3 (STRICT MTF + ADX M5)
+# LOGIQUE V5.3 (STRICT MTF + ADX M5 + H1)
 # ==========================================
-def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, adx_filter, mtf_filter, spread_pips, current_time_utc, force_open=False):
+def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, adx_filter, mtf_filter, live_price_raw, spread_pips, current_time_utc, force_open=False):
     details = {}
     rejection_reason = None
     
     atr = QuantEngine.calculate_atr(df_m5)
-    atr_pct = (atr / df_m5['close'].iloc[-1]) * 100
+    
+    # MODIFICATION 5: Utilisation du prix LIVE (Tick) pour la logique, au lieu de la dernière clôture
+    curr_price = live_price_raw if live_price_raw > 0 else df_m5['close'].iloc[-1]
+    
+    atr_pct = (atr / curr_price) * 100
     params = get_asset_params(symbol)
     
     pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
     midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
     
-    # ADX CALCULE SUR M5
-    adx_val = QuantEngine.calculate_adx(df_m5)
+    # MODIFICATION 2: Calcul ADX H1 (plus stable) ET M5
+    adx_m5 = QuantEngine.calculate_adx(df_m5)
+    adx_h1 = QuantEngine.calculate_adx(df_h1)
     
     z_score = QuantEngine.detect_structure_zscore(df_h4)
     fvg_active, fvg_type, fvg_zone = QuantEngine.detect_smart_fvg(df_m5, atr)
     ob_active, ob_zone = QuantEngine.detect_order_block(df_m5, atr, direction)
     inst_grade, inst_trend, _ = QuantEngine.get_institutional_grade(df_d, df_w)
     
-    curr_price = df_m5['close'].iloc[-1]
-    
-    # SESSION FILTER (Optionnel mais recommandé)
+    # SESSION FILTER
     session = QuantEngine.get_trading_session(current_time_utc)
     if session == "ASIAN":
         details['session_warning'] = "⚠️ ASIAN (Low liquidity)"
     elif session in ["LONDON", "NY"]:
         details['session'] = f"✅ {session}"
     
-    # Filtre ADX si activé
-    if adx_filter and adx_val < 20:
-        return 0, {}, atr_pct, f"ADX M5 {adx_val:.1f} < 20"
+    # Filtre ADX: On priorise H1 > 20 pour la tendance de fond (MODIFICATION 2)
+    if adx_filter:
+        if adx_h1 < 20:
+             return 0, {}, atr_pct, f"ADX H1 {adx_h1:.1f} < 20 (Weak Trend)"
+        if adx_m5 < 15: # M5 peut être plus bas mais doit exister
+             return 0, {}, atr_pct, f"ADX M5 {adx_m5:.1f} < 15"
     
     # HMA & HA M5
     hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
@@ -471,7 +493,7 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
         if not (hma_slope_m5 < 0 and ha_status_m5 < 0):
             return 0, {}, atr_pct, "No M5 Trigger (HMA/HA)"
             
-    # Zones (logique clarifiée)
+    # Zones (Utilisation du prix LIVE)
     if pdh is None or midnight_open is None: 
         return 0, {}, atr_pct, "Missing Levels"
     
@@ -479,25 +501,25 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     if daily_range == 0: daily_range = atr 
     
     if direction == "BUY":
-        # BUY: Prix EN DESSOUS de midnight, on vise PDH (direction haussière)
+        # BUY: Prix EN DESSOUS de midnight
         if curr_price > midnight_open: 
             return 0, {}, atr_pct, "Price > Midnight (Need Below for BUY)"
-        # Prix doit être dans zone discount (élargie à 40% pour plus d'opportunités)
+        # Prix doit être dans zone discount
         if curr_price > (pdl + (daily_range * 0.40)): 
             return 0, {}, atr_pct, "Not in Discount Zone (Far from PDL)"
         details['zone_status'] = "DISCOUNT (Below Midnight → PDH)"
         details['target'] = f"PDH: {pdh:.5f}"
     else:
-        # SELL: Prix AU DESSUS de midnight, on vise PDL (direction baissière)
+        # SELL: Prix AU DESSUS de midnight
         if curr_price < midnight_open: 
             return 0, {}, atr_pct, "Price < Midnight (Need Above for SELL)"
-        # Prix doit être dans zone premium (élargie à 40%)
+        # Prix doit être dans zone premium
         if curr_price < (pdh - (daily_range * 0.40)): 
             return 0, {}, atr_pct, "Not in Premium Zone (Far from PDH)"
         details['zone_status'] = "PREMIUM (Above Midnight → PDL)"
         details['target'] = f"PDL: {pdl:.5f}"
         
-    # MTF ALIGNEMENT selon filtre choisi
+    # MTF ALIGNEMENT
     hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
     slope_h1 = QuantEngine.hma_slope(hma_h1)
     
@@ -507,7 +529,6 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     mtf_aligned = False
     
     if mtf_filter == "Strict (D+H4+H1)":
-        # Mode strict: tous alignés
         if direction == "BUY":
             if slope_h1 > 0 and slope_h4 > 0 and "BULL" in inst_trend: 
                 mtf_aligned = True
@@ -516,29 +537,22 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
                 mtf_aligned = True
     
     elif mtf_filter == "Flexible (D+H4 OR H4+H1)":
-        # Mode flexible: Daily+H4 OU H4+H1
         if direction == "BUY":
-            condition1 = slope_h4 > 0 and "BULL" in inst_trend  # D+H4
-            condition2 = slope_h1 > 0 and slope_h4 > 0          # H4+H1
-            if condition1 or condition2:
-                mtf_aligned = True
+            condition1 = slope_h4 > 0 and "BULL" in inst_trend
+            condition2 = slope_h1 > 0 and slope_h4 > 0
+            if condition1 or condition2: mtf_aligned = True
         else:
-            condition1 = slope_h4 < 0 and "BEAR" in inst_trend  # D+H4
-            condition2 = slope_h1 < 0 and slope_h4 < 0          # H4+H1
-            if condition1 or condition2:
-                mtf_aligned = True
+            condition1 = slope_h4 < 0 and "BEAR" in inst_trend
+            condition2 = slope_h1 < 0 and slope_h4 < 0
+            if condition1 or condition2: mtf_aligned = True
     
     elif mtf_filter == "Light (H4 only)":
-        # Mode light: H4 seul suffit
         if direction == "BUY":
-            if slope_h4 > 0:
-                mtf_aligned = True
+            if slope_h4 > 0: mtf_aligned = True
         else:
-            if slope_h4 < 0:
-                mtf_aligned = True
+            if slope_h4 < 0: mtf_aligned = True
     
     elif mtf_filter == "Off":
-        # Pas de filtre MTF
         mtf_aligned = True
         
     if not mtf_aligned:
@@ -565,24 +579,24 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
             confluence_found = True
             confluence_type.append("OB")
     
-    # Fallback: Z-score structure (support/resistance statistique)
+    # Fallback: Z-score
     if not confluence_found:
-        if direction == "BUY" and z_score < -1.0:  # Prix oversold
+        if direction == "BUY" and z_score < -1.0:
             confluence_found = True
             confluence_type.append("OVERSOLD")
-        elif direction == "SELL" and z_score > 1.0:  # Prix overbought
+        elif direction == "SELL" and z_score > 1.0:
             confluence_found = True
             confluence_type.append("OVERBOUGHT")
         
     if not confluence_found:
         return 0, {}, atr_pct, "No Confluence (Need FVG/OB/Support)"
         
-    # Scoring raffiné
+    # Scoring raffiné (Intégration ADX H1)
     score = 0.70  # Base
     
-    # Bonus ADX
-    if adx_val > 25: score += 0.08
-    elif adx_val > 30: score += 0.12
+    # Bonus ADX (H1 plus important maintenant)
+    if adx_h1 > 25: score += 0.10
+    if adx_m5 > 30: score += 0.05
     
     # Bonus confluence multiple
     if len(confluence_type) > 1: score += 0.05
@@ -594,7 +608,7 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     # Bonus session
     if session in ["LONDON", "NY"]: score += 0.05
     
-    details['adx_val'] = adx_val
+    details['adx_val'] = adx_m5 # On garde l'affichage M5 pour le momentum court terme
     details['z_score'] = z_score
     details['inst_grade'] = inst_grade
     details['hma_slope'] = hma_slope_m5
@@ -609,7 +623,22 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     return min(score, 1.0), details, atr_pct, None
 
 # ==========================================
-# SCANNER V5.3
+# FONCTION HELPER POUR ASYNC (MODIF 1)
+# ==========================================
+def fetch_asset_data(api, sym):
+    """Fonction helper pour récupérer toutes les données d'un actif en une fois"""
+    try:
+        df_d_raw = api.get_candles(sym, "D", 250)
+        df_h4 = api.get_candles(sym, "H4", 100)
+        df_h1 = api.get_candles(sym, "H1", 50)
+        df_m5 = api.get_candles(sym, "M5", 200)
+        live_price, spread_pips = api.get_realtime_price_and_spread(sym)
+        return sym, df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips
+    except Exception as e:
+        return sym, None, None, None, None, 0, 0
+
+# ==========================================
+# SCANNER V5.3 (MODIF 1: PARALLELISATION)
 # ==========================================
 def run_scan_v53_blue(api, min_prob, adx_filter, mtf_filter, current_time_utc, force_open=False):
     cs_scores = get_currency_strength_rsi(api)
@@ -618,74 +647,82 @@ def run_scan_v53_blue(api, min_prob, adx_filter, mtf_filter, current_time_utc, f
     
     progress_bar = st.progress(0)
     status_text = st.empty()
+    status_text.markdown(f"⏳ **Initialisation du scan parallèle... (Ceci est beaucoup plus rapide)**")
     
-    for i, sym in enumerate(ASSETS):
-        progress_bar.progress((i+1)/len(ASSETS))
-        status_text.markdown(f"⏳ Scan V5.3: **{sym}** ({i+1}/{len(ASSETS)})")
+    # Utilisation de ThreadPoolExecutor pour paralléliser les appels API
+    # Cela permet de récupérer les données des 30+ paires simultanément
+    asset_data = {}
+    
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # Lancer toutes les requêtes
+        futures = {executor.submit(fetch_asset_data, api, sym): sym for sym in ASSETS}
         
-        try:
-            df_d_raw = api.get_candles(sym, "D", 250)
-            time.sleep(0.05)
-            df_h4 = api.get_candles(sym, "H4", 100)
-            time.sleep(0.05)
-            df_h1 = api.get_candles(sym, "H1", 50)
-            time.sleep(0.05)
-            df_m5 = api.get_candles(sym, "M5", 200)
+        completed_count = 0
+        for future in as_completed(futures):
+            sym, df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips = future.result()
             
-            if df_m5.empty or df_h1.empty or df_h4.empty or df_d_raw.empty: 
+            if df_m5 is not None and not df_m5.empty:
+                asset_data[sym] = (df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips)
+            
+            completed_count += 1
+            progress_bar.progress(completed_count / len(ASSETS))
+            status_text.markdown(f"⏳ Données reçues: {sym} ({completed_count}/{len(ASSETS)})")
+
+    status_text.markdown("⏳ Analyse technique en cours...")
+    
+    # Analyse des données récupérées
+    for sym in asset_data:
+        df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips = asset_data[sym]
+        
+        if df_m5.empty or df_h1.empty or df_h4.empty or df_d_raw.empty: 
+            continue
+        
+        df_d = df_d_raw.iloc[-100:].copy()
+        df_w = df_d_raw.set_index('time').resample('W-FRI').agg({
+            'open':'first', 'high':'max', 'low':'min', 'close':'last'
+        }).dropna().reset_index()
+        
+        for direction in ["BUY", "SELL"]:
+            prob, details, atr_pct, reject_reason = calculate_signal_probability_v53(
+                df_m5, df_h1, df_h4, df_d, df_w, sym, direction, None, adx_filter, mtf_filter, live_price, spread_pips, current_time_utc, force_open
+            )
+            
+            if reject_reason: 
+                rejected_log.append(f"{sym} {direction}: {reject_reason}")
+                continue
+                
+            if prob < min_prob: 
+                rejected_log.append(f"{sym} {direction}: Score {prob:.2f}")
                 continue
             
-            df_d = df_d_raw.iloc[-100:].copy()
-            df_w = df_d_raw.set_index('time').resample('W-FRI').agg({
-                'open':'first', 'high':'max', 'low':'min', 'close':'last'
-            }).dropna().reset_index()
+            temp_signal = {'symbol': sym, 'type': direction}
+            if check_dynamic_correlation_conflict(temp_signal, signals, cs_scores):
+                rejected_log.append(f"{sym} {direction}: Corrélation")
+                continue
             
-            spread_raw, spread_pips = api.get_realtime_spread(sym)
+            cs_aligned = False
+            if "_" in sym:
+                base, quote = sym.split('_')
+                if cs_scores and base in cs_scores and quote in cs_scores:
+                    gap = cs_scores.get(base, 0) - cs_scores.get(quote, 0)
+                    if direction == "BUY" and gap > 0: cs_aligned = True
+                    elif direction == "SELL" and gap < 0: cs_aligned = True
             
-            for direction in ["BUY", "SELL"]:
-                prob, details, atr_pct, reject_reason = calculate_signal_probability_v53(
-                    df_m5, df_h1, df_h4, df_d, df_w, sym, direction, None, adx_filter, mtf_filter, spread_pips, current_time_utc, force_open
-                )
-                
-                if reject_reason: 
-                    rejected_log.append(f"{sym} {direction}: {reject_reason}")
-                    continue
-                    
-                if prob < min_prob: 
-                    rejected_log.append(f"{sym} {direction}: Score {prob:.2f}")
-                    continue
-                
-                temp_signal = {'symbol': sym, 'type': direction}
-                if check_dynamic_correlation_conflict(temp_signal, signals, cs_scores):
-                    rejected_log.append(f"{sym} {direction}: Corrélation")
-                    continue
-                
-                cs_aligned = False
-                if "_" in sym:
-                    base, quote = sym.split('_')
-                    if cs_scores and base in cs_scores and quote in cs_scores:
-                        gap = cs_scores.get(base, 0) - cs_scores.get(quote, 0)
-                        if direction == "BUY" and gap > 0: cs_aligned = True
-                        elif direction == "SELL" and gap < 0: cs_aligned = True
-                
-                price = df_m5['close'].iloc[-1]
-                atr = QuantEngine.calculate_atr(df_m5)
-                params = get_asset_params(sym)
-                
-                sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
-                tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
-                
-                signals.append({
-                    'symbol': sym, 'type': direction, 'price': price,
-                    'prob': prob, 'score_display': prob * 10,
-                    'details': details, 'atr_pct': atr_pct,
-                    'sl': sl, 'tp': tp, 'rr': params['tp_rr'],
-                    'cs_aligned': cs_aligned, 'spread': spread_pips
-                })
-                
-        except Exception as e:
-            logging.error(f"Erreur scan {sym}: {e}")
-            continue
+            # Utilisation du prix LIVE pour le signal
+            price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
+            atr = QuantEngine.calculate_atr(df_m5)
+            params = get_asset_params(sym)
+            
+            sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
+            tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
+            
+            signals.append({
+                'symbol': sym, 'type': direction, 'price': price,
+                'prob': prob, 'score_display': prob * 10,
+                'details': details, 'atr_pct': atr_pct,
+                'sl': sl, 'tp': tp, 'rr': params['tp_rr'],
+                'cs_aligned': cs_aligned, 'spread': spread_pips
+            })
             
     progress_bar.empty()
     status_text.empty()
@@ -796,7 +833,7 @@ def main():
         adx_filter = st.checkbox(
             "🔥 Filtre ADX > 20 (M5)", 
             value=True,
-            help="Exige ADX supérieur à 20 sur M5 pour confirmer la tendance"
+            help="Exige ADX supérieur à 20 sur H1 et M5 pour confirmer la tendance"
         )
         
         min_prob = st.slider("Score Minimum", 60, 95, 75, 5)
