@@ -14,7 +14,7 @@ import pytz
 import warnings
 
 # ==========================================
-# CONFIGURATION & STYLE (THEME BLEU V5.1)
+# CONFIGURATION & STYLE (THEME BLEU V5.1 FIX)
 # ==========================================
 warnings.simplefilter(action='ignore', category=FutureWarning)
 st.set_page_config(page_title="Bluestar Ultimate V5.1", layout="centered", page_icon="🛡️")
@@ -187,7 +187,6 @@ class QuantEngine:
 
     @staticmethod
     def detect_smart_fvg(df, atr):
-        # LOGIQUE ORIGINALE V4.6
         if len(df) < 4: return False, 0
         curr_close = df['close'].iloc[-1]
         min_gap = atr * 0.5
@@ -206,7 +205,6 @@ class QuantEngine:
 
     @staticmethod
     def get_institutional_grade(df_d, df_w):
-        # LOGIQUE ORIGINALE V4.6
         def analyze_tf(df):
             if len(df) < 50: return "C", "NEUTRAL", 0
             close = df['close']
@@ -234,13 +232,12 @@ class QuantEngine:
         
         if final_score >= 95: final_grade = "A+"
         elif final_score >= 85: final_grade = "A"
-        elif final_grade >= 70: final_grade = "B"
+        elif final_score >= 70: final_grade = "B"  # FIX: Was final_grade typo
         else: final_grade = "C"
         return final_grade, trend_d, final_score
 
     @staticmethod
     def get_midnight_open_ny(df):
-        # LOGIQUE ORIGINALE V4.6 (Légèrement adaptée pour renvoyer aussi PDH/PDL si besoin)
         try:
             ny_tz = pytz.timezone('America/New_York')
             df_ny = df.copy()
@@ -252,13 +249,11 @@ class QuantEngine:
     
     @staticmethod
     def get_pdh_pdl(df_d):
-        # NOUVEAU (Helper simple pour PDH/PDL)
         if len(df_d) < 2: return None, None
         return df_d['high'].iloc[-2], df_d['low'].iloc[-2]
 
     @staticmethod
     def detect_structure_zscore(df, lookback=20):
-        # LOGIQUE ORIGINALE V4.6
         if len(df) < lookback + 1: return 0
         window = df['close'].iloc[-lookback:]
         try:
@@ -272,18 +267,15 @@ class QuantEngine:
     
     @staticmethod
     def calculate_ha_smoothed(df, period=3):
-        # Calcul standard Heiken Ashi
         ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
         ha_open = np.zeros(len(df))
         ha_open[0] = (df['open'].iloc[0] + df['close'].iloc[0]) / 2
         for i in range(1, len(df)):
             ha_open[i] = (ha_open[i-1] + ha_close[i-1]) / 2
         
-        # Lissage via EMA
         smooth_open = pd.Series(ha_open).ewm(span=period).mean()
         smooth_close = ha_close.ewm(span=period).mean()
         
-        # Vérification de la couleur de la dernière bougie
         if smooth_close.iloc[-1] > smooth_open.iloc[-1]: return 1 # Bull
         else: return -1 # Bear
 
@@ -376,7 +368,7 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
     return False
 
 # ==========================================
-# LOGIQUE V5.1 (STRICT ICT)
+# LOGIQUE V5.1 (STRICT ICT) - CORRECTED
 # ==========================================
 def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, strict_mode, spread_pips, force_open=False):
     details = {}
@@ -418,11 +410,10 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     if pdh is None or midnight_open is None: return 0, {}, atr_pct, "Missing Levels"
     
     daily_range = pdh - pdl
-    if daily_range == 0: daily_range = atr # Fallback
+    if daily_range == 0: daily_range = atr 
     
     if direction == "BUY":
         if curr_price > midnight_open: return 0, {}, atr_pct, "Price > Midnight"
-        # Proche PDL ?
         if curr_price > (pdl + (daily_range * 0.30)): return 0, {}, atr_pct, "Not Near PDL"
         details['zone_status'] = "DISCOUNT (Near PDL)"
     else:
@@ -431,7 +422,6 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
         details['zone_status'] = "PREMIUM (Near PDH)"
         
     # 5. MTF Alignment (D1, H4, H1)
-    # H1 / H4 Alignment via HMA
     hma_h1 = QuantEngine.calculate_hma(df_h1['close'], 20)
     slope_h1 = QuantEngine.hma_slope(hma_h1)
     
@@ -441,7 +431,7 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     mtf_aligned = False
     if direction == "BUY":
         if slope_h1 > 0 and slope_h4 > 0: mtf_aligned = True
-        if "BULL" in inst_trend: mtf_aligned = True # Bonus D1
+        if "BULL" in inst_trend: mtf_aligned = True 
     else:
         if slope_h1 < 0 and slope_h4 < 0: mtf_aligned = True
         if "BEAR" in inst_trend: mtf_aligned = True
@@ -456,7 +446,6 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     else:
         if fvg_active and fvg_type == "BEAR": structure_valid = True
         
-    # Si pas de FVG, on accepte si ZScore est modéré (pas une extension extrême)
     if not structure_valid:
         if abs(z_score) < 1.0: structure_valid = True
         
@@ -464,9 +453,9 @@ def calculate_signal_probability_v51(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
         return 0, {}, atr_pct, "No Structure/FVG Support"
         
     # 7. Scoring
-    score = 0.7 # Base pour tout ce qui est passé
+    score = 0.7 
     if adx_val > 25: score += 0.1
-    if abs(z_score) < 0.5: score += 0.1 # Clean structure
+    if abs(z_score) < 0.5: score += 0.1 
     if "A+" in inst_grade: score += 0.1
     
     details['adx_val'] = adx_val
@@ -496,7 +485,6 @@ def run_scan_v51_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
         status_text.markdown(f"⏳ Scan V5.1: **{sym}** ({i+1}/{len(ASSETS)})")
         
         try:
-            # Fetch Data (D1, H4, H1, M5)
             df_d_raw = api.get_candles(sym, "D", 250)
             time.sleep(0.05)
             df_h4 = api.get_candles(sym, "H4", 100)
@@ -514,7 +502,6 @@ def run_scan_v51_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
             
             spread_raw, spread_pips = api.get_realtime_spread(sym)
             
-            # Scan Directions (Check both BUY and SELL triggers)
             for direction in ["BUY", "SELL"]:
                 prob, details, atr_pct, reject_reason = calculate_signal_probability_v51(
                     df_m5, df_h1, df_h4, df_d, df_w, sym, direction, strict_mode, spread_pips, force_open
@@ -528,13 +515,11 @@ def run_scan_v51_blue(api, min_prob, strict_mode, current_time_utc, force_open=F
                     rejected_log.append(f"{sym} {direction}: Score {prob:.2f}")
                     continue
                 
-                # Correlation Check
                 temp_signal = {'symbol': sym, 'type': direction}
                 if check_dynamic_correlation_conflict(temp_signal, signals, cs_scores):
                     rejected_log.append(f"{sym} {direction}: Corrélation")
                     continue
                 
-                # CS Alignment Check
                 cs_aligned = False
                 if "_" in sym:
                     base, quote = sym.split('_')
@@ -628,3 +613,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+   
