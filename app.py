@@ -434,7 +434,7 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
     midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
     
-    # Calcul ADX H1 et M5
+    # Calcul ADX H1 et M5 (M5 sert juste au score, pas au filtre bloquant)
     adx_m5 = QuantEngine.calculate_adx(df_m5)
     adx_h1 = QuantEngine.calculate_adx(df_h1)
     
@@ -450,10 +450,11 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     elif session in ["LONDON", "NY"]:
         details['session'] = f"✅ {session}"
     
-    # Filtre ADX: UNIQUEMENT SUR H1
+    # Filtre ADX: UNIQUEMENT SUR H1 (Modif demandée)
     if adx_filter:
         if adx_h1 < 20:
              return 0, {}, atr_pct, f"ADX H1 {adx_h1:.1f} < 20 (Weak Trend)"
+        # Note: Plus de filtre bloquant sur ADX M5 ici.
     
     # HMA & HA M5
     hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
@@ -563,7 +564,7 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     score = 0.70
     
     if adx_h1 > 25: score += 0.10
-    if adx_m5 > 30: score += 0.05
+    if adx_m5 > 30: score += 0.05 # Bonus score si M5 aligné, mais pas obligatoire
     
     if len(confluence_type) > 1: score += 0.05
     
@@ -776,9 +777,9 @@ def main():
             help="Strict = tous alignés | Flexible = 2 sur 3 | Light = H4 seul | Off = pas de filtre"
         )
         
-        # MODIFICATION DU LABEL ICI
+        # MODIFICATION: Label mis à jour
         adx_filter = st.checkbox(
-            "🔥 Filtre ADX", 
+            "🔥 Filtre ADX > 20 (H1 uniquement)", 
             value=True,
             help="Exige ADX supérieur à 20 sur H1 pour confirmer la tendance de fond"
         )
@@ -814,3 +815,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+   
