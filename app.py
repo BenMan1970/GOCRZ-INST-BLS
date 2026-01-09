@@ -1,17 +1,3 @@
-
-
-Le problème vient de la rigidité du filtre M5. Avec `lookback=5` (25 minutes) et une moyenne mobile lissée (HA), le scanner rejetait tout mouvement qui ne durait pas depuis plus de 30 minutes, ce qui est trop long pour du scalping/intraday.
-
-Voici la correction **Bluestar V5.4.1 "Sniper"**.
-
-**Changements effectués :**
-1.  **Accélération HMA** : Le `lookback` pour la pente passe de 5 à **2** (10 minutes), pour réagir aux changements de direction rapides.
-2.  **Trigger "First Green Ball"** : J'ai remplacé la moyenne lissée (qui est en retard) par la **couleur brute de la dernière bougie Heikin Ashi fermée**. Cela capte exactement le moment où la bougie vient de "virer" au vert/rouge (le "repaint").
-3.  **Tolérance de Pente** : J'ai ajouté une tolérance (epsilon) pour accepter les tendances quasi-plates mais positives/négatives.
-
-Cela devrait débloquer la situation tout en gardant la logique stricte sur le Prix/Midnight/ADX.
-
-```python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -745,4 +731,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
