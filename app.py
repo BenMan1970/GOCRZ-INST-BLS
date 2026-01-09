@@ -15,13 +15,13 @@ import pytz
 import warnings
 
 # ==========================================
-# CONFIGURATION & STYLE (THEME BLEU V6.1)
+# CONFIGURATION & STYLE (THEME BLEU V6.1.1)
 # ==========================================
 warnings.simplefilter(action='ignore', category=FutureWarning)
 logging.getLogger().setLevel(logging.ERROR)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-st.set_page_config(page_title="Bluestar Ultimate V6.1", layout="centered", page_icon="🛡️")
+st.set_page_config(page_title="Bluestar Ultimate V6.1.1", layout="centered", page_icon="🛡️")
 
 if 'trade_logs' not in st.session_state:
     st.session_state.trade_logs = []
@@ -82,6 +82,8 @@ class OandaClient:
             if granularity == "M5": timeout = 15
             elif granularity == "M15": timeout = 60
             elif granularity in ["H1", "H4"]: timeout = 300
+            elif granularity == "D": timeout = 900
+            elif granularity == "W": timeout = 3600 # Cache Weekly 1h
             else: timeout = 900
             if (datetime.now() - ts).total_seconds() < timeout: return data
 
@@ -140,7 +142,7 @@ def get_asset_params(symbol):
     return {'type': 'FOREX', 'atr_threshold': 0.035, 'sl_base': 1.5, 'tp_rr': 2.0}
 
 # ==========================================
-# MOTEUR D'INDICATEURS V6.1 LOGIC
+# MOTEUR D'INDICATEURS V6.1.1 LOGIC
 # ==========================================
 class QuantEngine:
     # ---------- ATR ----------
@@ -245,20 +247,24 @@ class QuantEngine:
             if c < zone_low: return False
         return True
 
-    # ---------- GRADE INSTITUTIONNEL ----------
+    # ---------- GRADE INSTITUTIONNEL V6.1.1 (FIX WEEKLY) ----------
     @staticmethod
-    def get_institutional_grade(df_d, df_w, direction):
-        # Analyse Daily
+    def get_institutional_grade_v2(df_d, df_w, direction):
+        """
+        Version 6.1.1 : Utilise des Dataframes Daily et Weekly natifs de l'API.
+        Pas de resampling, donc plus précis pour le calcul SMA200W.
+        """
+        # Analyse Daily (besoin de 200+ bougies pour SMA200)
         if len(df_d) < 200: return "C"
         price_d = df_d['close'].iloc[-1]
         sma200_d = df_d['close'].rolling(200).mean().iloc[-1]
         ema50_d = df_d['close'].ewm(span=50).mean().iloc[-1]
         ema21_d = df_d['close'].ewm(span=21).mean().iloc[-1]
         
-        # Analyse Weekly (Réduit à 50 car on a moins de données W)
-        if len(df_w) < 50: return "C"
+        # Analyse Weekly (besoin de 51+ bougies pour SMA50)
+        if len(df_w) < 51: return "C"
         price_w = df_w['close'].iloc[-1]
-        sma200_w = df_w['close'].rolling(50).mean().iloc[-1] # Approximation 200 daily = 50 weekly
+        sma200_w = df_w['close'].rolling(50).mean().iloc[-1] # SMA 50 Weekly ~= SMA 200 Daily
         
         if direction == "BUY":
             cond_d = price_d > sma200_d and ema50_d > sma200_d and price_d > ema21_d
@@ -300,9 +306,9 @@ class QuantEngine:
         return df_d['high'].iloc[-2], df_d['low'].iloc[-2]
 
 # ==========================================
-# LOGIQUE PRINCIPALE V6.1 (STRICT MODE)
+# LOGIQUE PRINCIPALE V6.1.1
 # ==========================================
-def calculate_signal_probability_v610(
+def calculate_signal_probability_v611(
     df_m5, df_m15, df_h1, df_d, df_w,
     symbol, direction, live_price, spread, cs_scores, strict_mode
 ):
@@ -440,7 +446,8 @@ def calculate_signal_probability_v610(
     # 5. STRICT MODE: GRADE INSTITUTIONNEL
     # -----------------------------------------------------------
     if strict_mode:
-        grade = QuantEngine.get_institutional_grade(df_d, df_w, direction)
+        # Utilisation de la nouvelle fonction v2 avec données Weekly natives
+        grade = QuantEngine.get_institutional_grade_v2(df_d, df_w, direction)
         debug_info['GRADE'] = grade
         if grade != "A+":
             return 0, debug_info, 0, f"Grade Institutionnel: {grade} (Need A+)", {}
@@ -474,9 +481,9 @@ def calculate_signal_probability_v610(
     return final_score, details, atr / price * 100, None, {}
 
 # ==========================================
-# SCANNER PRINCIPAL
+# SCANNER PRINCIPAL V6.1.1
 # ==========================================
-def run_scan_v610(api, min_prob, current_time_utc, strict_mode):
+def run_scan_v611(api, min_prob, current_time_utc, strict_mode):
     cs_scores = get_currency_strength_rsi(api)
     signals = []
     rejected_log = []
@@ -488,20 +495,22 @@ def run_scan_v610(api, min_prob, current_time_utc, strict_mode):
         mode_str = "STRICT" if strict_mode else "STANDARD"
         status_text.markdown(f"⏳ Scan [{mode_str}]: **{sym}** ({i+1}/{len(ASSETS)})")
         try:
+            # Récupération Data H1, M15, M5
             df_h1 = api.get_candles(sym, "H1", 50)
             df_m15 = api.get_candles(sym, "M15", 100)
             df_m5 = api.get_candles(sym, "M5", 200)
-            df_d_raw = api.get_candles(sym, "D", 250)
+            
+            # FIX V6.1.1 : Appels séparés pour Daily et Weekly (plus précis)
+            df_d = api.get_candles(sym, "D", 250)
+            df_w = api.get_candles(sym, "W", 150) # On prend 150 semaines pour assurer le calcul SMA 50
             
             live_price, spread_pips = api.get_realtime_price_and_spread(sym)
             
-            if df_m5.empty or df_h1.empty or df_m15.empty or df_d_raw.empty: continue
-            
-            df_d = df_d_raw.iloc[-100:].copy()
-            df_w = df_d_raw.set_index('time').resample('W-FRI').agg({'open':'first', 'high':'max', 'low':'min', 'close':'last'}).dropna().reset_index()
+            # On vérifie que tous les Dataframes ne sont pas vides
+            if df_m5.empty or df_h1.empty or df_m15.empty or df_d.empty or df_w.empty: continue
             
             for direction in ["BUY", "SELL"]:
-                prob, details, atr_pct, reject_reason, _ = calculate_signal_probability_v610(
+                prob, details, atr_pct, reject_reason, _ = calculate_signal_probability_v611(
                     df_m5, df_m15, df_h1, df_d, df_w, sym, direction, live_price, spread_pips, cs_scores, strict_mode
                 )
                 
@@ -601,9 +610,9 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
     return False
 
 # ==========================================
-# AFFICHAGE
+# AFFICHAGE V6.1.1
 # ==========================================
-def display_sig_v610(s):
+def display_sig_v611(s):
     is_buy = s['type'] == 'BUY'
     col_type = "#10b981" if is_buy else "#ef4444"
     bg = "linear-gradient(90deg, #064e3b 0%, #065f46 100%)" if is_buy else "linear-gradient(90deg, #7f1d1d 0%, #991b1b 100%)"
@@ -651,8 +660,8 @@ def display_sig_v610(s):
 # MAIN
 # ==========================================
 def main():
-    st.title("🛡️ BLUESTAR ULTIMATE V6.1")
-    st.markdown("<p style='text-align:center;color:#94a3b8;'>Top-Down Logic (H1 → M15 → M5) + Strict Mode</p>", unsafe_allow_html=True)
+    st.title("🛡️ BLUESTAR ULTIMATE V6.1.1")
+    st.markdown("<p style='text-align:center;color:#94a3b8;'>Top-Down Logic (H1 → M15 → M5) + Strict Mode (Fixed Weekly Data)</p>", unsafe_allow_html=True)
     
     current_time_utc = datetime.now(pytz.utc)
     session = QuantEngine.get_trading_session(current_time_utc)
@@ -666,18 +675,18 @@ def main():
     """, unsafe_allow_html=True)
     
     with st.sidebar:
-        st.header("⚙️ Paramètres V6.1")
+        st.header("⚙️ Paramètres V6.1.1")
         strict_mode = st.checkbox("🔒 Mode STRICT (Institutional Only)", value=False, help="Filtre ADX > 25, Z-Score < 2.0 et Grade A+ requis")
         min_prob = st.slider("Score Min", 60, 95, 75, 5)
         
         if strict_mode:
             st.warning("⚠️ Mode Strict activé: Signaux très rares mais haute qualité.")
-            st.markdown("- ADX > 25\n- Z-Score < -2.0\n- Grade A+ Daily/Weekly")
+            st.markdown("- ADX > 25\n- Z-Score < -2.0\n- Grade A+ Daily/Weekly (Native)")
 
-    if st.button("🔍 SCANNER V6.1"):
+    if st.button("🔍 SCANNER V6.1.1"):
         with st.spinner("Analyse Top-Down en cours..."):
             api = OandaClient()
-            results, logs = run_scan_v610(api, min_prob/100, current_time_utc, strict_mode)
+            results, logs = run_scan_v611(api, min_prob/100, current_time_utc, strict_mode)
             
         if not results:
             st.warning("⚠️ Aucun signal validé.")
@@ -685,10 +694,9 @@ def main():
                 for log in logs[:50]: st.text(log)
         else:
             st.success(f"✅ {len(results)} Signal(s) Validé(s)")
-            for r in results: display_sig_v610(r)
+            for r in results: display_sig_v611(r)
             with st.expander("Logs de rejet"):
                 for log in logs[:50]: st.text(log)
 
 if __name__ == "__main__":
     main()
-  
