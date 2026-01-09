@@ -15,13 +15,13 @@ import pytz
 import warnings
 
 # ==========================================
-# CONFIGURATION & STYLE (THEME BLEU V5.4.1)
+# CONFIGURATION & STYLE (THEME BLEU V5.4.1 FIX)
 # ==========================================
 warnings.simplefilter(action='ignore', category=FutureWarning)
 logging.getLogger().setLevel(logging.ERROR)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-st.set_page_config(page_title="Bluestar Ultimate V5.4.1 Sniper", layout="centered", page_icon="🛡️")
+st.set_page_config(page_title="Bluestar Ultimate V5.4.1 Fix", layout="centered", page_icon="🛡️")
 
 if 'trade_logs' not in st.session_state:
     st.session_state.trade_logs = []
@@ -138,7 +138,7 @@ def get_asset_params(symbol):
     return {'type': 'FOREX', 'atr_threshold': 0.035, 'sl_base': 1.5, 'tp_rr': 2.0}
 
 # ==========================================
-# MOTEUR D'INDICATEURS V5.4.1 (RAPIDE)
+# MOTEUR D'INDICATEURS V5.4.1 FIX
 # ==========================================
 class QuantEngine:
     @staticmethod
@@ -182,9 +182,8 @@ class QuantEngine:
 
     @staticmethod
     def hma_slope(hma_series, lookback=2, min_slope=0.0001):
-        # FIX V5.4.1: lookback par défaut à 2 (10 min) pour réactivité
+        # lookback=2 pour réactivité M5
         if len(hma_series) < lookback + 1: return 0
-        # Calcul pente simple: (Actuel - Lookback_Arriere)
         diff = hma_series.iloc[-1] - hma_series.iloc[-1 - lookback]
         if diff > min_slope: return 1
         elif diff < -min_slope: return -1
@@ -192,16 +191,20 @@ class QuantEngine:
 
     @staticmethod
     def get_ha_color(df):
-        # FIX V5.4.1: Retourne la couleur de la DERNIÈRE bougie HA fermée (Trigger "First Green Ball")
+        # FIX V5.4.1: Utilisation de pd.Series au lieu de np.zeros pour éviter l'erreur .iloc
         if len(df) < 2: return 0
-        # Calcul HA standard pour la série complète
-        ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
-        ha_open = np.zeros(len(df))
-        ha_open[0] = (df['open'].iloc[0] + df['close'].iloc[0]) / 2
-        for i in range(1, len(df)):
-            ha_open[i] = (ha_open[i-1] + ha_close[i-1]) / 2
         
-        # On vérifie juste la dernière bougie fermée (iloc[-1])
+        # Calcul HA standard
+        ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
+        
+        # Utilisation de pd.Series pour garder l'index et utiliser .iloc
+        ha_open = pd.Series(np.zeros(len(df)), index=df.index)
+        ha_open.iloc[0] = (df['open'].iloc[0] + df['close'].iloc[0]) / 2
+        
+        for i in range(1, len(df)):
+            ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2
+        
+        # Retourne 1 (Bullish) si Close > Open, -1 (Bearish) sinon
         if ha_close.iloc[-1] > ha_open.iloc[-1]: return 1
         else: return -1
 
@@ -321,7 +324,7 @@ class QuantEngine:
         except: return 0 
 
 # ==========================================
-# LOGIQUE PRINCIPALE V5.4.1
+# LOGIQUE PRINCIPALE V5.4.1 FIX
 # ==========================================
 def calculate_signal_probability_v541(df_m5, df_h1, df_h4, df_d, df_w, symbol, direction, adx_filter, mtf_filter, live_price_raw, spread_pips, current_time_utc):
     details = {}
@@ -347,12 +350,10 @@ def calculate_signal_probability_v541(df_m5, df_h1, df_h4, df_d, df_w, symbol, d
     ob_active, ob_zone = QuantEngine.detect_order_block(df_m5, atr, direction)
     inst_grade, inst_trend, _ = QuantEngine.get_institutional_grade(df_d, df_w)
     
-    # 3. M5 TRIGGER (CORRIGÉ POUR ÊTRE PLUS RAPIDE)
+    # 3. M5 TRIGGER
     hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
-    # FIX V5.4.1: lookback=2 pour réagir sur 10 mins
     hma_slope_m5 = QuantEngine.hma_slope(hma_m5, lookback=2) 
-    # FIX V5.4.1: Utilisation de get_ha_color pour la dernière bougie fermée
-    ha_color_m5 = QuantEngine.get_ha_color(df_m5)
+    ha_color_m5 = QuantEngine.get_ha_color(df_m5) # FIX APPLIQUÉ ICI
     
     # FILTRE ADX H1 > 20
     if adx_filter and adx_h1 < 20:
@@ -360,11 +361,9 @@ def calculate_signal_probability_v541(df_m5, df_h1, df_h4, df_d, df_w, symbol, d
         
     # FILTRE M5: HMA & HA
     if direction == "BUY":
-        # HMA doit monter (slope 1) ET HA doit être verte (1)
         if not (hma_slope_m5 >= 0 and ha_color_m5 > 0):
             return 0, {}, atr_pct, "No M5 Trigger (Need Green HMA/HA)", {}
     else:
-        # HMA doit descendre (slope -1) ET HA doit être rouge (-1)
         if not (hma_slope_m5 <= 0 and ha_color_m5 < 0):
             return 0, {}, atr_pct, "No M5 Trigger (Need Red HMA/HA)", {}
             
@@ -631,7 +630,8 @@ def run_scan_v541(api, min_prob, adx_filter, mtf_filter, current_time_utc):
                     'details': details, 'atr_pct': atr_pct, 'sl': sl, 'tp': tp, 'rr': params['tp_rr'],
                     'cs_aligned': cs_aligned, 'spread': spread_pips, 'enhanced_metrics': enhanced_metrics
                 })
-        except Exception as e: rejected_log.append(f"❌ {sym} Err: {str(e)[:30]}"); continue
+        except Exception as e: 
+            rejected_log.append(f"❌ {sym} Err: {str(e)[:30]}"); continue
     progress_bar.empty()
     status_text.empty()
     return sorted(signals, key=lambda x: x['prob'], reverse=True), rejected_log
@@ -699,8 +699,8 @@ def display_sig_v541(s):
             if d.get('timing_alerts'): st.write(f"**Alerts:** {', '.join(d['timing_alerts'])}")
 
 def main():
-    st.title("🛡️ BLUESTAR ULTIMATE V5.4.1 SNIPER")
-    st.markdown("<p style='text-align:center;color:#94a3b8;'>M5 Fast Trigger | Fixed Logic | Optimized</p>", unsafe_allow_html=True)
+    st.title("🛡️ BLUESTAR ULTIMATE V5.4.1 FIX")
+    st.markdown("<p style='text-align:center;color:#94a3b8;'>M5 Fast Trigger | Bug Fixes | Optimized</p>", unsafe_allow_html=True)
     current_time_utc = datetime.now(pytz.utc)
     session = QuantEngine.get_trading_session(current_time_utc)
     session_colors = {"ASIAN": "#f59e0b", "LONDON": "#10b981", "NY": "#3b82f6", "OFF": "#6b7280"}
@@ -714,8 +714,8 @@ def main():
         st.header("⚙️ Filtres V5.4.1")
         mtf_filter = st.selectbox("Alignement MTF", ["Strict (D+H4+H1)", "Flexible (D+H4 OR H4+H1)", "Light (H4 only)", "Off"], index=0)
         adx_filter = st.checkbox("Filtre ADX H1 > 20", value=True)
-        min_prob = st.slider("Score Min", 60, 95, 70, 5) # Baisé le défaut à 70 pour être plus permissif
-    if st.button("🔍 SCANNER V5.4.1"):
+        min_prob = st.slider("Score Min", 60, 95, 70, 5)
+    if st.button("🔍 SCANNER V5.4.1 FIX"):
         with st.spinner("Analyse Rapide..."):
             api = OandaClient()
             results, logs = run_scan_v541(api, min_prob/100, adx_filter, mtf_filter, current_time_utc)
