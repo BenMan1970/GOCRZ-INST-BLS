@@ -15,18 +15,18 @@ import pytz
 import warnings
 
 # ==========================================
-# CONFIGURATION & STYLE (THEME BLEU V6.2)
+# CONFIGURATION & STYLE (THEME BLEU V6.3)
 # ==========================================
 warnings.simplefilter(action='ignore', category=FutureWarning)
 logging.getLogger().setLevel(logging.ERROR)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-st.set_page_config(page_title="Bluestar Ultimate V6.2", layout="centered", page_icon="🛡️")
+st.set_page_config(page_title="Bluestar Ultimate V6.3", layout="centered", page_icon="🛡️")
 
 if 'trade_logs' not in st.session_state:
     st.session_state.trade_logs = []
 if 'active_zones' not in st.session_state:
-    st.session_state.active_zones = {} # Track used zones: {symbol: {'zone': (low, high), 'dir': 'BUY'}}
+    st.session_state.active_zones = {} 
 
 st.markdown("""
 <style>
@@ -145,7 +145,7 @@ def get_asset_params(symbol):
     return {'type': 'FOREX', 'atr_threshold': 0.035, 'sl_base': 1.5, 'tp_rr': 2.0}
 
 # ==========================================
-# MOTEUR D'INDICATEURS V6.2 LOGIC
+# MOTEUR D'INDICATEURS V6.3 LOGIC
 # ==========================================
 class QuantEngine:
     # ---------- ATR ----------
@@ -158,7 +158,7 @@ class QuantEngine:
         ], axis=1).max(axis=1)
         return tr.ewm(span=period).mean().iloc[-1]
 
-    # ---------- ADX & DI (Directionnel) ----------
+    # ---------- ADX & DI ----------
     @staticmethod
     def calculate_adx_and_di(df, period=14):
         high, low, close = df['high'], df['low'], df['close']
@@ -174,7 +174,6 @@ class QuantEngine:
         minus_di = 100 * (minus_dm.ewm(alpha=1/period).mean() / atr)
         dx = (abs(plus_di - minus_di) / (plus_di + minus_di)).fillna(0) * 100
         adx = dx.ewm(alpha=1/period).mean().iloc[-1]
-        # Retourne l'ADX et la direction (1 si +DM > -DM, -1 si -DM > +DM)
         direction = 1 if plus_di.iloc[-1] > minus_di.iloc[-1] else -1
         return adx, direction
 
@@ -198,7 +197,7 @@ class QuantEngine:
             ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2
         return ha_open, ha_close
 
-    # ---------- Z-SCORE STATUS ----------
+    # ---------- Z-SCORE ----------
     @staticmethod
     def get_zscore_status(df, lookback=20):
         if len(df) < lookback + 1: return 0, 0
@@ -216,7 +215,7 @@ class QuantEngine:
             impulse = abs(df['close'].iloc[i+1] - df['open'].iloc[i+1])
             if impulse < body * 1.8: continue
             zone = (df['low'].iloc[i], df['high'].iloc[i])
-            price = df['close'].iloc[-1]
+            price = df['close'].iloc[-1] # Prix actuel
             if zone[0] <= price <= zone[1]:
                 if direction == "BUY" and df['close'].iloc[i] < df['open'].iloc[i]:
                     return True, zone
@@ -305,13 +304,12 @@ class QuantEngine:
         return df_d['high'].iloc[-2], df_d['low'].iloc[-2]
 
 # ==========================================
-# LOGIQUE PRINCIPALE V6.2
+# LOGIQUE PRINCIPALE V6.3 (ANTI-REPAINT)
 # ==========================================
-def calculate_signal_probability_v620(
+def calculate_signal_probability_v630(
     df_m5, df_m15, df_h1, df_d, df_w,
     symbol, direction, live_price, spread, cs_scores, strict_mode
 ):
-    # 0. Initialisation
     price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
     atr = QuantEngine.calculate_atr(df_m5)
     params = get_asset_params(symbol)
@@ -319,52 +317,41 @@ def calculate_signal_probability_v620(
     midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
     
     debug_info = {}
-    
-    # --- STRICT MODE CONFIG ---
     min_adx = 25 if strict_mode else 20
     min_z_abs = 2.0 if strict_mode else 1.5
     
     # -----------------------------------------------------------
-    # 1. CONTEXTE H1 (AJOUT DI DIRECTIONNEL)
+    # 1. CONTEXTE H1 (ANTI-REPAINT: Bougie Clôturée)
     # -----------------------------------------------------------
-    adx_h1, adx_dir = QuantEngine.calculate_adx_and_di(df_h1)
     hma_h1 = QuantEngine.calculate_hma(df_h1['close'])
-    hma_h1_green = hma_h1.iloc[-1] > hma_h1.iloc[-2]
-    price_h1 = df_h1['close'].iloc[-1]
+    # FIX V6.3: On regarde la bougie clôturée (-2) vs la précédente (-3)
+    hma_h1_green = hma_h1.iloc[-2] > hma_h1.iloc[-3]
+    price_h1 = df_h1['close'].iloc[-1] # Le prix actuel
     
-    if adx_h1 <= min_adx: 
-        reason = f"H1 ADX {adx_h1:.1f} < {min_adx}" + (" (Strict)" if strict_mode else "")
-        return 0, debug_info, 0, reason, {}
-    
-    # FIX V6.2 : Vérifier la direction ADX (+DM vs -DM)
     if direction == "BUY":
-        if adx_dir != 1: return 0, debug_info, 0, "ADX Direction BAISSIÈRE", {} # +DM doit dominer
-        if not hma_h1_green: return 0, debug_info, 0, "H1 HMA Rouge", {}
-        if price_h1 <= hma_h1.iloc[-1]: return 0, debug_info, 0, "Prix sous HMA H1", {}
+        if not hma_h1_green: return 0, debug_info, 0, "H1 HMA Rouge (Closed)", {}
+        if price_h1 <= hma_h1.iloc[-2]: return 0, debug_info, 0, "Prix sous HMA H1", {}
     else: # SELL
-        if adx_dir != -1: return 0, debug_info, 0, "ADX Direction HAUSSIÈRE", {} # -DM doit dominer
-        if hma_h1_green: return 0, debug_info, 0, "H1 HMA Verte (Sell)", {}
-        if price_h1 >= hma_h1.iloc[-1]: return 0, debug_info, 0, "Prix sur HMA H1 (Sell)", {}
+        if hma_h1_green: return 0, debug_info, 0, "H1 HMA Verte (Closed)", {}
+        if price_h1 >= hma_h1.iloc[-2]: return 0, debug_info, 0, "Prix sur HMA H1", {}
 
-    debug_info['H1'] = f"✅ ADX:{adx_h1:.0f} DI:{'PLUS' if adx_dir==1 else 'MINUS'} HMA: {'UP' if hma_h1_green else 'DN'}"
+    debug_info['H1'] = f"✅ ADX OK HMA: {'UP' if hma_h1_green else 'DN'} (Closed)"
 
     # -----------------------------------------------------------
-    # 2. ALIGNEMENT M15 (FIX STRUCTURE)
+    # 2. ALIGNEMENT M15 (ANTI-REPAINT)
     # -----------------------------------------------------------
     hma_m15 = QuantEngine.calculate_hma(df_m15['close'])
-    hma_m15_green = hma_m15.iloc[-1] > hma_m15.iloc[-2]
+    hma_m15_green = hma_m15.iloc[-2] > hma_m15.iloc[-3]
     
     ha_o_m15, ha_c_m15 = QuantEngine.get_ha_ohlc(df_m15)
-    ha_m15_green = ha_c_m15.iloc[-1] > ha_o_m15.iloc[-1]
+    # FIX V6.3: HA sur bougie clôturée
+    ha_m15_green = ha_c_m15.iloc[-2] > ha_o_m15.iloc[-2]
     
-    # FIX V6.2 : Structure plus robuste (2 points consécutifs)
-    # Buy: Low[-1] > Low[-3] (HL sur 2 bougies) ET Low[-1] > Low[-5] (Tendance HL)
     if direction == "BUY":
-        structure_ok = (df_m15['low'].iloc[-1] > df_m15['low'].iloc[-3]) and (df_m15['low'].iloc[-1] > df_m15['low'].iloc[-5])
+        structure_ok = (df_m15['low'].iloc[-2] > df_m15['low'].iloc[-4]) and (df_m15['low'].iloc[-2] > df_m15['low'].iloc[-6])
     else:
-        structure_ok = (df_m15['high'].iloc[-1] < df_m15['high'].iloc[-3]) and (df_m15['high'].iloc[-1] < df_m15['high'].iloc[-5])
+        structure_ok = (df_m15['high'].iloc[-2] < df_m15['high'].iloc[-4]) and (df_m15['high'].iloc[-2] < df_m15['high'].iloc[-6])
     
-    # Matrice des forces
     cs_aligned = False
     if "_" in symbol and cs_scores:
         base, quote = symbol.split('_')
@@ -373,40 +360,36 @@ def calculate_signal_probability_v620(
         elif direction == "SELL" and gap < 0: cs_aligned = True
 
     if direction == "BUY":
-        if not hma_m15_green: return 0, debug_info, 0, "M15 HMA Rouge", {}
-        if not ha_m15_green: return 0, debug_info, 0, "M15 HA Rouge", {}
+        if not hma_m15_green: return 0, debug_info, 0, "M15 HMA Rouge (Closed)", {}
+        if not ha_m15_green: return 0, debug_info, 0, "M15 HA Rouge (Closed)", {}
         if not structure_ok: return 0, debug_info, 0, "M15 Structure Faible", {}
         if not cs_aligned: return 0, debug_info, 0, "CS Non Aligné", {}
     else:
-        if hma_m15_green: return 0, debug_info, 0, "M15 HMA Verte (Sell)", {}
-        if ha_m15_green: return 0, debug_info, 0, "M15 HA Verte (Sell)", {}
+        if hma_m15_green: return 0, debug_info, 0, "M15 HMA Verte (Closed)", {}
+        if ha_m15_green: return 0, debug_info, 0, "M15 HA Verte (Closed)", {}
         if not structure_ok: return 0, debug_info, 0, "M15 Structure Faible", {}
         if not cs_aligned: return 0, debug_info, 0, "CS Non Aligné", {}
 
-    debug_info['M15'] = f"✅ HMA/HA OK | Structure Robuste | CS OK"
+    debug_info['M15'] = f"✅ HMA/HA OK (Closed) | Structure Robuste | CS OK"
 
     # -----------------------------------------------------------
-    # 3. ZONE & CONTEXTE (M5) + TRACKING ZONE
+    # 3. ZONE & CONTEXTE
     # -----------------------------------------------------------
-    # Midnight Rule
     if midnight_open:
         if direction == "BUY" and price >= midnight_open:
             return 0, debug_info, 0, "Prix > Midnight (Buy)", {}
         if direction == "SELL" and price <= midnight_open:
             return 0, debug_info, 0, "Prix < Midnight (Sell)", {}
     
-    # PDL Rule
     if pdl is not None and direction == "BUY" and price <= pdl:
         return 0, debug_info, 0, "Prix < PDL (Achat cassé)", {}
     
-    # OB/FVG Detection
     ob_valid, ob_zone = QuantEngine.detect_valid_ob(df_m5, atr, direction)
     fvg_valid, fvg_zone = QuantEngine.detect_fvg(df_m5, atr, direction)
     
     target_zone = None
     zone_type = ""
     
-    # FIX V6.2 : Priorité OB > FVG
     if ob_valid:
         target_zone = ob_zone
         zone_type = "OB"
@@ -419,49 +402,53 @@ def calculate_signal_probability_v620(
     if not QuantEngine.check_zone_integrity(df_m5, target_zone, lookback=5):
         return 0, debug_info, 0, f"{zone_type} Cassée", {}
         
-    # FIX V6.2 : Vérifier si la zone est déjà utilisée (Session State)
-    # Si le prix est dans une zone qu'on a déjà signalé, on refuse.
+    # Check Re-entry (Tracking)
     if symbol in st.session_state.active_zones:
         existing = st.session_state.active_zones[symbol]
-        # Nettoyage : si le prix est sorti de l'ancienne zone, on la supprime
         old_low, old_high = existing['zone']
         if price < old_low or price > old_high:
             del st.session_state.active_zones[symbol]
         else:
-            # Le prix est DANS l'ancienne zone. Refus.
             return 0, debug_info, 0, "Zone Déjà Utilisée (Re-entry)", {}
 
     debug_info['ZONE'] = f"✅ {zone_type} Validée (Fresh)"
 
     # -----------------------------------------------------------
-    # 4. DÉCLENCHEUR M5 & Z-SCORE
+    # 4. DÉCLENCHEUR M5 (ANTI-REPAINT CRITICAL)
     # -----------------------------------------------------------
     hma_m5 = QuantEngine.calculate_hma(df_m5['close'])
-    hma_m5_green = hma_m5.iloc[-1] > hma_m5.iloc[-2]
+    hma_m5_green = hma_m5.iloc[-2] > hma_m5.iloc[-3]
     
     ha_o_m5, ha_c_m5 = QuantEngine.get_ha_ohlc(df_m5)
+    # FIX V6.3: Le flip doit être confirmé sur la bougie clôturée (-2)
+    # Exemple Buy: -2 est verte, -3 était rouge.
+    if direction == "BUY":
+        ha_prev_red = ha_c_m5.iloc[-3] < ha_o_m5.iloc[-3]
+        ha_curr_green = ha_c_m5.iloc[-2] > ha_o_m5.iloc[-2]
+        ha_flip = ha_prev_red and ha_curr_green
+    else:
+        ha_prev_green = ha_c_m5.iloc[-3] > ha_o_m5.iloc[-3]
+        ha_curr_red = ha_c_m5.iloc[-2] < ha_o_m5.iloc[-2]
+        ha_flip = ha_prev_green and ha_curr_red
+
     z_curr, z_prev = QuantEngine.get_zscore_status(df_m5, lookback=20)
     
     z_buy_ok = (z_curr < -min_z_abs) and (z_curr > z_prev)
     z_sell_ok = (z_curr > min_z_abs) and (z_curr < z_prev)
 
     if direction == "BUY":
-        if not hma_m5_green: return 0, debug_info, 0, "M5 HMA Rouge", {}
-        ha_prev_red = ha_c_m5.iloc[-2] < ha_o_m5.iloc[-2]
-        ha_curr_green = ha_c_m5.iloc[-1] > ha_o_m5.iloc[-1]
-        if not (ha_prev_red and ha_curr_green): return 0, debug_info, 0, "Pas de HA Flip Buy", {}
+        if not hma_m5_green: return 0, debug_info, 0, "M5 HMA Rouge (Closed)", {}
+        if not ha_flip: return 0, debug_info, 0, "Pas de HA Flip Buy (Closed)", {}
         if not z_buy_ok: return 0, debug_info, 0, f"Z-Score {z_curr:.2f} (Need < -{min_z_abs})", {}
     else: # SELL
-        if hma_m5_green: return 0, debug_info, 0, "M5 HMA Verte", {}
-        ha_prev_green = ha_c_m5.iloc[-2] > ha_o_m5.iloc[-2]
-        ha_curr_red = ha_c_m5.iloc[-1] < ha_o_m5.iloc[-1]
-        if not (ha_prev_green and ha_curr_red): return 0, debug_info, 0, "Pas de HA Flip Sell", {}
+        if hma_m5_green: return 0, debug_info, 0, "M5 HMA Verte (Closed)", {}
+        if not ha_flip: return 0, debug_info, 0, "Pas de HA Flip Sell (Closed)", {}
         if not z_sell_ok: return 0, debug_info, 0, f"Z-Score {z_curr:.2f} (Need > {min_z_abs})", {}
 
     debug_info['TRIGGER'] = f"Z:{z_curr:.2f}"
 
     # -----------------------------------------------------------
-    # 5. STRICT MODE: GRADE INSTITUTIONNEL
+    # 5. STRICT MODE
     # -----------------------------------------------------------
     if strict_mode:
         grade = QuantEngine.get_institutional_grade_v2(df_d, df_w, direction)
@@ -470,21 +457,21 @@ def calculate_signal_probability_v620(
             return 0, debug_info, 0, f"Grade Institutionnel: {grade} (Need A+)", {}
 
     # -----------------------------------------------------------
-    # 6. SCORING FINAL & ZONE REGISTRATION
+    # 6. SCORING & REGISTRATION
     # -----------------------------------------------------------
     score_base = 0.85 if strict_mode else 0.80
-    if adx_h1 > 30: score_base += 0.05
+    # ADX Direction (calculé dans le scanner principal pour lazy load)
+    # On suppose ici que si on arrive ici, ADX est OK.
     if cs_aligned: score_base += 0.10
     final_score = min(score_base, 1.0)
 
     sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
     tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
     
-    # FIX V6.2 : Enregistrer la zone pour empêcher le re-entry
     st.session_state.active_zones[symbol] = {'zone': target_zone, 'dir': direction}
 
     details = {
-        "adx_val": adx_h1,
+        "adx_val": debug_info.get('ADX', 0), # Will be set in loop
         "z_score": z_curr,
         "hma_slope": 1 if direction=="BUY" else -1,
         "ha_status": "🟢" if direction=="BUY" else "🔴",
@@ -501,30 +488,48 @@ def calculate_signal_probability_v620(
     return final_score, details, atr / price * 100, None, {}
 
 # ==========================================
-# SCANNER PRINCIPAL V6.2
+# SCANNER PRINCIPAL V6.3 (LAZY LOADING)
 # ==========================================
-def run_scan_v620(api, min_prob, current_time_utc, strict_mode, filter_asian):
+def run_scan_v630(api, min_prob, current_time_utc, strict_mode, filter_asian):
     cs_scores = get_currency_strength_rsi(api)
     signals = []
     rejected_log = []
     progress_bar = st.progress(0)
     status_text = st.empty()
     
+    # Lazy Loading Config
+    min_adx = 25 if strict_mode else 20
+    
     for i, sym in enumerate(ASSETS):
         progress_bar.progress((i+1)/len(ASSETS))
         mode_str = "STRICT" if strict_mode else "STANDARD"
         status_text.markdown(f"⏳ Scan [{mode_str}]: **{sym}** ({i+1}/{len(ASSETS)})")
         try:
-            # FIX V6.2 : Filtre Session Asiatique (Optionnel)
+            # --- ETAPE 1: SESSION FILTER ---
             if filter_asian:
                 session = QuantEngine.get_trading_session(current_time_utc)
                 if session == "ASIAN":
-                    # Exceptions: Gold/Indices sometimes move in Asian, but let's keep it strict as requested
                     if "XAU" not in sym and "US30" not in sym:
                         rejected_log.append(f"{sym}: Session Asiatique Filtrée")
                         continue
-            
+
+            # --- ETAPE 2: LAZY LOAD H1 (Gardien) ---
             df_h1 = api.get_candles(sym, "H1", 50)
+            if df_h1.empty: continue
+            
+            # Vérification H1 IMMÉDIATE pour économiser les appels API
+            adx_h1, adx_dir = QuantEngine.calculate_adx_and_di(df_h1)
+            
+            # Filtrage ADX Force
+            if adx_h1 < min_adx:
+                rejected_log.append(f"{sym}: H1 ADX Faible ({adx_h1:.1f})")
+                continue
+            
+            # Filtrage ADX Direction
+            is_buy_potential = (adx_dir == 1)
+            is_sell_potential = (adx_dir == -1)
+
+            # --- ETAPE 3: CHARGEMENT COMPLET (Seulement si H1 valide) ---
             df_m15 = api.get_candles(sym, "M15", 100)
             df_m5 = api.get_candles(sym, "M5", 200)
             df_d = api.get_candles(sym, "D", 250)
@@ -532,12 +537,20 @@ def run_scan_v620(api, min_prob, current_time_utc, strict_mode, filter_asian):
             
             live_price, spread_pips = api.get_realtime_price_and_spread(sym)
             
-            if df_m5.empty or df_h1.empty or df_m15.empty or df_d.empty or df_w.empty: continue
+            if df_m5.empty or df_m15.empty or df_d.empty or df_w.empty: continue
             
-            for direction in ["BUY", "SELL"]:
-                prob, details, atr_pct, reject_reason, _ = calculate_signal_probability_v620(
+            # Boucle sur directions, mais en tenant compte de ADX direction
+            directions_to_check = []
+            if is_buy_potential: directions_to_check.append("BUY")
+            if is_sell_potential: directions_to_check.append("SELL")
+
+            for direction in directions_to_check:
+                prob, details, atr_pct, reject_reason, _ = calculate_signal_probability_v630(
                     df_m5, df_m15, df_h1, df_d, df_w, sym, direction, live_price, spread_pips, cs_scores, strict_mode
                 )
+                
+                # Injecter ADX dans les details pour l'affichage
+                details['adx_val'] = adx_h1
                 
                 if reject_reason: 
                     rejected_log.append(f"{sym} {direction}: {reject_reason}")
@@ -635,9 +648,9 @@ def check_dynamic_correlation_conflict(new_signal, existing_signals, cs_scores):
     return False
 
 # ==========================================
-# AFFICHAGE V6.2
+# AFFICHAGE V6.3
 # ==========================================
-def display_sig_v620(s):
+def display_sig_v630(s):
     is_buy = s['type'] == 'BUY'
     col_type = "#10b981" if is_buy else "#ef4444"
     bg = "linear-gradient(90deg, #064e3b 0%, #065f46 100%)" if is_buy else "linear-gradient(90deg, #7f1d1d 0%, #991b1b 100%)"
@@ -676,8 +689,8 @@ def display_sig_v620(s):
         
         with st.expander("🔍 Analyse Top-Down"):
             st.write(f"**H1 Context:** ADX > {25 if is_strict else 20}, DI Directionnel {'HAUSSIER' if is_buy else 'BAISSIER'}.")
-            st.write(f"**M15 Alignment:** HMA/HA Green, Structure Robuste (2 pts), CS OK.")
-            st.write(f"**M5 Trigger:** HA Flip + Z-Score {'< -2.0' if is_strict else '< -1.5'}.")
+            st.write(f"**M15 Alignment:** HMA/HA Green (Closed), Structure Robuste, CS OK.")
+            st.write(f"**M5 Trigger:** HA Flip Confirmé + Z-Score {'< -2.0' if is_strict else '< -1.5'}.")
             if d.get('debug'):
                 st.json(d['debug'])
 
@@ -685,8 +698,8 @@ def display_sig_v620(s):
 # MAIN
 # ==========================================
 def main():
-    st.title("🛡️ BLUESTAR ULTIMATE V6.2")
-    st.markdown("<p style='text-align:center;color:#94a3b8;'>Top-Down Logic (H1 → M15 → M5) + ADX Direction + Zone Tracking</p>", unsafe_allow_html=True)
+    st.title("🛡️ BLUESTAR ULTIMATE V6.3")
+    st.markdown("<p style='text-align:center;color:#94a3b8;'>Top-Down Logic (H1 → M15 → M5) + Lazy Loading + Anti-Repaint</p>", unsafe_allow_html=True)
     
     current_time_utc = datetime.now(pytz.utc)
     session = QuantEngine.get_trading_session(current_time_utc)
@@ -700,7 +713,7 @@ def main():
     """, unsafe_allow_html=True)
     
     with st.sidebar:
-        st.header("⚙️ Paramètres V6.2")
+        st.header("⚙️ Paramètres V6.3")
         strict_mode = st.checkbox("🔒 Mode STRICT (Institutional)", value=False, help="Filtre ADX > 25, Z-Score < 2.0 et Grade A+ requis")
         filter_asian = st.checkbox("🕶️ Filtrer Session Asiatique", value=True, help="Ignore les signaux pendant la session Asiatique (faible volatilité)")
         min_prob = st.slider("Score Min", 60, 95, 75, 5)
@@ -709,11 +722,13 @@ def main():
             st.warning("⚠️ Mode Strict activé.")
         if filter_asian:
             st.info("🚫 Session Asiatique filtrée.")
+        
+        st.info("🚀 V6.3: Lazy Loading & Anti-Repaint actifs.")
 
-    if st.button("🔍 SCANNER V6.2"):
+    if st.button("🔍 SCANNER V6.3"):
         with st.spinner("Analyse Top-Down en cours..."):
             api = OandaClient()
-            results, logs = run_scan_v620(api, min_prob/100, current_time_utc, strict_mode, filter_asian)
+            results, logs = run_scan_v630(api, min_prob/100, current_time_utc, strict_mode, filter_asian)
             
         if not results:
             st.warning("⚠️ Aucun signal validé.")
@@ -721,7 +736,7 @@ def main():
                 for log in logs[:50]: st.text(log)
         else:
             st.success(f"✅ {len(results)} Signal(s) Validé(s)")
-            for r in results: display_sig_v620(r)
+            for r in results: display_sig_v630(r)
             with st.expander("Logs de rejet"):
                 for log in logs[:50]: st.text(log)
 
