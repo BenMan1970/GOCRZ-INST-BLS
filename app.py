@@ -10,17 +10,22 @@ from datetime import datetime
 import pytz
 import warnings
 
+# --- CONFIGURATION ---
 warnings.simplefilter(action='ignore', category=FutureWarning)
 logging.getLogger().setLevel(logging.ERROR)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 st.set_page_config(page_title="Bluestar V6.6", layout="centered", page_icon="🛡️")
 
+# --- SESSION STATE ---
 if 'trade_logs' not in st.session_state:
     st.session_state.trade_logs = []
 if 'active_zones' not in st.session_state:
     st.session_state.active_zones = {}
+if 'cache' not in st.session_state: st.session_state.cache = {}
+if 'cs_data' not in st.session_state: st.session_state.cs_data = {'data': None, 'time': None}
 
+# --- STYLES ---
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700;900&display=swap');
@@ -50,9 +55,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-if 'cache' not in st.session_state: st.session_state.cache = {}
-if 'cs_data' not in st.session_state: st.session_state.cs_data = {'data': None, 'time': None}
-
+# --- CLASSES ---
 class OandaClient:
     def __init__(self):
         try:
@@ -323,7 +326,7 @@ class QuantEngine:
         return False, None
 
 def calculate_signal_v66(df_m5, df_m15, df_h1, df_d, df_w, symbol, direction, live_price, spread, cs_scores, min_adx, use_zones, strict_grade):
-    """Logique stricte selon le document"""
+    """Logique stricte selon le document + Matrix CS Update"""
     
     price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
     atr = QuantEngine.calculate_atr(df_m5)
@@ -402,21 +405,47 @@ def calculate_signal_v66(df_m5, df_m15, df_h1, df_d, df_w, symbol, direction, li
     if not structure_ok:
         return 0, {}, 0, "Structure M15 faible", {}
     
-    # 7. Matrice des forces
+    # 7. Matrice des forces (Mise à jour V7)
     cs_aligned = False
+    cs_reason = ""
+    
     if "_" in symbol and cs_scores:
         base, quote = symbol.split('_')
-        gap = cs_scores.get(base, 0) - cs_scores.get(quote, 0)
-        if direction == "BUY" and gap > 0:
-            cs_aligned = True
-        elif direction == "SELL" and gap < 0:
-            cs_aligned = True
+        
+        # On récupère les dicts complets
+        base_data = cs_scores.get(base, {'force': 5.0, 'coherence': 0.0})
+        quote_data = cs_scores.get(quote, {'force': 5.0, 'coherence': 0.0})
+        
+        # Filtre de cohérence (NOUVEAU)
+        min_coherence = 0.25 
+        if base_data['coherence'] < min_coherence or quote_data['coherence'] < min_coherence:
+             return 0, {}, 0, f"CS Incohérent ({base}:{base_data['coherence']:.2f}, {quote}:{quote_data['coherence']:.2f})", {}
+
+        gap = base_data['force'] - quote_data['force']
+
+        if direction == "BUY":
+            if gap > 1.5:
+                cs_aligned = True
+            else:
+                cs_reason = f"CS Gap faible (+{gap:.1f})"
+        elif direction == "SELL":
+            if gap < -1.5:
+                cs_aligned = True
+            else:
+                cs_reason = f"CS Gap faible ({gap:.1f})"
+    else:
+        cs_aligned = True # Pour or, indices etc.
     
     if not cs_aligned:
-        return 0, {}, 0, "CS Non Aligné", {}
+        return 0, {}, 0, f"CS Non Aligné: {cs_reason}", {}
     
     score += 15
-    reasons.append("✅ M15 Aligné + CS OK")
+    # Affichage adapté pour le string reason
+    cs_display = ""
+    if "_" in symbol:
+        gap_val = cs_scores[symbol.split('_')[0]]['force'] - cs_scores[symbol.split('_')[1]]['force']
+        cs_display = f"Gap {abs(gap_val):.1f}"
+    reasons.append(f"✅ M15 Aligné + CS OK ({cs_display})")
     
     # ========== ZONE D'INTÉRÊT (INDISPENSABLE) ==========
     zone_text = "NO_ZONE"
@@ -682,25 +711,26 @@ def run_scan_v66(api, min_score, current_time_utc, filter_asian, min_adx, use_zo
 
 
 def get_currency_strength_rsi(api):
+    """Nouvelle matrice : Force + Impulsion + Cohérence"""
     now = datetime.now()
     if st.session_state.cs_data.get('time') and (now - st.session_state.cs_data['time']).total_seconds() < 900:
         return st.session_state.cs_data['data']
     
     forex_pairs = [p for p in ASSETS if "_" in p and "XAU" not in p and "US30" not in p and "DE30" not in p]
     prices = {}
-    for pair in forex_pairs[:20]:
+    
+    # 1. Fetching data (léger élargissement du scope pour précision)
+    for pair in forex_pairs[:25]:
         try:
             df = api.get_candles(pair, "H1", 50)
             if df is not None and not df.empty: prices[pair] = df['close']
         except: continue
     
     if not prices: return None
-    
     df_prices = pd.DataFrame(prices).ffill().bfill()
     
-    def normalize_score(rsi_value): return ((rsi_value - 50) / 50 + 1) * 5
-    
-    def calculate_rsi_series(series, period=14):
+    # Fonction locale RSI optimisée
+    def calculate_rsi_matrix(series, period=14):
         delta = series.diff()
         gain = (delta.where(delta > 0, 0)).fillna(0)
         loss = (-delta.where(delta < 0, 0)).fillna(0)
@@ -708,39 +738,53 @@ def get_currency_strength_rsi(api):
         avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
         rs = avg_gain / avg_loss.replace(0, 0.0001)
         return 100 - (100 / (1 + rs))
-    
+
+    # 2. Logique Matrix
     currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
-    final_scores = {}
+    results = {}
     
     for curr in currencies:
-        total_score = 0.0
-        count = 0
-        opponents = [c for c in currencies if c != curr]
-        
-        for opp in opponents:
-            pair_direct = f"{curr}_{opp}"
-            pair_inverse = f"{opp}_{curr}"
-            rsi_val = None
+        rsi_values_now = []
+        rsi_values_prev = []
+
+        for col in df_prices.columns:
+            base, quote = col.split('_')
+            series = None
             
-            if pair_direct in df_prices.columns:
-                rsi_series = calculate_rsi_series(df_prices[pair_direct])
-                if not rsi_series.empty: rsi_val = rsi_series.iloc[-1]
-            elif pair_inverse in df_prices.columns:
-                inverted_price = 1 / df_prices[pair_inverse]
-                rsi_series = calculate_rsi_series(inverted_price)
-                if not rsi_series.empty: rsi_val = rsi_series.iloc[-1]
+            if curr == base: series = df_prices[col]
+            elif curr == quote: series = 1 / df_prices[col]
             
-            if rsi_val is not None:
-                total_score += normalize_score(rsi_val)
-                count += 1
+            if series is not None:
+                rsi = calculate_rsi_matrix(series)
+                if len(rsi) > 2:
+                    rsi_values_now.append(rsi.iloc[-1])
+                    rsi_values_prev.append(rsi.iloc[-2])
+
+        if not rsi_values_now:
+            results[curr] = {'force': 5.0, 'coherence': 0.0, 'impulsion': 0.0}
+            continue
+
+        rsi_now = np.mean(rsi_values_now)
+        rsi_prev = np.mean(rsi_values_prev)
         
-        if count > 0:
-            final_scores[curr] = total_score / count
-        else:
-            final_scores[curr] = 5.0
+        direction = (rsi_now - 50) / 50
+        impulsion = (rsi_now - rsi_prev) / 10
+        
+        above = sum(1 for r in rsi_values_now if r > 50)
+        below = sum(1 for r in rsi_values_now if r < 50)
+        coherence = (above - below) / len(rsi_values_now)
+        
+        force_raw = direction * 0.5 + impulsion * 0.3 + coherence * 0.2
+        force_score = (force_raw + 1) * 5
+
+        results[curr] = {
+            "force": round(force_score, 2),
+            "coherence": round(abs(coherence), 2),
+            "impulsion": round(impulsion, 2)
+        }
     
-    st.session_state.cs_data = {'data': final_scores, 'time': now}
-    return final_scores
+    st.session_state.cs_data = {'data': results, 'time': now}
+    return results
 
 
 def display_sig_v66(s):
@@ -861,3 +905,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+   
