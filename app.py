@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 from scipy import stats 
 import pytz
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
 # CONFIGURATION & STYLE (THEME BLEU V5.3)
@@ -323,7 +322,7 @@ class QuantEngine:
         else: return -1
 
 # ==========================================
-# NOUVEAUX TWEAKS PRO (AJOUTÉS)
+# NOUVEAUX TWEAKS PRO
 # ==========================================
 
 def evaluate_spread_impact(spread_pips, tp_distance, symbol):
@@ -691,21 +690,7 @@ def calculate_signal_probability_v53(df_m5, df_h1, df_h4, df_d, df_w, symbol, di
     return min(score, 1.0), details, atr_pct, None, enhanced_metrics
 
 # ==========================================
-# FONCTION HELPER POUR ASYNC
-# ==========================================
-def fetch_asset_data(api, sym):
-    try:
-        df_d_raw = api.get_candles(sym, "D", 250)
-        df_h4 = api.get_candles(sym, "H4", 100)
-        df_h1 = api.get_candles(sym, "H1", 50)
-        df_m5 = api.get_candles(sym, "M5", 200)
-        live_price, spread_pips = api.get_realtime_price_and_spread(sym)
-        return sym, df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips
-    except Exception as e:
-        return sym, None, None, None, None, 0, 0
-
-# ==========================================
-# SCANNER V5.3 ENHANCED
+# SCANNER V5.3 ENHANCED (SÉQUENTIEL ROBUSTE)
 # ==========================================
 def run_scan_v53_blue(api, min_prob, adx_filter, mtf_filter, current_time_utc, force_open=False):
     cs_scores = get_currency_strength_rsi(api)
@@ -714,76 +699,81 @@ def run_scan_v53_blue(api, min_prob, adx_filter, mtf_filter, current_time_utc, f
     
     progress_bar = st.progress(0)
     status_text = st.empty()
-    status_text.markdown(f"⏳ **Initialisation du scan parallèle...**")
+    status_text.markdown(f"⏳ **Initialisation du scan (Mode Robuste)...**")
     
-    asset_data = {}
-    
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_asset_data, api, sym): sym for sym in ASSETS}
-        completed_count = 0
-        for future in as_completed(futures):
-            sym, df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips = future.result()
-            if df_m5 is not None and not df_m5.empty:
-                asset_data[sym] = (df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips)
-            completed_count += 1
-            progress_bar.progress(completed_count / len(ASSETS))
-            status_text.markdown(f"⏳ Données reçues: {sym} ({completed_count}/{len(ASSETS)})")
-
-    status_text.markdown("⏳ Analyse technique en cours...")
-    
-    for sym in asset_data:
-        df_d_raw, df_h4, df_h1, df_m5, live_price, spread_pips = asset_data[sym]
+    # BOUCLE SÉQUENTIELLE (RETOUR À LA MÉTHODE V5.0 QUI MARCHAIT)
+    for i, sym in enumerate(ASSETS):
+        progress_bar.progress((i+1)/len(ASSETS))
+        status_text.markdown(f"⏳ Analyse: **{sym}** ({i+1}/{len(ASSETS)})")
         
-        if df_m5.empty or df_h1.empty or df_h4.empty or df_d_raw.empty: 
-            continue
-        
-        df_d = df_d_raw.iloc[-100:].copy()
-        df_w = df_d_raw.set_index('time').resample('W-FRI').agg({
-            'open':'first', 'high':'max', 'low':'min', 'close':'last'
-        }).dropna().reset_index()
-        
-        for direction in ["BUY", "SELL"]:
-            prob, details, atr_pct, reject_reason, enhanced_metrics = calculate_signal_probability_v53(
-                df_m5, df_h1, df_h4, df_d, df_w, sym, direction, None, adx_filter, mtf_filter, live_price, spread_pips, current_time_utc, force_open
-            )
+        try:
+            # Récupération directe (plus de threads qui buggent)
+            df_d_raw = api.get_candles(sym, "D", 250)
+            time.sleep(0.02) # Petite pause pour laisser respirer l'API
+            df_h4 = api.get_candles(sym, "H4", 100)
+            time.sleep(0.02)
+            df_h1 = api.get_candles(sym, "H1", 50)
+            time.sleep(0.02)
+            df_m5 = api.get_candles(sym, "M5", 200)
             
-            if reject_reason: 
-                rejected_log.append(f"{sym} {direction}: {reject_reason}")
+            live_price, spread_pips = api.get_realtime_price_and_spread(sym)
+            
+            if df_m5.empty or df_h1.empty or df_h4.empty or df_d_raw.empty: 
+                rejected_log.append(f"⚠️ {sym}: Données incomplètes")
                 continue
+            
+            df_d = df_d_raw.iloc[-100:].copy()
+            df_w = df_d_raw.set_index('time').resample('W-FRI').agg({
+                'open':'first', 'high':'max', 'low':'min', 'close':'last'
+            }).dropna().reset_index()
+            
+            for direction in ["BUY", "SELL"]:
+                prob, details, atr_pct, reject_reason, enhanced_metrics = calculate_signal_probability_v53(
+                    df_m5, df_h1, df_h4, df_d, df_w, sym, direction, None, adx_filter, mtf_filter, live_price, spread_pips, current_time_utc, force_open
+                )
                 
-            if prob < min_prob: 
-                rejected_log.append(f"{sym} {direction}: Score {prob:.2f}")
-                continue
-            
-            temp_signal = {'symbol': sym, 'type': direction}
-            if check_dynamic_correlation_conflict(temp_signal, signals, cs_scores):
-                rejected_log.append(f"{sym} {direction}: Corrélation")
-                continue
-            
-            cs_aligned = False
-            if "_" in sym:
-                base, quote = sym.split('_')
-                if cs_scores and base in cs_scores and quote in cs_scores:
-                    gap = cs_scores.get(base, 0) - cs_scores.get(quote, 0)
-                    if direction == "BUY" and gap > 0: cs_aligned = True
-                    elif direction == "SELL" and gap < 0: cs_aligned = True
-            
-            price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
-            atr = QuantEngine.calculate_atr(df_m5)
-            params = get_asset_params(sym)
-            
-            sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
-            tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
-            
-            signals.append({
-                'symbol': sym, 'type': direction, 'price': price,
-                'prob': prob, 'score_display': prob * 10,
-                'details': details, 'atr_pct': atr_pct,
-                'sl': sl, 'tp': tp, 'rr': params['tp_rr'],
-                'cs_aligned': cs_aligned, 'spread': spread_pips,
-                'enhanced_metrics': enhanced_metrics
-            })
-            
+                if reject_reason: 
+                    rejected_log.append(f"{sym} {direction}: {reject_reason}")
+                    continue
+                    
+                if prob < min_prob: 
+                    rejected_log.append(f"{sym} {direction}: Score {prob:.2f}")
+                    continue
+                
+                temp_signal = {'symbol': sym, 'type': direction}
+                if check_dynamic_correlation_conflict(temp_signal, signals, cs_scores):
+                    rejected_log.append(f"{sym} {direction}: Corrélation")
+                    continue
+                
+                cs_aligned = False
+                if "_" in sym:
+                    base, quote = sym.split('_')
+                    if cs_scores and base in cs_scores and quote in cs_scores:
+                        gap = cs_scores.get(base, 0) - cs_scores.get(quote, 0)
+                        if direction == "BUY" and gap > 0: cs_aligned = True
+                        elif direction == "SELL" and gap < 0: cs_aligned = True
+                
+                price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
+                atr = QuantEngine.calculate_atr(df_m5)
+                params = get_asset_params(sym)
+                
+                sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
+                tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
+                
+                signals.append({
+                    'symbol': sym, 'type': direction, 'price': price,
+                    'prob': prob, 'score_display': prob * 10,
+                    'details': details, 'atr_pct': atr_pct,
+                    'sl': sl, 'tp': tp, 'rr': params['tp_rr'],
+                    'cs_aligned': cs_aligned, 'spread': spread_pips,
+                    'enhanced_metrics': enhanced_metrics
+                })
+        
+        except Exception as e:
+            # Ici on verra la vraie erreur si ça plante
+            rejected_log.append(f"❌ {sym} Erreur: {str(e)}")
+            continue
+
     progress_bar.empty()
     status_text.empty()
     return sorted(signals, key=lambda x: x['prob'], reverse=True), rejected_log
@@ -917,7 +907,7 @@ def main():
         )
         
         adx_filter = st.checkbox(
-            "🔥 Filtre ADX H1", 
+            "🔥 Filtre ADX", 
             value=True,
             help="Exige ADX supérieur à 20 sur H1 pour confirmer la tendance de fond"
         )
@@ -925,7 +915,7 @@ def main():
         min_prob = st.slider("Score Minimum", 60, 95, 75, 5)
         
     if st.button("🔍 LANCER LE SCAN V5.3 ENHANCED"):
-        with st.spinner("🔄 Scan en cours..."):
+        with st.spinner("🔄 Scan en cours (Mode Robuste)..."):
             api = OandaClient()
             results, logs = run_scan_v53_blue(api, min_prob/100, adx_filter, mtf_filter, current_time_utc)
         
