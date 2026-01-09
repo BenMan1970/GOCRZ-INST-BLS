@@ -318,13 +318,19 @@ def calculate_signal_probability_v640(
         # Assemblage détails
         all_reasons = tier1_reasons + tier2_reasons + tier3_reasons
         
+        # Session calculée de manière sûre
+        try:
+            current_session = QuantEngine.get_trading_session(datetime.now(pytz.utc))
+        except:
+            current_session = "N/A"
+        
         details = {
             "quality": quality,
             "score_breakdown": f"Core:{tier1_score} + Premium:{tier2_score} + Elite:{tier3_score} = {total_score}/100",
             "reasons": all_reasons,
             "midnight": f"{midnight_open:.5f}" if midnight_open else "N/A",
             "pdh_pdl": f"{pdh:.5f} / {pdl:.5f}" if pdh and pdl else "N/A",
-            "session": QuantEngine.get_trading_session(datetime.now(pytz.utc)),
+            "session": current_session,
         }
         
         # Probabilité normalisée (0-1)
@@ -409,11 +415,14 @@ def run_scan_v640(api, min_score, current_time_utc, filter_asian):
         try:
             # Filtrage session Asiatique
             if filter_asian:
-                session = QuantEngine.get_trading_session(current_time_utc)
-                if session == "ASIAN":
-                    if "XAU" not in sym and "US30" not in sym:
-                        rejected_log.append(f"{sym}: Session Asiatique")
-                        continue
+                try:
+                    session = QuantEngine.get_trading_session(current_time_utc)
+                    if session == "ASIAN":
+                        if "XAU" not in sym and "US30" not in sym:
+                            rejected_log.append(f"{sym}: Session Asiatique")
+                            continue
+                except:
+                    pass  # Continue si erreur de session
             
             # Lazy loading H1 d'abord
             df_h1 = api.get_candles(sym, "H1", 50)
@@ -501,7 +510,13 @@ def main():
     st.markdown("<p style='text-align:center;color:#94a3b8;'>Core Criteria (70%) + Premium Zones (20%) + Elite Confluences (10%)</p>", unsafe_allow_html=True)
     
     current_time_utc = datetime.now(pytz.utc)
-    session = QuantEngine.get_trading_session(current_time_utc)
+    
+    # Calcul de session de manière sûre
+    try:
+        session = QuantEngine.get_trading_session(current_time_utc)
+    except Exception as e:
+        session = "N/A"
+        st.warning(f"⚠️ Impossible de déterminer la session: {str(e)}")
     
     with st.sidebar:
         st.header("⚙️ Paramètres V6.4")
@@ -525,8 +540,12 @@ def main():
     
     if st.button("🔍 SCANNER V6.4", type="primary"):
         with st.spinner("Analyse Pyramide en cours..."):
-            api = OandaClient()
-            results, logs = run_scan_v640(api, min_score, current_time_utc, filter_asian)
+            try:
+                api = OandaClient()
+                results, logs = run_scan_v640(api, min_score, current_time_utc, filter_asian)
+            except Exception as e:
+                st.error(f"❌ Erreur lors de l'initialisation: {str(e)}")
+                return
         
         if not results:
             st.warning("⚠️ Aucun signal validé.")
