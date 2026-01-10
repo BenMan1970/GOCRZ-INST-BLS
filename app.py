@@ -1,3 +1,4 @@
+# appVersion BlueStar_Sniper_Pro_V7.0-FINAL.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -576,12 +577,12 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         if not touched_hma:
             return 0, {}, 0, "Pas de Pullback HMA", {}
         
-        # RSI: Zone reload 45-50, puis break 50
-        rsi_reload = ((rsi_m5_prev >= 45) & (rsi_m5_prev <= 50)).any()
-        rsi_above_40 = (rsi_m5_prev >= 40).all()  # Ne doit PAS passer sous 40
+        # RSI: Zone reload 40-55 (Élargi pour plus de signaux)
+        rsi_reload = ((rsi_m5_prev >= 40) & (rsi_m5_prev <= 55)).any()
+        rsi_above_35 = (rsi_m5_prev >= 35).all()  # Ne doit PAS passer sous 35
         
-        if not rsi_above_40:
-            return 0, {}, 0, f"RSI cassé 40 ({rsi_m5_prev.min():.1f})", {}
+        if not rsi_above_35:
+            return 0, {}, 0, f"RSI cassé 35 ({rsi_m5_prev.min():.1f})", {}
         
         if rsi_reload and rsi_m5_current > 50:
             # Heiken Ashi vert
@@ -601,12 +602,12 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         if not touched_hma:
             return 0, {}, 0, "Pas de Pullback HMA", {}
         
-        # RSI: Zone reload 50-55, puis break 50
-        rsi_reload = ((rsi_m5_prev >= 50) & (rsi_m5_prev <= 55)).any()
-        rsi_below_60 = (rsi_m5_prev <= 60).all()  # Ne doit PAS dépasser 60
+        # RSI: Zone reload 45-60 (Élargi pour plus de signaux)
+        rsi_reload = ((rsi_m5_prev >= 45) & (rsi_m5_prev <= 60)).any()
+        rsi_below_65 = (rsi_m5_prev <= 65).all()  # Ne doit PAS dépasser 65
         
-        if not rsi_below_60:
-            return 0, {}, 0, f"RSI cassé 60 ({rsi_m5_prev.max():.1f})", {}
+        if not rsi_below_65:
+            return 0, {}, 0, f"RSI cassé 65 ({rsi_m5_prev.max():.1f})", {}
         
         if rsi_reload and rsi_m5_current < 50:
             # Heiken Ashi rouge
@@ -927,7 +928,7 @@ def main():
         
         **Phase 3 - PIRM Trigger M5:**
         - Pullback HMA 20
-        - RSI 10 OHLC4 Reload
+        - RSI 10 OHLC4 Reload (40-55 / 45-60)
         - Break niveau 50
         - ADX M5 > 18
         
