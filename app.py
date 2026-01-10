@@ -9,13 +9,12 @@ from datetime import datetime, timedelta
 import pytz
 from concurrent.futures import ThreadPoolExecutor
 
-# Configuration de base
+# --- CONFIGURATION ---
 warnings.simplefilter(action='ignore', category=FutureWarning)
 logging.getLogger().setLevel(logging.ERROR)
-
 st.set_page_config(page_title="GOCRZ-Sniper PRO | PIRM-5M", layout="centered", page_icon="🎯")
 
-# --- CSS & VISUEL (Intouché) ---
+# --- CSS (INTOUCHÉ) ---
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700;900&display=swap');
 * { font-family: 'Roboto', sans-serif; }
@@ -26,15 +25,15 @@ h1 { background: linear-gradient(90deg, #00d2ff 0%, #3a7bd5 100%); -webkit-backg
 .badge-premium { background: linear-gradient(135deg, #C0C0C0 0%, #808080 100%); color: black; padding: 6px 12px; border-radius: 6px; font-weight: 700; }
 </style>""", unsafe_allow_html=True)
 
-# --- SYSTÈME DE CACHE (Optimisé pour la vitesse) ---
+# --- CACHE ---
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_candles_cached(instrument, granularity, count):
-    """Récupère les bougies avec mise en cache native Streamlit"""
     try:
         token = st.secrets["OANDA_ACCESS_TOKEN"]
         env = st.secrets.get("OANDA_ENVIRONMENT", "practice")
         client = oandapyV20.API(access_token=token, environment=env)
         
+        # Astuce Oanda: On demande "M" (Midpoint) pour avoir OHLC
         params = {"count": count, "granularity": granularity, "price": "M"}
         r = instruments.InstrumentsCandles(instrument=instrument, params=params)
         client.request(r)
@@ -54,7 +53,7 @@ def fetch_candles_cached(instrument, granularity, count):
     except:
         return pd.DataFrame()
 
-# --- CLIENT OANDA ---
+# --- API CLIENT ---
 class OandaClient:
     def __init__(self):
         try:
@@ -67,7 +66,6 @@ class OandaClient:
             st.stop()
 
     def get_candles(self, instrument, granularity, count):
-        # Appel à la fonction mise en cache
         return fetch_candles_cached(instrument, granularity, count)
 
     def get_realtime_price_and_spread(self, instrument):
@@ -90,36 +88,41 @@ def get_asset_params(symbol):
     if any(x in symbol for x in ["XAU", "XAG"]): return {'sl_base': 1.8, 'tp_rr': 2.5}
     return {'sl_base': 1.5, 'tp_rr': 2.0}
 
-# --- QUANT ENGINE (MOTEUR MATHÉMATIQUE OPTIMISÉ) ---
+# --- QUANT ENGINE (CORRIGÉ & CALIBRÉ TV) ---
 class QuantEngine:
     @staticmethod
     def calculate_atr_wilder(df, period=14):
-        # Vrai ATR de Wilder (RMA)
+        # ATR Wilder (RMA)
         high, low, close = df['high'], df['low'], df['close']
         tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        # alpha=1/period correspond exactement au lissage RMA de TradingView
         return tr.ewm(alpha=1/period, adjust=False).mean().iloc[-1]
 
     @staticmethod
     def calculate_adx_wilder(df, period=14):
-        # ADX Wilder Authentique
+        # ADX Wilder (Exactitude TradingView)
         high, low, close = df['high'], df['low'], df['close']
+        
         up = high.diff()
         down = -low.diff()
         
-        # Directional Movement (Seul le mouvement dominant compte)
+        # 1. Directional Movement (DM)
         plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
         minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
         
+        # 2. True Range
         tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
         
-        # Lissage Wilder (RMA)
+        # 3. Smoothing (RMA) - C'est ici que l'historique compte !
         atr = tr.ewm(alpha=1/period, adjust=False).mean()
         smoothed_plus = plus_dm.ewm(alpha=1/period, adjust=False).mean()
         smoothed_minus = minus_dm.ewm(alpha=1/period, adjust=False).mean()
         
+        # 4. DI
         plus_di = 100 * (smoothed_plus / atr)
         minus_di = 100 * (smoothed_minus / atr)
         
+        # 5. DX & ADX
         dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
         adx = dx.ewm(alpha=1/period, adjust=False).mean()
         
@@ -127,7 +130,7 @@ class QuantEngine:
 
     @staticmethod
     def calculate_hma(series, period=20):
-        # Ta HMA 20 intouchée
+        # HMA Standard
         half, sqrt = int(period / 2), int(np.sqrt(period))
         wma_half = series.rolling(half).apply(lambda x: np.dot(x, np.arange(1, half+1)) / np.arange(1, half+1).sum(), raw=True)
         wma_full = series.rolling(period).apply(lambda x: np.dot(x, np.arange(1, period+1)) / np.arange(1, period+1).sum(), raw=True)
@@ -136,73 +139,85 @@ class QuantEngine:
 
     @staticmethod
     def calculate_rsi_ohlc4(df, period=10):
-        # RSI 10 sur OHLC4 (Ton choix pour le M5)
+        # RSI 10 sur OHLC4
         ohlc4 = (df['open'] + df['high'] + df['low'] + df['close']) / 4
         delta = ohlc4.diff()
-        gain, loss = (delta.where(delta > 0, 0)).fillna(0), (-delta.where(delta < 0, 0)).fillna(0)
+        
+        gain = (delta.where(delta > 0, 0)).fillna(0)
+        loss = (-delta.where(delta < 0, 0)).fillna(0)
+        
+        # Lissage RMA pour le RSI (Standard)
         avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
         avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+        
         rs = avg_gain / avg_loss.replace(0, 0.0001)
         return 100 - (100 / (1 + rs))
 
     @staticmethod
     def detect_swing_structure(df, direction, lookback=30):
-        # Structure H1 : On ne trade pas contre le dernier extrême
         if len(df) < lookback: return False
         highs, lows = df['high'].iloc[-lookback:], df['low'].iloc[-lookback:]
         
         if direction == "BUY":
-            # Pour acheter, le prix ne doit pas être en train de casser les derniers bas
+            # Pas de lower low récent
             return lows.iloc[-1] >= lows.iloc[-lookback:].min()
         else:
-            # Pour vendre, le prix ne doit pas être en train de casser les derniers hauts
+            # Pas de higher high récent
             return highs.iloc[-1] <= highs.iloc[-lookback:].max()
 
     @staticmethod
     def get_midnight_open_ny(df):
         try:
             ny_tz = pytz.timezone('America/New_York')
+            # Conversion de la dernière bougie pour avoir la date courante à NY
             last_dt = pd.to_datetime(df['time'].iloc[-1], utc=True).astimezone(ny_tz)
+            
+            # On définit le Minuit qu'on cherche
             midnight_time = last_dt.replace(hour=0, minute=0, second=0, microsecond=0)
             
             df_ny = df.copy()
             df_ny['dt_ny'] = pd.to_datetime(df_ny['time'], utc=True).dt.tz_convert(ny_tz)
-            midnight_candle = df_ny.loc[df_ny['dt_ny'] <= midnight_time]
             
-            return midnight_candle.iloc[-1]['open'] if not midnight_candle.empty else None
+            # On cherche les bougies AVANT ou ÉGALE à minuit
+            candidates = df_ny.loc[df_ny['dt_ny'] <= midnight_time]
+            
+            if not candidates.empty:
+                # La dernière candidate est celle de minuit (ou 23h55 la veille si gap)
+                return candidates.iloc[-1]['open']
+            return None
         except: return None
 
     @staticmethod
     def get_pdh_pdl(df_d):
         return (df_d['high'].iloc[-2], df_d['low'].iloc[-2]) if len(df_d) >= 2 else (None, None)
 
-
-# --- LOGIQUE DE TRADING PIRM (OPTIMISÉE) ---
+# --- CALCUL DU SIGNAL ---
 def calculate_signal_pirm(df_m5, df_h1, df_d, symbol, direction, live_price, cs_scores, min_adx, use_zones):
     price = live_price
-    atr = QuantEngine.calculate_atr_wilder(df_m5) # ATR Wilder
+    atr = QuantEngine.calculate_atr_wilder(df_m5)
     midnight = QuantEngine.get_midnight_open_ny(df_m5)
     
-    # Indicateurs
-    adx_h1 = QuantEngine.calculate_adx_wilder(df_h1, 14) # ADX Wilder
-    rsi_m5 = QuantEngine.calculate_rsi_ohlc4(df_m5, 10)  # RSI 10 OHLC4
+    adx_h1 = QuantEngine.calculate_adx_wilder(df_h1, 14)
+    rsi_m5 = QuantEngine.calculate_rsi_ohlc4(df_m5, 10)
     hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
     
     reasons = []
     
-    # 1. Filtre H1 (Régime & Structure)
+    # 1. H1 CHECK
     if adx_h1 < min_adx: return 0, {}, 0, f"ADX H1 {adx_h1:.1f} < {min_adx}", {}
     
     if not QuantEngine.detect_swing_structure(df_h1, direction):
         return 0, {}, 0, "Contre Structure H1", {}
     reasons.append(f"✅ H1 Validé (ADX {adx_h1:.1f})")
     
-    # 2. Biais Discount/Premium (Midnight / PDH / PDL)
+    # 2. ZONES (Midnight & PDH/PDL)
     if midnight:
         if direction == "BUY":
-            # On évite d'acheter si on est TROP haut par rapport à minuit (Premium), sauf si RSI a de la place
+            # Achat : Attention si Prix >> Midnight (Premium)
+            # Tolérance : Si RSI est fort (>65), on accepte d'acheter cher
             if price > midnight and rsi_m5 > 65: return 0, {}, 0, "Prix Premium (Trop haut)", {}
         else:
+            # Vente : Attention si Prix << Midnight (Discount)
             if price < midnight and rsi_m5 < 35: return 0, {}, 0, "Prix Discount (Trop bas)", {}
     
     pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
@@ -212,45 +227,41 @@ def calculate_signal_pirm(df_m5, df_h1, df_d, symbol, direction, live_price, cs_
     
     reasons.append("✅ Zones Discount/Premium OK")
     
-    # 3. Currency Strength
+    # 3. CURRENCY STRENGTH
     if "_" in symbol and cs_scores:
         base, quote = symbol.split('_')
         b = cs_scores.get(base, {'force': 5.0, 'coherence': 0.0})
         q = cs_scores.get(quote, {'force': 5.0, 'coherence': 0.0})
         gap = b['force'] - q['force']
         
-        # Validation du gap
         if direction == "BUY" and gap < 0.5: return 0, {}, 0, f"CS Faible ({gap:.1f})", {}
         if direction == "SELL" and gap > -0.5: return 0, {}, 0, f"CS Faible ({gap:.1f})", {}
         reasons.append(f"✅ CS Gap: {gap:.1f}")
 
     # 4. TRIGGER PIRM-5M
-    if len(hma_m5) < 3: return 0, {}, 0, "Données insuffisantes", {}
+    if len(hma_m5) < 3: return 0, {}, 0, "Données insuf.", {}
     hma_val = hma_m5.iloc[-2]
     rsi_val = rsi_m5.iloc[-2]
     
     trigger_valid = False
     dist_hma = (price - hma_val) / hma_val if direction == "BUY" else (hma_val - price) / hma_val
     
-    # Logique Matricielle Stricte
     if direction == "BUY":
-        # RSI 10 entre 40 et 60 pour le départ du mouvement
+        # RSI sain pour un achat & Prix proche HMA
         if 40 <= rsi_val <= 65:
-            # Prix doit être proche de la HMA (pas de FOMO)
-            if dist_hma > -0.001 and dist_hma < 0.0025: 
-                trigger_valid = True
-    else: # SELL
+            if -0.001 < dist_hma < 0.0025: trigger_valid = True
+    else:
+        # RSI sain pour une vente & Prix proche HMA
         if 35 <= rsi_val <= 60:
-            if dist_hma > -0.001 and dist_hma < 0.0025:
-                trigger_valid = True
-                
+            if -0.001 < dist_hma < 0.0025: trigger_valid = True
+            
     if not trigger_valid: return 0, {}, 0, f"Trigger Invalide (RSI {rsi_val:.1f})", {}
     
     reasons.append(f"🔥 PIRM-5M: RSI {rsi_val:.1f} | Dist.HMA {dist_hma*100:.3f}%")
     
-    # Scoring
+    # SCORING
     score = 80
-    if abs(dist_hma) < 0.001: score += 10 # Sniper entry (très proche HMA)
+    if abs(dist_hma) < 0.001: score += 10
     if adx_h1 > 30: score += 5
     
     quality = "ELITE 🏆" if score >= 85 else "PREMIUM ⭐"
@@ -269,20 +280,18 @@ def calculate_signal_pirm(df_m5, df_h1, df_d, symbol, direction, live_price, cs_
     
     return 1.0, info, atr / price * 100, None, {'sl': sl, 'tp': tp}
 
-# --- CURRENCY STRENGTH (Cache 1 heure) ---
+# --- CURRENCY STRENGTH ---
 @st.cache_data(ttl=3600)
 def get_currency_strength_rsi_cached():
-    """Calcul CS optimisé et mis en cache"""
     try:
-        # On utilise une instance temporaire pour le cache global
         token = st.secrets["OANDA_ACCESS_TOKEN"]
         client = oandapyV20.API(access_token=token, environment=st.secrets.get("OANDA_ENVIRONMENT", "practice"))
         
         pairs = [p for p in ASSETS if "_" in p and "XAU" not in p and "US30" not in p]
         prices = {}
+        # On ne charge que 100 bougies ici, suffisant pour un RSI H1
         for p in pairs[:15]:
-            # On fetch directement ici
-            params = {"count": 50, "granularity": "H1", "price": "M"}
+            params = {"count": 100, "granularity": "H1", "price": "M"}
             r = instruments.InstrumentsCandles(instrument=p, params=params)
             client.request(r)
             close_prices = [float(c['mid']['c']) for c in r.response['candles'] if c['complete']]
@@ -318,7 +327,7 @@ def get_currency_strength_rsi_cached():
         return results
     except: return None
 
-# --- SCANNER MULTITHREADÉ ---
+# --- SCANNER ---
 def run_scan_pirm(api, min_score, min_adx, use_zones):
     cs_scores = get_currency_strength_rsi_cached()
     signals, logs = [], []
@@ -326,14 +335,14 @@ def run_scan_pirm(api, min_score, min_adx, use_zones):
     
     def scan_asset(sym):
         try:
-            # Récupération rapide
-            df_m5 = api.get_candles(sym, "M5", 200)
-            df_h1 = api.get_candles(sym, "H1", 60)
+            # === MODIFICATION MAJEURE ===
+            # Augmentation drastique de l'historique pour précision ADX et Midnight
+            df_m5 = api.get_candles(sym, "M5", 500) # 500 bougies = ~41 heures -> Midnight garanti
+            df_h1 = api.get_candles(sym, "H1", 500) # 500 bougies = Stabilité ADX garantie
             df_d = api.get_candles(sym, "D", 5)
             
             if df_m5.empty or df_h1.empty: return None
             
-            # Prix Live (Last Close M5 suffisant pour scanner)
             live_price = df_m5['close'].iloc[-1]
             
             res_list = []
@@ -343,22 +352,17 @@ def run_scan_pirm(api, min_score, min_adx, use_zones):
                 )
                 
                 if not reject and info['score'] >= min_score:
-                    # On récupère le vrai spread seulement si le signal est bon (économie API)
                     _, spread = api.get_realtime_price_and_spread(sym)
                     res_list.append({
                         'symbol': sym, 'type': direction, 'price': live_price, 'score': info['score'],
                         'details': info, 'sl': extras['sl'], 'tp': extras['tp'], 'spread': spread
                     })
-                elif reject:
-                    # logs.append(f"{sym} {direction}: {reject}") # Décommenter pour debug
-                    pass
             return res_list
         except Exception as e:
             return f"Err {sym}: {str(e)[:20]}"
 
-    status.info("🚀 Scan PIRM Multithreadé en cours...")
+    status.info("🚀 Scan PIRM en cours (Haute Précision)...")
     
-    # Exécution parallèle
     with ThreadPoolExecutor(max_workers=8) as executor:
         results_future = list(executor.map(scan_asset, ASSETS))
 
@@ -371,7 +375,7 @@ def run_scan_pirm(api, min_score, min_adx, use_zones):
     status.empty()
     return sorted(signals, key=lambda x: x['score'], reverse=True), logs
 
-# --- AFFICHAGE (IDENTIQUE) ---
+# --- AFFICHAGE ---
 def display_signal(s):
     col_type = "#10b981" if s['type'] == "BUY" else "#ef4444"
     bg = "linear-gradient(90deg, #064e3b 0%, #065f46 100%)" if s['type'] == "BUY" else "linear-gradient(90deg, #7f1d1d 0%, #991b1b 100%)"
