@@ -14,7 +14,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 logging.getLogger().setLevel(logging.ERROR)
 st.set_page_config(page_title="GOCRZ-Sniper PRO | PIRM-5M", layout="centered", page_icon="🎯")
 
-# --- CSS (INTOUCHÉ) ---
+# --- CSS ---
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700;900&display=swap');
 * { font-family: 'Roboto', sans-serif; }
@@ -91,14 +91,12 @@ def get_asset_params(symbol):
 class QuantEngine:
     @staticmethod
     def calculate_atr_wilder(df, period=14):
-        # ATR Wilder (RMA) pour être cohérent avec l'ADX
         high, low, close = df['high'], df['low'], df['close']
         tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
         return tr.ewm(alpha=1/period, adjust=False).mean().iloc[-1]
 
     @staticmethod
     def calculate_adx_wilder(df, period=14):
-        # ADX Wilder (Exactitude TradingView)
         high, low, close = df['high'], df['low'], df['close']
         up = high.diff()
         down = -low.diff()
@@ -121,7 +119,6 @@ class QuantEngine:
 
     @staticmethod
     def calculate_hma(series, period=20):
-        # HMA Standard
         half, sqrt = int(period / 2), int(np.sqrt(period))
         wma_half = series.rolling(half).apply(lambda x: np.dot(x, np.arange(1, half+1)) / np.arange(1, half+1).sum(), raw=True)
         wma_full = series.rolling(period).apply(lambda x: np.dot(x, np.arange(1, period+1)) / np.arange(1, period+1).sum(), raw=True)
@@ -130,7 +127,6 @@ class QuantEngine:
 
     @staticmethod
     def calculate_rsi_ohlc4(df, period=10):
-        # RSI 10 sur OHLC4
         ohlc4 = (df['open'] + df['high'] + df['low'] + df['close']) / 4
         delta = ohlc4.diff()
         gain = (delta.where(delta > 0, 0)).fillna(0)
@@ -149,7 +145,6 @@ class QuantEngine:
         else:
             return highs.iloc[-1] <= highs.iloc[-lookback:].max()
 
-    # --- RESTAURATION DE LA LOGIQUE ORIGINALE EXACTE ---
     @staticmethod
     def get_midnight_open_ny(df):
         try:
@@ -164,15 +159,23 @@ class QuantEngine:
     def get_pdh_pdl(df_d):
         return (df_d['high'].iloc[-2], df_d['low'].iloc[-2]) if len(df_d) >= 2 else (None, None)
 
-# --- CALCUL DU SIGNAL ---
+# --- CALCUL DU SIGNAL (CORRIGÉ) ---
 def calculate_signal_pirm(df_m5, df_h1, df_d, symbol, direction, live_price, cs_scores, min_adx, use_zones):
     price = live_price
     atr = QuantEngine.calculate_atr_wilder(df_m5)
     midnight = QuantEngine.get_midnight_open_ny(df_m5)
     
     adx_h1 = QuantEngine.calculate_adx_wilder(df_h1, 14)
-    rsi_m5 = QuantEngine.calculate_rsi_ohlc4(df_m5, 10)
-    hma_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
+    
+    # On récupère les séries
+    rsi_m5_series = QuantEngine.calculate_rsi_ohlc4(df_m5, 10)
+    hma_m5_series = QuantEngine.calculate_hma(df_m5['close'], 20)
+    
+    # CORRECTION ICI: On définit les valeurs scalaires (un seul chiffre) pour les tests
+    if len(rsi_m5_series) < 2 or len(hma_m5_series) < 2: return 0, {}, 0, "Data insuf.", {}
+    
+    # On utilise la dernière valeur CLOTURÉE pour le filtrage zones (plus stable)
+    rsi_current = rsi_m5_series.iloc[-1] 
     
     reasons = []
     
@@ -186,9 +189,12 @@ def calculate_signal_pirm(df_m5, df_h1, df_d, symbol, direction, live_price, cs_
     # 2. ZONES (Midnight & PDH/PDL)
     if midnight:
         if direction == "BUY":
-            if price > midnight and rsi_m5 > 65: return 0, {}, 0, "Prix Premium (Trop haut)", {}
+            # On vérifie avec rsi_current (un chiffre) et non rsi_m5_series (une liste)
+            if price > midnight and rsi_current > 65: 
+                return 0, {}, 0, "Prix Premium (Trop haut)", {}
         else:
-            if price < midnight and rsi_m5 < 35: return 0, {}, 0, "Prix Discount (Trop bas)", {}
+            if price < midnight and rsi_current < 35: 
+                return 0, {}, 0, "Prix Discount (Trop bas)", {}
     
     pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
     if pdh and pdl:
@@ -209,9 +215,8 @@ def calculate_signal_pirm(df_m5, df_h1, df_d, symbol, direction, live_price, cs_
         reasons.append(f"✅ CS Gap: {gap:.1f}")
 
     # 4. TRIGGER PIRM-5M
-    if len(hma_m5) < 3: return 0, {}, 0, "Données insuf.", {}
-    hma_val = hma_m5.iloc[-2]
-    rsi_val = rsi_m5.iloc[-2]
+    hma_val = hma_m5_series.iloc[-2] # Bougie close
+    rsi_val = rsi_m5_series.iloc[-2] # Bougie close
     
     trigger_valid = False
     dist_hma = (price - hma_val) / hma_val if direction == "BUY" else (hma_val - price) / hma_val
@@ -302,7 +307,6 @@ def run_scan_pirm(api, min_score, min_adx, use_zones):
     
     def scan_asset(sym):
         try:
-            # On garde 500 ici car c'est nécessaire pour l'ADX Wilder et pour trouver minuit à coup sûr
             df_m5 = api.get_candles(sym, "M5", 500)
             df_h1 = api.get_candles(sym, "H1", 500)
             df_d = api.get_candles(sym, "D", 5)
@@ -325,7 +329,7 @@ def run_scan_pirm(api, min_score, min_adx, use_zones):
                     })
             return res_list
         except Exception as e:
-            return f"Err {sym}: {str(e)[:20]}"
+            return f"Err {sym}: {str(e)[:40]}"
 
     status.info("🚀 Scan PIRM en cours (Haute Précision)...")
     
@@ -403,4 +407,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
