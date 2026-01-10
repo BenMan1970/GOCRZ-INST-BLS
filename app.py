@@ -33,7 +33,6 @@ def fetch_candles_cached(instrument, granularity, count):
         env = st.secrets.get("OANDA_ENVIRONMENT", "practice")
         client = oandapyV20.API(access_token=token, environment=env)
         
-        # Astuce Oanda: On demande "M" (Midpoint) pour avoir OHLC
         params = {"count": count, "granularity": granularity, "price": "M"}
         r = instruments.InstrumentsCandles(instrument=instrument, params=params)
         client.request(r)
@@ -88,44 +87,36 @@ def get_asset_params(symbol):
     if any(x in symbol for x in ["XAU", "XAG"]): return {'sl_base': 1.8, 'tp_rr': 2.5}
     return {'sl_base': 1.5, 'tp_rr': 2.0}
 
-# --- QUANT ENGINE (CORRIGÉ & CALIBRÉ TV) ---
+# --- QUANT ENGINE ---
 class QuantEngine:
     @staticmethod
     def calculate_atr_wilder(df, period=14):
-        # ATR Wilder (RMA)
+        # ATR Wilder (RMA) pour être cohérent avec l'ADX
         high, low, close = df['high'], df['low'], df['close']
         tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-        # alpha=1/period correspond exactement au lissage RMA de TradingView
         return tr.ewm(alpha=1/period, adjust=False).mean().iloc[-1]
 
     @staticmethod
     def calculate_adx_wilder(df, period=14):
         # ADX Wilder (Exactitude TradingView)
         high, low, close = df['high'], df['low'], df['close']
-        
         up = high.diff()
         down = -low.diff()
         
-        # 1. Directional Movement (DM)
         plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
         minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
         
-        # 2. True Range
         tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
         
-        # 3. Smoothing (RMA) - C'est ici que l'historique compte !
         atr = tr.ewm(alpha=1/period, adjust=False).mean()
         smoothed_plus = plus_dm.ewm(alpha=1/period, adjust=False).mean()
         smoothed_minus = minus_dm.ewm(alpha=1/period, adjust=False).mean()
         
-        # 4. DI
         plus_di = 100 * (smoothed_plus / atr)
         minus_di = 100 * (smoothed_minus / atr)
         
-        # 5. DX & ADX
         dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
         adx = dx.ewm(alpha=1/period, adjust=False).mean()
-        
         return adx.iloc[-1]
 
     @staticmethod
@@ -142,14 +133,10 @@ class QuantEngine:
         # RSI 10 sur OHLC4
         ohlc4 = (df['open'] + df['high'] + df['low'] + df['close']) / 4
         delta = ohlc4.diff()
-        
         gain = (delta.where(delta > 0, 0)).fillna(0)
         loss = (-delta.where(delta < 0, 0)).fillna(0)
-        
-        # Lissage RMA pour le RSI (Standard)
         avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
         avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-        
         rs = avg_gain / avg_loss.replace(0, 0.0001)
         return 100 - (100 / (1 + rs))
 
@@ -157,34 +144,20 @@ class QuantEngine:
     def detect_swing_structure(df, direction, lookback=30):
         if len(df) < lookback: return False
         highs, lows = df['high'].iloc[-lookback:], df['low'].iloc[-lookback:]
-        
         if direction == "BUY":
-            # Pas de lower low récent
             return lows.iloc[-1] >= lows.iloc[-lookback:].min()
         else:
-            # Pas de higher high récent
             return highs.iloc[-1] <= highs.iloc[-lookback:].max()
 
+    # --- RESTAURATION DE LA LOGIQUE ORIGINALE EXACTE ---
     @staticmethod
     def get_midnight_open_ny(df):
         try:
             ny_tz = pytz.timezone('America/New_York')
-            # Conversion de la dernière bougie pour avoir la date courante à NY
-            last_dt = pd.to_datetime(df['time'].iloc[-1], utc=True).astimezone(ny_tz)
-            
-            # On définit le Minuit qu'on cherche
-            midnight_time = last_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-            
             df_ny = df.copy()
-            df_ny['dt_ny'] = pd.to_datetime(df_ny['time'], utc=True).dt.tz_convert(ny_tz)
-            
-            # On cherche les bougies AVANT ou ÉGALE à minuit
-            candidates = df_ny.loc[df_ny['dt_ny'] <= midnight_time]
-            
-            if not candidates.empty:
-                # La dernière candidate est celle de minuit (ou 23h55 la veille si gap)
-                return candidates.iloc[-1]['open']
-            return None
+            df_ny['time'] = pd.to_datetime(df_ny['time'], utc=True).dt.tz_convert(ny_tz)
+            midnight = df_ny[df_ny['time'].dt.hour == 0]
+            return midnight.iloc[-1]['open'] if not midnight.empty else None
         except: return None
 
     @staticmethod
@@ -213,11 +186,8 @@ def calculate_signal_pirm(df_m5, df_h1, df_d, symbol, direction, live_price, cs_
     # 2. ZONES (Midnight & PDH/PDL)
     if midnight:
         if direction == "BUY":
-            # Achat : Attention si Prix >> Midnight (Premium)
-            # Tolérance : Si RSI est fort (>65), on accepte d'acheter cher
             if price > midnight and rsi_m5 > 65: return 0, {}, 0, "Prix Premium (Trop haut)", {}
         else:
-            # Vente : Attention si Prix << Midnight (Discount)
             if price < midnight and rsi_m5 < 35: return 0, {}, 0, "Prix Discount (Trop bas)", {}
     
     pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
@@ -247,11 +217,9 @@ def calculate_signal_pirm(df_m5, df_h1, df_d, symbol, direction, live_price, cs_
     dist_hma = (price - hma_val) / hma_val if direction == "BUY" else (hma_val - price) / hma_val
     
     if direction == "BUY":
-        # RSI sain pour un achat & Prix proche HMA
         if 40 <= rsi_val <= 65:
             if -0.001 < dist_hma < 0.0025: trigger_valid = True
     else:
-        # RSI sain pour une vente & Prix proche HMA
         if 35 <= rsi_val <= 60:
             if -0.001 < dist_hma < 0.0025: trigger_valid = True
             
@@ -289,7 +257,6 @@ def get_currency_strength_rsi_cached():
         
         pairs = [p for p in ASSETS if "_" in p and "XAU" not in p and "US30" not in p]
         prices = {}
-        # On ne charge que 100 bougies ici, suffisant pour un RSI H1
         for p in pairs[:15]:
             params = {"count": 100, "granularity": "H1", "price": "M"}
             r = instruments.InstrumentsCandles(instrument=p, params=params)
@@ -335,10 +302,9 @@ def run_scan_pirm(api, min_score, min_adx, use_zones):
     
     def scan_asset(sym):
         try:
-            # === MODIFICATION MAJEURE ===
-            # Augmentation drastique de l'historique pour précision ADX et Midnight
-            df_m5 = api.get_candles(sym, "M5", 500) # 500 bougies = ~41 heures -> Midnight garanti
-            df_h1 = api.get_candles(sym, "H1", 500) # 500 bougies = Stabilité ADX garantie
+            # On garde 500 ici car c'est nécessaire pour l'ADX Wilder et pour trouver minuit à coup sûr
+            df_m5 = api.get_candles(sym, "M5", 500)
+            df_h1 = api.get_candles(sym, "H1", 500)
             df_d = api.get_candles(sym, "D", 5)
             
             if df_m5.empty or df_h1.empty: return None
@@ -437,3 +403,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
