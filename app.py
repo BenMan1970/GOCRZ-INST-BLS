@@ -15,13 +15,11 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 logging.getLogger().setLevel(logging.ERROR)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-st.set_page_config(page_title="Bluestar V6.6", layout="centered", page_icon="🛡️")
+st.set_page_config(page_title="GOCRZ-Sniper PRO", layout="centered", page_icon="🛡️")
 
 # --- SESSION STATE ---
-if 'trade_logs' not in st.session_state:
-    st.session_state.trade_logs = []
-if 'active_zones' not in st.session_state:
-    st.session_state.active_zones = {}
+if 'trade_logs' not in st.session_state: st.session_state.trade_logs = []
+if 'active_zones' not in st.session_state: st.session_state.active_zones = {}
 if 'cache' not in st.session_state: st.session_state.cache = {}
 if 'cs_data' not in st.session_state: st.session_state.cs_data = {'data': None, 'time': None}
 
@@ -139,7 +137,8 @@ class QuantEngine:
         return tr.ewm(span=period).mean().iloc[-1]
 
     @staticmethod
-    def calculate_adx_and_di(df, period=14):
+    def calculate_adx(df, period=14):
+        # STRATEGY LOCK: ADX H1 = Régime uniquement (jamais directionnel)
         high, low, close = df['high'], df['low'], df['close']
         plus_dm = high.diff().clip(lower=0)
         minus_dm = (-low.diff()).clip(lower=0)
@@ -153,8 +152,7 @@ class QuantEngine:
         minus_di = 100 * (minus_dm.ewm(alpha=1/period).mean() / atr)
         dx = (abs(plus_di - minus_di) / (plus_di + minus_di)).fillna(0) * 100
         adx = dx.ewm(alpha=1/period).mean().iloc[-1]
-        direction = 1 if plus_di.iloc[-1] > minus_di.iloc[-1] else -1
-        return adx, direction
+        return adx
 
     @staticmethod
     def calculate_hma(series, period=20):
@@ -164,15 +162,6 @@ class QuantEngine:
         wma_full = series.rolling(period).apply(lambda x: np.dot(x, np.arange(1, period+1)) / np.arange(1, period+1).sum(), raw=True)
         diff = 2 * wma_half - wma_full
         return diff.rolling(sqrt).apply(lambda x: np.dot(x, np.arange(1, sqrt+1)) / np.arange(1, sqrt+1).sum(), raw=True)
-
-    @staticmethod
-    def get_ha_ohlc(df):
-        ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
-        ha_open = ha_close.copy()
-        ha_open.iloc[0] = (df['open'].iloc[0] + df['close'].iloc[0]) / 2
-        for i in range(1, len(df)):
-            ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2
-        return ha_open, ha_close
 
     @staticmethod
     def get_zscore_status(df, lookback=20):
@@ -325,254 +314,214 @@ class QuantEngine:
         
         return False, None
 
+    @staticmethod
+    def detect_choch_m5(df, direction):
+        # STRATEGY LOCK: TRIGGER CENTRAL = CHoCH M5 uniquement
+        # Basé sur la cassure fractale (Swing High/Low) + clôture
+        if len(df) < 10: return False
+        
+        lookback = 15
+        if len(df) < lookback + 2: lookback = len(df) - 2
+        
+        # Bougie de référence (avant-dernière complète)
+        current_close = df['close'].iloc[-2]
+        
+        if direction == "BUY":
+            last_swing_high = 0
+            found_swing = False
+            
+            for i in range(-3, -lookback, -1):
+                h_i = df['high'].iloc[i]
+                h_prev = df['high'].iloc[i-1]
+                h_next = df['high'].iloc[i+1]
+                
+                if h_i >= h_prev and h_i >= h_next:
+                    last_swing_high = h_i
+                    found_swing = True
+                    break 
+            
+            if found_swing:
+                return current_close > last_swing_high # CHoCH: Cassure LH
+            
+        elif direction == "SELL":
+            last_swing_low = 999999
+            found_swing = False
+            
+            for i in range(-3, -lookback, -1):
+                l_i = df['low'].iloc[i]
+                l_prev = df['low'].iloc[i-1]
+                l_next = df['low'].iloc[i+1]
+                
+                if l_i <= l_prev and l_i <= l_next:
+                    last_swing_low = l_i
+                    found_swing = True
+                    break
+            
+            if found_swing:
+                return current_close < last_swing_low # CHoCH: Cassure HL
+                
+        return False
+
+
 def calculate_signal_v66(df_m5, df_m15, df_h1, df_d, df_w, symbol, direction, live_price, spread, cs_scores, min_adx, use_zones, strict_grade):
-    """Logique stricte selon le document + Matrix CS Update"""
+    """Logique strictement alignée sur la Stratégie Finale Verrouillée"""
     
     price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
     atr = QuantEngine.calculate_atr(df_m5)
     midnight_open = QuantEngine.get_midnight_open_ny(df_m5)
     pdh, pdl = QuantEngine.get_pdh_pdl(df_d)
     
+    # --- INITIALISATION ---
     score = 0
     reasons = []
     
-    # ========== FILTRE H1 (OBLIGATOIRE) ==========
-    # 1. ADX H1 > 20
-    adx_h1, adx_dir = QuantEngine.calculate_adx_and_di(df_h1)
+    # ========== 1. FILTRE RÉGIME (ADX H1) ==========
+    # LOCK: Filtre de marché tradable/uniquement. Pas de direction.
+    adx_h1 = QuantEngine.calculate_adx(df_h1)
     if adx_h1 < min_adx:
-        return 0, {}, 0, f"ADX {adx_h1:.1f} < {min_adx}", {}
+        return 0, {}, 0, f"Régime: ADX {adx_h1:.1f} < {min_adx}", {}
     
-    # 2. Direction ADX alignée
-    if direction == "BUY" and adx_dir != 1:
-        return 0, {}, 0, "ADX Direction Baissière", {}
-    if direction == "SELL" and adx_dir != -1:
-        return 0, {}, 0, "ADX Direction Haussière", {}
+    reasons.append(f"✅ Régime OK (ADX {adx_h1:.1f})")
     
-    score += 15
-    reasons.append(f"✅ ADX {adx_h1:.1f}")
-    
-    # 3. HMA H1 verte + prix au-dessus
+    # ========== 2. DIRECTION H1 (HMA 20 UNIQUEMENT) ==========
+    # LOCK: Direction Officielle = HMA H1. Pas de structure H1, pas de DI.
     hma_h1 = QuantEngine.calculate_hma(df_h1['close'])
     if len(hma_h1) < 3:
-        return 0, {}, 0, "HMA H1 données insuffisantes", {}
+        return 0, {}, 0, "Direction: HMA H1 données insuffisantes", {}
     
     hma_h1_green = hma_h1.iloc[-2] > hma_h1.iloc[-3]
     price_h1 = df_h1['close'].iloc[-1]
     
     if direction == "BUY":
-        if not hma_h1_green:
-            return 0, {}, 0, "HMA H1 Rouge", {}
-        if price_h1 <= hma_h1.iloc[-2]:
-            return 0, {}, 0, "Prix sous HMA H1", {}
-    else:
-        if hma_h1_green:
-            return 0, {}, 0, "HMA H1 Verte", {}
-        if price_h1 >= hma_h1.iloc[-2]:
-            return 0, {}, 0, "Prix sur HMA H1", {}
-    
-    score += 15
-    reasons.append("✅ HMA H1 + Prix OK")
-    
-    # ========== FILTRE M15 (OBLIGATOIRE) ==========
-    # 4. HMA M15 alignée
-    hma_m15 = QuantEngine.calculate_hma(df_m15['close'])
-    hma_m15_green = hma_m15.iloc[-2] > hma_m15.iloc[-3]
-    
-    if direction == "BUY":
-        if not hma_m15_green:
-            return 0, {}, 0, "HMA M15 Rouge", {}
-    else:
-        if hma_m15_green:
-            return 0, {}, 0, "HMA M15 Verte", {}
-    
-    # 5. Heiken Ashi M15 (bougie clôturée)
-    ha_o_m15, ha_c_m15 = QuantEngine.get_ha_ohlc(df_m15)
-    ha_m15_green = ha_c_m15.iloc[-2] > ha_o_m15.iloc[-2]
-    
-    if direction == "BUY":
-        if not ha_m15_green:
-            return 0, {}, 0, "HA M15 Rouge", {}
-    else:
-        if ha_m15_green:
-            return 0, {}, 0, "HA M15 Verte", {}
-    
-    # 6. Structure M15
-    if direction == "BUY":
-        structure_ok = (df_m15['low'].iloc[-2] > df_m15['low'].iloc[-4])
-    else:
-        structure_ok = (df_m15['high'].iloc[-2] < df_m15['high'].iloc[-4])
-    
-    if not structure_ok:
-        return 0, {}, 0, "Structure M15 faible", {}
-    
-    # 7. Matrice des forces (Mise à jour V7)
-    cs_aligned = False
-    cs_reason = ""
-    
-    if "_" in symbol and cs_scores:
-        base, quote = symbol.split('_')
-        
-        # On récupère les dicts complets
-        base_data = cs_scores.get(base, {'force': 5.0, 'coherence': 0.0})
-        quote_data = cs_scores.get(quote, {'force': 5.0, 'coherence': 0.0})
-        
-        # Filtre de cohérence (NOUVEAU)
-        min_coherence = 0.25 
-        if base_data['coherence'] < min_coherence or quote_data['coherence'] < min_coherence:
-             return 0, {}, 0, f"CS Incohérent ({base}:{base_data['coherence']:.2f}, {quote}:{quote_data['coherence']:.2f})", {}
+        if not hma_h1_green: return 0, {}, 0, "Direction: HMA H1 Baissière", {}
+        if price_h1 <= hma_h1.iloc[-2]: return 0, {}, 0, "Direction: Prix sous HMA H1", {}
+    else: # SELL
+        if hma_h1_green: return 0, {}, 0, "Direction: HMA H1 Haussière", {}
+        if price_h1 >= hma_h1.iloc[-2]: return 0, {}, 0, "Direction: Prix sur HMA H1", {}
+            
+    reasons.append("✅ Direction H1 Validée")
 
-        gap = base_data['force'] - quote_data['force']
-
-        if direction == "BUY":
-            if gap > 1.5:
-                cs_aligned = True
-            else:
-                cs_reason = f"CS Gap faible (+{gap:.1f})"
-        elif direction == "SELL":
-            if gap < -1.5:
-                cs_aligned = True
-            else:
-                cs_reason = f"CS Gap faible ({gap:.1f})"
-    else:
-        cs_aligned = True # Pour or, indices etc.
+    # ========== 3. BIAIS (Midnight) ==========
+    # LOCK: Biais journalier bloquant. Jamais un score.
+    if midnight_open:
+        if direction == "BUY" and price >= midnight_open:
+            return 0, {}, 0, "Biais: Prix > Midnight Open", {}
+        if direction == "SELL" and price <= midnight_open:
+            return 0, {}, 0, "Biais: Prix < Midnight Open", {}
+        reasons.append("✅ Biais Midnight OK")
     
-    if not cs_aligned:
-        return 0, {}, 0, f"CS Non Aligné: {cs_reason}", {}
-    
-    score += 15
-    # Affichage adapté pour le string reason
-    cs_display = ""
-    if "_" in symbol:
-        gap_val = cs_scores[symbol.split('_')[0]]['force'] - cs_scores[symbol.split('_')[1]]['force']
-        cs_display = f"Gap {abs(gap_val):.1f}"
-    reasons.append(f"✅ M15 Aligné + CS OK ({cs_display})")
-    
-    # ========== ZONE D'INTÉRÊT (INDISPENSABLE) ==========
+    # ========== 4. ZONES (Contexte Obligatoire) ==========
+    # LOCK: Une seule zone suffit. Trade hors zone = INTERDIT.
     zone_text = "NO_ZONE"
-    
     if use_zones:
-        # 8. Détection zone
         ob_valid, ob_zone = QuantEngine.detect_valid_ob(df_m5, atr, direction)
         fvg_valid, fvg_zone = QuantEngine.detect_fvg(df_m5, atr, direction)
         
         if ob_valid:
-            score += 10
-            reasons.append("✅ ORDER BLOCK")
             zone_text = "OB"
+            reasons.append("✅ Zone: Order Block")
         elif fvg_valid:
-            score += 8
-            reasons.append("✅ FVG")
             zone_text = "FVG"
+            reasons.append("✅ Zone: FVG")
         elif pdl and direction == "BUY" and abs(price - pdl) < atr * 0.5:
-            score += 6
-            reasons.append("✅ PDL")
             zone_text = "PDL"
+            reasons.append("✅ Zone: PDL")
         elif pdh and direction == "SELL" and abs(price - pdh) < atr * 0.5:
-            score += 6
-            reasons.append("✅ PDH")
             zone_text = "PDH"
+            reasons.append("✅ Zone: PDH")
         else:
-            return 0, {}, 0, "Aucune Zone", {}
+            return 0, {}, 0, "Contexte: Aucune Zone valide", {}
     else:
-        score += 10
         reasons.append("ℹ️ Zones désactivées")
+
+    # ========== 5. MACRO (Matrix CS) ==========
+    # LOCK: Filtre bloquant uniquement. Ne valide jamais, ne fait qu'empêcher.
+    if "_" in symbol and cs_scores:
+        base, quote = symbol.split('_')
+        base_data = cs_scores.get(base, {'force': 5.0, 'coherence': 0.0})
+        quote_data = cs_scores.get(quote, {'force': 5.0, 'coherence': 0.0})
+        
+        if base_data['coherence'] < 0.25 or quote_data['coherence'] < 0.25:
+             return 0, {}, 0, f"Macro: Incohérence CS", {}
+
+        gap = base_data['force'] - quote_data['force']
+        if direction == "BUY":
+            if gap <= 1.5: return 0, {}, 0, f"Macro: Gap BUY insuffisant ({gap:.1f})", {}
+        elif direction == "SELL":
+            if gap >= -1.5: return 0, {}, 0, f"Macro: Gap SELL insuffisant ({gap:.1f})", {}
+        
+        reasons.append("✅ Macro: Forces Alignées")
     
-    # 9. Prix sous/sur Midnight
-    if midnight_open:
-        if direction == "BUY" and price >= midnight_open:
-            return 0, {}, 0, "Prix > Midnight", {}
-        if direction == "SELL" and price <= midnight_open:
-            return 0, {}, 0, "Prix < Midnight", {}
-        score += 10
-        reasons.append("✅ Midnight OK")
-    else:
-        score += 5
-        reasons.append("⚠️ Midnight N/A")
-    
-    # 10. PDL/PDH respectés
-    if pdl and direction == "BUY" and price <= pdl:
-        return 0, {}, 0, "Prix < PDL", {}
-    if pdh and direction == "SELL" and price >= pdh:
-        return 0, {}, 0, "Prix > PDH", {}
-    
-    # ========== DÉCLENCHEUR M5 (TIMING) ==========
-    # 11. HMA M5
-    hma_m5 = QuantEngine.calculate_hma(df_m5['close'])
-    hma_m5_green = hma_m5.iloc[-2] > hma_m5.iloc[-3]
-    
-    if direction == "BUY":
-        if not hma_m5_green:
-            return 0, {}, 0, "HMA M5 Rouge", {}
-    else:
-        if hma_m5_green:
-            return 0, {}, 0, "HMA M5 Verte", {}
-    
-    # 12. HA Flip M5 (ANTI-REPAINT)
-    ha_o_m5, ha_c_m5 = QuantEngine.get_ha_ohlc(df_m5)
+    # ========== 6. TIMING M15 (Alignement) ==========
+    # LOCK: HMA M15 + Structure (Status Quo). Alignement requis.
+    hma_m15 = QuantEngine.calculate_hma(df_m15['close'])
+    hma_m15_green = hma_m15.iloc[-2] > hma_m15.iloc[-3]
     
     if direction == "BUY":
-        ha_prev_red = ha_c_m5.iloc[-3] < ha_o_m5.iloc[-3]
-        ha_curr_green = ha_c_m5.iloc[-2] > ha_o_m5.iloc[-2]
-        ha_flip = ha_prev_red and ha_curr_green
-    else:
-        ha_prev_green = ha_c_m5.iloc[-3] > ha_o_m5.iloc[-3]
-        ha_curr_red = ha_c_m5.iloc[-2] < ha_o_m5.iloc[-2]
-        ha_flip = ha_prev_green and ha_curr_red
-    
-    if not ha_flip:
-        return 0, {}, 0, "Pas de HA Flip", {}
-    
-    score += 20
-    reasons.append("✅ HA Flip Confirmé")
-    
-    # 13. Z-Score (timing)
+        if not hma_m15_green: return 0, {}, 0, "Timing M15: HMA Rouge", {}
+        if not (df_m15['low'].iloc[-2] > df_m15['low'].iloc[-4]): return 0, {}, 0, "Timing M15: Structure rompue", {}
+    else: # SELL
+        if hma_m15_green: return 0, {}, 0, "Timing M15: HMA Verte", {}
+        if not (df_m15['high'].iloc[-2] < df_m15['high'].iloc[-4]): return 0, {}, 0, "Timing M15: Structure rompue", {}
+        
+    reasons.append("✅ Timing M15 Aligné")
+
+    # ========== 7. TIMING Z-SCORE (Filtre) ==========
+    # LOCK: Bloque les extrêmes (Garde-fou).
     z_curr, z_prev = QuantEngine.get_zscore_status(df_m5, lookback=20)
     
     if direction == "BUY":
-        if z_curr < -1.5 and z_curr > z_prev:
-            score += 10
-            reasons.append(f"✅ Z-Score {z_curr:.2f}")
-        else:
-            score += 3
-            reasons.append(f"⚠️ Z-Score {z_curr:.2f}")
-    else:
-        if z_curr > 1.5 and z_curr < z_prev:
-            score += 10
-            reasons.append(f"✅ Z-Score {z_curr:.2f}")
-        else:
-            score += 3
-            reasons.append(f"⚠️ Z-Score {z_curr:.2f}")
+        if z_curr > 2.0: return 0, {}, 0, f"Timing: Z-Score Overbought ({z_curr:.1f})", {}
+    else: # SELL
+        if z_curr < -2.0: return 0, {}, 0, f"Timing: Z-Score Oversold ({z_curr:.1f})", {}
+            
+    reasons.append(f"✅ Timing Z-Score OK ({z_curr:.2f})")
+
+    # ========== 8. TRIGGER (CHoCH M5) ==========
+    # LOCK: Déclencheur UNIQUE. HMA M5 est pré-condition.
     
-    # ========== GRADE INSTITUTIONNEL ==========
+    # 8.1 Pré-condition HMA M5
+    hma_m5 = QuantEngine.calculate_hma(df_m5['close'])
+    hma_m5_green = hma_m5.iloc[-2] > hma_m5.iloc[-3]
+    
+    if direction == "BUY" and not hma_m5_green:
+        return 0, {}, 0, "Trigger: HMA M5 Rouge", {}
+    if direction == "SELL" and hma_m5_green:
+        return 0, {}, 0, "Trigger: HMA M5 Verte", {}
+        
+    # 8.2 CHoCH M5 (Cassure Fractale)
+    choch_valid = QuantEngine.detect_choch_m5(df_m5, direction)
+    if not choch_valid:
+        return 0, {}, 0, "Trigger: Pas de CHoCH M5", {}
+        
+    reasons.append("🔥 TRIGGER: CHoCH M5 Confirmé")
+
+    # ========== 9. SCORING (Qualité Uniquement) ==========
+    # LOCK: Score ne valide jamais le trade. Il classe la qualité.
+    quality_score = 60
+    
+    # Grade
     grade = QuantEngine.get_institutional_grade_v2(df_d, df_w, direction)
+    if grade == "A+": 
+        quality_score += 20
+        reasons.append("✅ Qualité: Grade A+")
+    elif grade == "A": 
+        quality_score += 10
+        reasons.append("✅ Qualité: Grade A")
     
-    if strict_grade:
-        if grade != "A+":
-            return 0, {}, 0, f"Grade {grade} (Need A+)", {}
-        score += 10
-        reasons.append("✅ Grade A+")
-    else:
-        if grade == "A+":
-            score += 10
-            reasons.append("✅ Grade A+")
-        elif grade == "A":
-            score += 7
-            reasons.append("✅ Grade A")
-        else:
-            score += 3
-            reasons.append(f"⚠️ Grade {grade}")
+    # Zone Bonus
+    if zone_text == "OB": quality_score += 10
+    elif zone_text in ["FVG", "PDH", "PDL"]: quality_score += 5
     
-    # ========== VALIDATION FINALE ==========
-    if score < 60:
-        return 0, {}, 0, f"Score {score}/100 insuffisant", {}
+    # Z-Score Bonus (Pullback propre)
+    if direction == "BUY" and -1.5 < z_curr < 0: quality_score += 5
+    if direction == "SELL" and 0 < z_curr < 1.5: quality_score += 5
     
-    # Classification
-    if score >= 85:
-        quality = "ELITE 🏆"
-    elif score >= 75:
-        quality = "PREMIUM ⭐"
-    else:
-        quality = "STANDARD ✅"
+    final_score = min(100, quality_score)
+    
+    if final_score >= 85: quality = "ELITE 🏆"
+    elif final_score >= 75: quality = "PREMIUM ⭐"
+    else: quality = "STANDARD ✅"
     
     # SL/TP
     params = get_asset_params(symbol)
@@ -581,7 +530,7 @@ def calculate_signal_v66(df_m5, df_m15, df_h1, df_d, df_w, symbol, direction, li
     
     details = {
         "quality": quality,
-        "score": score,
+        "score": final_score,
         "reasons": reasons,
         "midnight": f"{midnight_open:.5f}" if midnight_open else "N/A",
         "pdh_pdl": f"{pdh:.5f} / {pdl:.5f}" if pdh else "N/A",
@@ -592,7 +541,7 @@ def calculate_signal_v66(df_m5, df_m15, df_h1, df_d, df_w, symbol, direction, li
         "session": QuantEngine.get_trading_session(datetime.now(pytz.utc)),
     }
     
-    return score / 100, details, atr / price * 100, None, {}
+    return 1.0, details, atr / price * 100, None, {}
 
 
 def run_scan_v66(api, min_score, current_time_utc, filter_asian, min_adx, use_zones, strict_grade):
@@ -602,15 +551,9 @@ def run_scan_v66(api, min_score, current_time_utc, filter_asian, min_adx, use_zo
     
     stats = {
         'total': len(ASSETS),
-        'adx_rejected': 0,
-        'hma_rejected': 0,
-        'ha_rejected': 0,
-        'zone_rejected': 0,
-        'cs_rejected': 0,
-        'midnight_rejected': 0,
-        'score_rejected': 0,
-        'session_filtered': 0,
-        'other': 0
+        'regime_rejected': 0, 'direction_rejected': 0, 'bias_rejected': 0,
+        'zone_rejected': 0, 'macro_rejected': 0, 'timing_m15_rejected': 0,
+        'timing_z_rejected': 0, 'trigger_rejected': 0, 'other': 0
     }
     
     progress_bar = st.progress(0)
@@ -621,26 +564,15 @@ def run_scan_v66(api, min_score, current_time_utc, filter_asian, min_adx, use_zo
         status_text.markdown(f"⏳ **{sym}** ({i+1}/{len(ASSETS)})")
         
         try:
-            # Session filter
             if filter_asian:
                 session = QuantEngine.get_trading_session(current_time_utc)
                 if session == "ASIAN" and "XAU" not in sym and "US30" not in sym:
-                    stats['session_filtered'] += 1
-                    rejected_log.append(f"{sym}: Session Asiatique")
+                    stats['other'] += 1
                     continue
             
-            # Lazy load H1
             df_h1 = api.get_candles(sym, "H1", 50)
             if df_h1.empty: continue
             
-            # Pre-check ADX
-            adx_h1, adx_dir = QuantEngine.calculate_adx_and_di(df_h1)
-            if adx_h1 < min_adx:
-                stats['adx_rejected'] += 1
-                rejected_log.append(f"{sym}: ADX {adx_h1:.1f}")
-                continue
-            
-            # Full load
             df_m15 = api.get_candles(sym, "M15", 100)
             df_m5 = api.get_candles(sym, "M5", 200)
             df_d = api.get_candles(sym, "D", 250)
@@ -648,37 +580,31 @@ def run_scan_v66(api, min_score, current_time_utc, filter_asian, min_adx, use_zo
             
             live_price, spread_pips = api.get_realtime_price_and_spread(sym)
             
-            if df_m5.empty or df_m15.empty or df_d.empty or df_w.empty:
-                continue
+            if df_m5.empty or df_m15.empty or df_d.empty or df_w.empty: continue
             
-            # Test directions
             for direction in ["BUY", "SELL"]:
-                if direction == "BUY" and adx_dir != 1: continue
-                if direction == "SELL" and adx_dir != -1: continue
-                
                 prob, details, atr_pct, reject_reason, _ = calculate_signal_v66(
                     df_m5, df_m15, df_h1, df_d, df_w, sym, direction,
                     live_price, spread_pips, cs_scores, min_adx, use_zones, strict_grade
                 )
                 
                 if reject_reason:
-                    if "ADX" in reject_reason: stats['adx_rejected'] += 1
-                    elif "HMA" in reject_reason: stats['hma_rejected'] += 1
-                    elif "HA" in reject_reason or "Flip" in reject_reason: stats['ha_rejected'] += 1
-                    elif "Zone" in reject_reason or "OB" in reject_reason or "FVG" in reject_reason: stats['zone_rejected'] += 1
-                    elif "CS" in reject_reason: stats['cs_rejected'] += 1
-                    elif "Midnight" in reject_reason: stats['midnight_rejected'] += 1
-                    elif "Score" in reject_reason: stats['score_rejected'] += 1
+                    if "Régime" in reject_reason: stats['regime_rejected'] += 1
+                    elif "Direction" in reject_reason: stats['direction_rejected'] += 1
+                    elif "Biais" in reject_reason: stats['bias_rejected'] += 1
+                    elif "Zone" in reject_reason: stats['zone_rejected'] += 1
+                    elif "Macro" in reject_reason: stats['macro_rejected'] += 1
+                    elif "Timing M15" in reject_reason: stats['timing_m15_rejected'] += 1
+                    elif "Timing: Z-" in reject_reason: stats['timing_z_rejected'] += 1
+                    elif "Trigger" in reject_reason: stats['trigger_rejected'] += 1
                     else: stats['other'] += 1
-                    
                     rejected_log.append(f"{sym} {direction}: {reject_reason}")
                     continue
                 
-                score_100 = prob * 100
-                if score_100 < min_score:
-                    stats['score_rejected'] += 1
-                    rejected_log.append(f"{sym} {direction}: Score {score_100:.0f}")
-                    continue
+                score_display = details['score']
+                if score_display < min_score:
+                     rejected_log.append(f"{sym} {direction}: Score {score_display:.0f} < Min {min_score}")
+                     continue
                 
                 price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
                 atr = QuantEngine.calculate_atr(df_m5)
@@ -687,17 +613,9 @@ def run_scan_v66(api, min_score, current_time_utc, filter_asian, min_adx, use_zo
                 tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
                 
                 signals.append({
-                    'symbol': sym,
-                    'type': direction,
-                    'price': price,
-                    'prob': prob,
-                    'score_display': score_100,
-                    'details': details,
-                    'atr_pct': atr_pct,
-                    'sl': sl,
-                    'tp': tp,
-                    'rr': params['tp_rr'],
-                    'spread': spread_pips
+                    'symbol': sym, 'type': direction, 'price': price, 'prob': prob,
+                    'score_display': score_display, 'details': details, 'atr_pct': atr_pct,
+                    'sl': sl, 'tp': tp, 'rr': params['tp_rr'], 'spread': spread_pips
                 })
         
         except Exception as e:
@@ -707,11 +625,10 @@ def run_scan_v66(api, min_score, current_time_utc, filter_asian, min_adx, use_zo
     
     progress_bar.empty()
     status_text.empty()
-    return sorted(signals, key=lambda x: x['prob'], reverse=True), rejected_log, stats
+    return sorted(signals, key=lambda x: x['score_display'], reverse=True), rejected_log, stats
 
 
 def get_currency_strength_rsi(api):
-    """Nouvelle matrice : Force + Impulsion + Cohérence"""
     now = datetime.now()
     if st.session_state.cs_data.get('time') and (now - st.session_state.cs_data['time']).total_seconds() < 900:
         return st.session_state.cs_data['data']
@@ -719,7 +636,6 @@ def get_currency_strength_rsi(api):
     forex_pairs = [p for p in ASSETS if "_" in p and "XAU" not in p and "US30" not in p and "DE30" not in p]
     prices = {}
     
-    # 1. Fetching data (léger élargissement du scope pour précision)
     for pair in forex_pairs[:25]:
         try:
             df = api.get_candles(pair, "H1", 50)
@@ -729,7 +645,6 @@ def get_currency_strength_rsi(api):
     if not prices: return None
     df_prices = pd.DataFrame(prices).ffill().bfill()
     
-    # Fonction locale RSI optimisée
     def calculate_rsi_matrix(series, period=14):
         delta = series.diff()
         gain = (delta.where(delta > 0, 0)).fillna(0)
@@ -739,7 +654,6 @@ def get_currency_strength_rsi(api):
         rs = avg_gain / avg_loss.replace(0, 0.0001)
         return 100 - (100 / (1 + rs))
 
-    # 2. Logique Matrix
     currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
     results = {}
     
@@ -750,7 +664,6 @@ def get_currency_strength_rsi(api):
         for col in df_prices.columns:
             base, quote = col.split('_')
             series = None
-            
             if curr == base: series = df_prices[col]
             elif curr == quote: series = 1 / df_prices[col]
             
@@ -766,14 +679,11 @@ def get_currency_strength_rsi(api):
 
         rsi_now = np.mean(rsi_values_now)
         rsi_prev = np.mean(rsi_values_prev)
-        
         direction = (rsi_now - 50) / 50
         impulsion = (rsi_now - rsi_prev) / 10
-        
         above = sum(1 for r in rsi_values_now if r > 50)
         below = sum(1 for r in rsi_values_now if r < 50)
         coherence = (above - below) / len(rsi_values_now)
-        
         force_raw = direction * 0.5 + impulsion * 0.3 + coherence * 0.2
         force_score = (force_raw + 1) * 5
 
@@ -794,14 +704,11 @@ def display_sig_v66(s):
     d = s['details']
     
     quality_badge = ""
-    if "ELITE" in d['quality']:
-        quality_badge = "<span class='badge-elite'>🏆 ELITE</span>"
-    elif "PREMIUM" in d['quality']:
-        quality_badge = "<span class='badge-premium'>⭐ PREMIUM</span>"
-    else:
-        quality_badge = "<span class='badge badge-blue'>✅ STANDARD</span>"
+    if "ELITE" in d['quality']: quality_badge = "<span class='badge-elite'>🏆 ELITE</span>"
+    elif "PREMIUM" in d['quality']: quality_badge = "<span class='badge-premium'>⭐ PREMIUM</span>"
+    else: quality_badge = "<span class='badge badge-blue'>✅ STANDARD</span>"
     
-    with st.expander(f"{'📈' if is_buy else '📉'} {s['symbol']} | {s['type']} | {s['score_display']:.0f}/100", expanded=True):
+    with st.expander(f"{'📈' if is_buy else '📉'} {s['symbol']} | {s['type']} | Score: {s['score_display']:.0f}", expanded=True):
         st.markdown(f"""
         <div style="background:{bg};padding:15px;border-radius:8px;border:2px solid {col_type};margin-bottom:10px;">
             <span style="font-size:1.5em;font-weight:900;color:white;">{s['symbol']}</span>
@@ -813,12 +720,10 @@ def display_sig_v66(s):
         
         st.markdown("### 📋 Critères Validés")
         for reason in d['reasons']:
-            if "✅" in reason:
-                st.success(reason)
-            elif "⚠️" in reason:
-                st.warning(reason)
-            elif "ℹ️" in reason:
-                st.info(reason)
+            if "🔥" in reason: st.success(reason)
+            elif "✅" in reason: st.success(reason)
+            elif "⚠️" in reason: st.warning(reason)
+            elif "ℹ️" in reason: st.info(reason)
         
         c1, c2, c3 = st.columns(3)
         c1.metric("Midnight", d.get('midnight', 'N/A'))
@@ -831,7 +736,7 @@ def display_sig_v66(s):
 
 
 def main():
-    st.title("🛡️ BLUESTAR V6.6")
+    st.title("🛡️ GOCRZ-Sniper PRO (Strategy Locked)")
     
     current_time_utc = datetime.now(pytz.utc)
     session = QuantEngine.get_trading_session(current_time_utc)
@@ -846,19 +751,16 @@ def main():
     
     with st.sidebar:
         st.header("⚙️ Paramètres")
-        
-        min_score = st.slider("Score Minimum", 60, 95, 70, 5)
-        
+        min_score = st.slider("Score Min (Qualité)", 60, 95, 70, 5)
         st.markdown("---")
-        adx_enabled = st.checkbox("✅ Filtrer ADX", value=True)
+        adx_enabled = st.checkbox("✅ Filtrer ADX (Régime)", value=True)
         min_adx = st.slider("ADX Min", 15, 30, 20, 1) if adx_enabled else 0
-        
-        use_zones = st.checkbox("🎯 Zones (OB/FVG)", value=True)
+        use_zones = st.checkbox("🎯 Zones (Contexte)", value=True)
         strict_grade = st.checkbox("📊 Grade Strict (A+)", value=False)
         filter_asian = st.checkbox("🕶️ Filtrer Asiatique", value=True)
     
     if st.button("🔍 SCANNER"):
-        with st.spinner("Analyse..."):
+        with st.spinner("Analyse en cours..."):
             api = OandaClient()
             results, logs, stats = run_scan_v66(
                 api, min_score, current_time_utc, filter_asian,
@@ -866,43 +768,35 @@ def main():
             )
         
         if not results:
-            st.warning("⚠️ Aucun signal")
-            
-            st.subheader("📊 Rejets")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Session", stats['session_filtered'])
-            col2.metric("ADX", stats['adx_rejected'])
-            col3.metric("HMA", stats['hma_rejected'])
-            col4.metric("HA", stats['ha_rejected'])
-            
-            col5, col6, col7, col8 = st.columns(4)
-            col5.metric("Zone", stats['zone_rejected'])
-            col6.metric("CS", stats['cs_rejected'])
-            col7.metric("Midnight", stats['midnight_rejected'])
-            col8.metric("Score", stats['score_rejected'])
+            st.warning("⚠️ Aucun signal valide (Hard Rules)")
+            st.subheader("📊 Détail des Rejets")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("1. Régime (ADX)", stats['regime_rejected'])
+            c2.metric("2. Direction (H1)", stats['direction_rejected'])
+            c3.metric("3. Biais (Midnight)", stats['bias_rejected'])
+            c4.metric("4. Zones", stats['zone_rejected'])
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("5. Macro (CS)", stats['macro_rejected'])
+            c6.metric("6. Timing M15", stats['timing_m15_rejected'])
+            c7.metric("7. Timing Z-Score", stats['timing_z_rejected'])
+            c8.metric("8. Trigger (CHoCH)", stats['trigger_rejected'])
             
             with st.expander("📜 Logs (50 premiers)"):
-                for log in logs[:50]:
-                    st.text(log)
+                for log in logs[:50]: st.text(log)
         else:
-            st.success(f"✅ {len(results)} Signal(s)")
-            
+            st.success(f"✅ {len(results)} Signal(s) Valide(s)")
             elite = sum(1 for r in results if "ELITE" in r['details']['quality'])
             premium = sum(1 for r in results if "PREMIUM" in r['details']['quality'])
             standard = len(results) - elite - premium
-            
             col1, col2, col3 = st.columns(3)
             col1.metric("🏆 Elite", elite)
             col2.metric("⭐ Premium", premium)
             col3.metric("✅ Standard", standard)
             
-            for r in results:
-                display_sig_v66(r)
+            for r in results: display_sig_v66(r)
             
-            with st.expander("📜 Logs"):
-                for log in logs[:50]:
-                    st.text(log)
+            with st.expander("📜 Logs Rejets"):
+                for log in logs[:50]: st.text(log)
 
 if __name__ == "__main__":
     main()
-   
