@@ -1,4 +1,3 @@
-# appVersion BlueStar_Sniper_Pro_V7.0-FINAL.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -48,6 +47,7 @@ st.markdown("""
         font-size: 3em;
         text-align: center;
         margin-bottom: 0.2em;
+        color: #3b82f6;
         filter: drop-shadow(0 0 10px rgba(59, 130, 246, 0.6));
     }
     
@@ -577,12 +577,12 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         if not touched_hma:
             return 0, {}, 0, "Pas de Pullback HMA", {}
         
-        # RSI: Zone reload 40-55 (Élargi pour plus de signaux)
-        rsi_reload = ((rsi_m5_prev >= 40) & (rsi_m5_prev <= 55)).any()
-        rsi_above_35 = (rsi_m5_prev >= 35).all()  # Ne doit PAS passer sous 35
+        # RSI: Zone reload 45-50, puis break 50
+        rsi_reload = ((rsi_m5_prev >= 45) & (rsi_m5_prev <= 50)).any()
+        rsi_above_40 = (rsi_m5_prev >= 40).all()  # Ne doit PAS passer sous 40
         
-        if not rsi_above_35:
-            return 0, {}, 0, f"RSI cassé 35 ({rsi_m5_prev.min():.1f})", {}
+        if not rsi_above_40:
+            return 0, {}, 0, f"RSI cassé 40 ({rsi_m5_prev.min():.1f})", {}
         
         if rsi_reload and rsi_m5_current > 50:
             # Heiken Ashi vert
@@ -602,12 +602,12 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         if not touched_hma:
             return 0, {}, 0, "Pas de Pullback HMA", {}
         
-        # RSI: Zone reload 45-60 (Élargi pour plus de signaux)
-        rsi_reload = ((rsi_m5_prev >= 45) & (rsi_m5_prev <= 60)).any()
-        rsi_below_65 = (rsi_m5_prev <= 65).all()  # Ne doit PAS dépasser 65
+        # RSI: Zone reload 50-55, puis break 50
+        rsi_reload = ((rsi_m5_prev >= 50) & (rsi_m5_prev <= 55)).any()
+        rsi_below_60 = (rsi_m5_prev <= 60).all()  # Ne doit PAS dépasser 60
         
-        if not rsi_below_65:
-            return 0, {}, 0, f"RSI cassé 65 ({rsi_m5_prev.max():.1f})", {}
+        if not rsi_below_60:
+            return 0, {}, 0, f"RSI cassé 60 ({rsi_m5_prev.max():.1f})", {}
         
         if rsi_reload and rsi_m5_current < 50:
             # Heiken Ashi rouge
@@ -878,7 +878,21 @@ def display_signal_v7(s):
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("RSI H1", f"{d['rsi_h1']:.1f}")
         c2.metric("RSI M5", f"{d['rsi_m5']:.1f}")
-        c3.metric("Midnight", d['midnight'])
+        
+        # Premium/Discount Status
+        midnight_val = d['midnight']
+        if midnight_val != "N/A":
+            try:
+                mid_price = float(midnight_val)
+                if s['price'] > mid_price:
+                    c3.markdown(f"**Midnight**<br><span style='color:#ef4444;font-weight:700;'>🔴 PREMIUM</span><br><span style='font-size:0.8em;color:#64748b;'>{midnight_val}</span>", unsafe_allow_html=True)
+                else:
+                    c3.markdown(f"**Midnight**<br><span style='color:#10b981;font-weight:700;'>🟢 DISCOUNT</span><br><span style='font-size:0.8em;color:#64748b;'>{midnight_val}</span>", unsafe_allow_html=True)
+            except:
+                c3.metric("Midnight", midnight_val)
+        else:
+            c3.metric("Midnight", "N/A")
+        
         c4.metric("PDH/PDL", d['pdh_pdl'])
         
         st.markdown("### 🎯 Niveaux de Trade")
@@ -889,7 +903,7 @@ def display_signal_v7(s):
 
 def main():
     st.markdown("<div class='star-logo'>⭐</div>", unsafe_allow_html=True)
-    st.title("BlueStar Sniper Pro V7.0")
+    st.title("BlueStar Sniper Pro V7.0 ULTIMATE")
     st.markdown("<p style='text-align:center;color:#94a3b8;font-size:1.1em;'>ULTIMATE FUSION: H1 Bias → M15 Alignment → M5 PIRM Trigger</p>", unsafe_allow_html=True)
     
     with st.sidebar:
@@ -928,7 +942,7 @@ def main():
         
         **Phase 3 - PIRM Trigger M5:**
         - Pullback HMA 20
-        - RSI 10 OHLC4 Reload (40-55 / 45-60)
+        - RSI 10 OHLC4 Reload
         - Break niveau 50
         - ADX M5 > 18
         
