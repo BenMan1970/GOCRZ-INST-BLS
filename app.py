@@ -426,25 +426,6 @@ class QuantEngine:
         
         return False, None
 
-    @staticmethod
-    def detect_structure_zscore(df, lookback=20):
-        """Détection EXPANSION vs CONSOLIDATION via Z-Score"""
-        if len(df) < lookback + 1: 
-            return 0, "UNKNOWN"
-        
-        window = df['close'].iloc[-lookback:]
-        try:
-            from scipy import stats
-            z_scores = stats.zscore(window)
-            z_current = z_scores[-1]
-            
-            if abs(z_current) > 1.5:
-                return z_current, "EXPANSION 🌊"
-            else:
-                return z_current, "CONSOLIDATION 🧱"
-        except:
-            return 0, "NEUTRAL"
-
 def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direction, live_price, cs_scores, config):
     """
     BlueStar Sniper Pro V7.0 - FUSION ULTIME
@@ -626,9 +607,13 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
             if ha_bullish:
                 pirm_valid = True
                 trigger_type = "PIRM"
-        
-        if not pirm_valid:
-            return 0, {}, 0, f"PIRM invalide (RSI {rsi_m5_current:.1f})", {}
+            else:
+                return 0, {}, 0, "HA M5 pas vert", {}
+        else:
+            if not rsi_reload:
+                return 0, {}, 0, "Pas de Reload RSI (45-50)", {}
+            else:
+                return 0, {}, 0, f"RSI pas break 50 ({rsi_m5_current:.1f})", {}
     
     else:  # SELL
         # Pullback vers HMA 20
@@ -651,9 +636,13 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
             if ha_bearish:
                 pirm_valid = True
                 trigger_type = "PIRM"
-        
-        if not pirm_valid:
-            return 0, {}, 0, f"PIRM invalide (RSI {rsi_m5_current:.1f})", {}
+            else:
+                return 0, {}, 0, "HA M5 pas rouge", {}
+        else:
+            if not rsi_reload:
+                return 0, {}, 0, "Pas de Reload RSI (50-55)", {}
+            else:
+                return 0, {}, 0, f"RSI pas break 50 ({rsi_m5_current:.1f})", {}
     
     score += 25
     reasons.append(f"🔥 PIRM TRIGGER: RSI {rsi_m5_current:.1f}")
@@ -724,8 +713,6 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         "rsi_h1": rsi_h1_val,
         "rsi_m5": rsi_m5_current,
         "hma_m5": hma_m5_current,
-        "z_score": z_score_val,
-        "z_status": z_status,
     }
     
     return score / 100, details, atr / price * 100, None, {'sl': sl, 'tp': tp}
@@ -850,12 +837,16 @@ def run_scan_bluestar_v7(api, config):
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(scan_single_asset, args): args[0] for args in args_list}
         
-        for future in as_completed(futures):
-            result = future.result()
-            if isinstance(result, list):
-                signals.extend(result)
-            elif isinstance(result, str):
-                logs.append(result)
+        for future in as_completed(futures, timeout=60):
+            try:
+                result = future.result(timeout=10)
+                if isinstance(result, list):
+                    signals.extend(result)
+                elif isinstance(result, str):
+                    logs.append(result)
+            except Exception as e:
+                sym_name = futures.get(future, "Unknown")
+                logs.append(f"Timeout/Error: {sym_name}")
     
     status.empty()
     return sorted(signals, key=lambda x: x['score'], reverse=True), logs
@@ -911,7 +902,7 @@ def display_signal_v7(s):
                         st.info(reason)
         
         st.markdown("### 📊 Indicateurs Clés")
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("RSI H1", f"{d['rsi_h1']:.1f}")
         c2.metric("RSI M5", f"{d['rsi_m5']:.1f}")
         
@@ -930,11 +921,6 @@ def display_signal_v7(s):
             c3.metric("Midnight", "N/A")
         
         c4.metric("PDH/PDL", d['pdh_pdl'])
-        
-        # Z-Score Structure
-        z_status = d.get('z_status', 'NEUTRAL')
-        z_val = d.get('z_score', 0)
-        c5.markdown(f"**Structure H1**<br><span style='font-weight:700;'>{z_status}</span><br><span style='font-size:0.8em;color:#64748b;'>Z: {z_val:.2f}</span>", unsafe_allow_html=True)
         
         st.markdown("### 🎯 Niveaux de Trade")
         col_sl, col_tp = st.columns(2)
