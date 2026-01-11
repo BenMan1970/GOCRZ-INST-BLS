@@ -332,18 +332,40 @@ class QuantEngine:
 
     @staticmethod
     def detect_structure(df, direction, lookback=20):
-        """Détection HH/HL ou LL/LH"""
-        if len(df) < lookback: return False
+        """Détection HH/HL (BUY) ou LL/LH (SELL)"""
+        if len(df) < lookback + 5: 
+            return False
         
         if direction == "BUY":
-            # HH / HL
+            # Higher Highs / Higher Lows
             recent_high = df['high'].iloc[-5:].max()
             prev_high = df['high'].iloc[-lookback:-5].max()
             recent_low = df['low'].iloc[-5:].min()
             prev_low = df['low'].iloc[-lookback:-5].min()
             return recent_high > prev_high and recent_low > prev_low
         else:
-            # LL / LH
+            # Lower Lows / Lower Highs
+            recent_low = df['low'].iloc[-5:].min()
+            prev_low = df['low'].iloc[-lookback:-5].min()
+            recent_high = df['high'].iloc[-5:].max()
+            prev_high = df['high'].iloc[-lookback:-5].max()
+            return recent_low < prev_low and recent_high < prev_high
+
+    @staticmethod
+    def detect_structure(df, direction, lookback=20):
+        """Détection HH/HL (BUY) ou LL/LH (SELL)"""
+        if len(df) < lookback + 5: 
+            return False
+        
+        if direction == "BUY":
+            # Higher Highs / Higher Lows
+            recent_high = df['high'].iloc[-5:].max()
+            prev_high = df['high'].iloc[-lookback:-5].max()
+            recent_low = df['low'].iloc[-5:].min()
+            prev_low = df['low'].iloc[-lookback:-5].min()
+            return recent_high > prev_high and recent_low > prev_low
+        else:
+            # Lower Lows / Lower Highs
             recent_low = df['low'].iloc[-5:].min()
             prev_low = df['low'].iloc[-lookback:-5].min()
             recent_high = df['high'].iloc[-5:].max()
