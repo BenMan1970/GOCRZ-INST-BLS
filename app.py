@@ -331,6 +331,26 @@ class QuantEngine:
         return df_d['high'].iloc[-2], df_d['low'].iloc[-2]
 
     @staticmethod
+    def detect_structure(df, direction, lookback=20):
+        """Détection HH/HL ou LL/LH"""
+        if len(df) < lookback: return False
+        
+        if direction == "BUY":
+            # HH / HL
+            recent_high = df['high'].iloc[-5:].max()
+            prev_high = df['high'].iloc[-lookback:-5].max()
+            recent_low = df['low'].iloc[-5:].min()
+            prev_low = df['low'].iloc[-lookback:-5].min()
+            return recent_high > prev_high and recent_low > prev_low
+        else:
+            # LL / LH
+            recent_low = df['low'].iloc[-5:].min()
+            prev_low = df['low'].iloc[-lookback:-5].min()
+            recent_high = df['high'].iloc[-5:].max()
+            prev_high = df['high'].iloc[-lookback:-5].max()
+            return recent_low < prev_low and recent_high < prev_high
+
+    @staticmethod
     def detect_valid_ob(df, atr, direction):
         """Order Block Detection"""
         if len(df) < 30: return False, None
