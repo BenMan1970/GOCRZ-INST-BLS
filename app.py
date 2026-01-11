@@ -426,6 +426,25 @@ class QuantEngine:
         
         return False, None
 
+    @staticmethod
+    def detect_structure_zscore(df, lookback=20):
+        """Détection EXPANSION vs CONSOLIDATION via Z-Score"""
+        if len(df) < lookback + 1: 
+            return 0, "UNKNOWN"
+        
+        window = df['close'].iloc[-lookback:]
+        try:
+            from scipy import stats
+            z_scores = stats.zscore(window)
+            z_current = z_scores[-1]
+            
+            if abs(z_current) > 1.5:
+                return z_current, "EXPANSION 🌊"
+            else:
+                return z_current, "CONSOLIDATION 🧱"
+        except:
+            return 0, "NEUTRAL"
+
 def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direction, live_price, cs_scores, config):
     """
     BlueStar Sniper Pro V7.0 - FUSION ULTIME
@@ -525,7 +544,22 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     score += 10
     reasons.append("✅ M15 Aligné (HMA+HA)")
     
-    # 7. Currency Strength
+    # ========================================
+    # PHASE 2.5: Z-SCORE STRUCTURE CHECK
+    # ========================================
+    
+    # Check structure sur H1 pour éviter les ranges serrés
+    z_score_val, z_status = QuantEngine.detect_structure_zscore(df_h1, lookback=20)
+    
+    if abs(z_score_val) < 0.5:
+        return 0, {}, 0, f"Range serré (Z-Score {z_score_val:.2f})", {}
+    
+    score += 5
+    reasons.append(f"✅ {z_status}")
+    
+    # ========================================
+    # PHASE 3: CURRENCY STRENGTH
+    # ========================================
     cs_valid = False
     if "_" in symbol and cs_scores:
         base, quote = symbol.split('_')
@@ -690,6 +724,8 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         "rsi_h1": rsi_h1_val,
         "rsi_m5": rsi_m5_current,
         "hma_m5": hma_m5_current,
+        "z_score": z_score_val,
+        "z_status": z_status,
     }
     
     return score / 100, details, atr / price * 100, None, {'sl': sl, 'tp': tp}
@@ -875,7 +911,7 @@ def display_signal_v7(s):
                         st.info(reason)
         
         st.markdown("### 📊 Indicateurs Clés")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("RSI H1", f"{d['rsi_h1']:.1f}")
         c2.metric("RSI M5", f"{d['rsi_m5']:.1f}")
         
@@ -894,6 +930,11 @@ def display_signal_v7(s):
             c3.metric("Midnight", "N/A")
         
         c4.metric("PDH/PDL", d['pdh_pdl'])
+        
+        # Z-Score Structure
+        z_status = d.get('z_status', 'NEUTRAL')
+        z_val = d.get('z_score', 0)
+        c5.markdown(f"**Structure H1**<br><span style='font-weight:700;'>{z_status}</span><br><span style='font-size:0.8em;color:#64748b;'>Z: {z_val:.2f}</span>", unsafe_allow_html=True)
         
         st.markdown("### 🎯 Niveaux de Trade")
         col_sl, col_tp = st.columns(2)
@@ -997,3 +1038,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+   
