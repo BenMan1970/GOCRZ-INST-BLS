@@ -43,32 +43,38 @@ st.markdown("""
         text-shadow: 0 0 30px rgba(59, 130, 246, 0.3);
         display: inline-block;
         vertical-align: middle;
-        margin-left: 15px;
+        margin-left: 0px;
+        margin-top: 0;
+        margin-bottom: 0;
     }
     
     .star-logo {
-        font-size: 3em;
+        font-size: 2.8em;
         display: inline-block;
         vertical-align: middle;
-        color: #3b82f6;
-        filter: drop-shadow(0 0 15px rgba(59, 130, 246, 0.8));
+        color: #60a5fa;
+        filter: drop-shadow(0 0 15px rgba(96, 165, 250, 0.8));
         animation: pulse-star 2s infinite;
+        margin-right: 10px;
     }
     
     @keyframes pulse-star {
         0%, 100% { 
-            filter: drop-shadow(0 0 15px rgba(59, 130, 246, 0.8));
+            filter: drop-shadow(0 0 15px rgba(96, 165, 250, 0.8));
             transform: scale(1);
         }
         50% { 
-            filter: drop-shadow(0 0 25px rgba(59, 130, 246, 1));
+            filter: drop-shadow(0 0 25px rgba(96, 165, 250, 1));
             transform: scale(1.05);
         }
     }
     
     .header-container {
-        text-align: left;
+        text-align: center;
         margin-bottom: 1em;
+        display: flex;
+        align-items: center;
+        justify-content: center;
     }
     
     .stButton>button {
