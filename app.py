@@ -15,7 +15,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 logging.getLogger().setLevel(logging.ERROR)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-st.set_page_config(page_title="BlueStar Sniper Pro V7.0", layout="centered", page_icon="⭐")
+st.set_page_config(page_title="BlueStar Sniper Ultimate 7", layout="centered", page_icon="⭐")
 
 if 'active_zones' not in st.session_state:
     st.session_state.active_zones = {}
@@ -38,17 +38,37 @@ st.markdown("""
         -webkit-text-fill-color: transparent;
         font-weight: 900; 
         font-size: 2.5em; 
-        text-align: center; 
+        text-align: left;
         margin-bottom: 0.3em;
         text-shadow: 0 0 30px rgba(59, 130, 246, 0.3);
+        display: inline-block;
+        vertical-align: middle;
+        margin-left: 15px;
     }
     
     .star-logo {
         font-size: 3em;
-        text-align: center;
-        margin-bottom: 0.2em;
+        display: inline-block;
+        vertical-align: middle;
         color: #3b82f6;
-        filter: drop-shadow(0 0 10px rgba(59, 130, 246, 0.6));
+        filter: drop-shadow(0 0 15px rgba(59, 130, 246, 0.8));
+        animation: pulse-star 2s infinite;
+    }
+    
+    @keyframes pulse-star {
+        0%, 100% { 
+            filter: drop-shadow(0 0 15px rgba(59, 130, 246, 0.8));
+            transform: scale(1);
+        }
+        50% { 
+            filter: drop-shadow(0 0 25px rgba(59, 130, 246, 1));
+            transform: scale(1.05);
+        }
+    }
+    
+    .header-container {
+        text-align: left;
+        margin-bottom: 1em;
     }
     
     .stButton>button {
@@ -57,17 +77,17 @@ st.markdown("""
         height: 3.5em; 
         font-weight: 700; 
         font-size: 1.1em;
-        border: 2px solid rgba(59, 130, 246, 0.3);
+        border: 2px solid rgba(239, 68, 68, 0.5);
         background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
         color: white; 
         transition: all 0.3s ease;
-        box-shadow: 0 4px 15px rgba(37, 99, 235, 0.4);
+        box-shadow: 0 4px 15px rgba(37, 99, 235, 0.4), 0 0 20px rgba(239, 68, 68, 0.2);
     }
     
     .stButton>button:hover {
         transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(59, 130, 246, 0.6);
-        border-color: rgba(96, 165, 250, 0.6);
+        box-shadow: 0 6px 20px rgba(59, 130, 246, 0.6), 0 0 30px rgba(239, 68, 68, 0.4);
+        border-color: rgba(239, 68, 68, 0.7);
     }
     
     .streamlit-expanderHeader { 
@@ -853,7 +873,7 @@ def run_scan_bluestar_v7(api, config):
     logs = []
     
     status = st.empty()
-    status.info("🚀 BlueStar Sniper Pro V7.0 - Scan en cours...")
+    status.info("🚀 BlueStar Sniper Ultimate 7 - Scan en cours...")
     
     args_list = [(sym, api, config) for sym in ASSETS]
     
@@ -956,9 +976,12 @@ def display_signal_v7(s):
 
 
 def main():
-    st.markdown("<div class='star-logo'>⭐</div>", unsafe_allow_html=True)
-    st.title("BlueStar Sniper Pro V7.0 ULTIMATE")
-    st.markdown("<p style='text-align:center;color:#94a3b8;font-size:1.1em;'>ULTIMATE FUSION: H1 Bias → M15 Alignment → M5 PIRM Trigger</p>", unsafe_allow_html=True)
+    st.markdown("""
+    <div class='header-container'>
+        <span class='star-logo'>⭐</span><h1>BLUESTAR SNIPER ULTIMATE 7</h1>
+    </div>
+    <p style='text-align:center;color:#94a3b8;font-size:1.1em;margin-top:-10px;'>ULTIMATE FUSION: H1 Bias → M15 Alignment → M5 PIRM Trigger</p>
+    """, unsafe_allow_html=True)
     
     with st.sidebar:
         st.markdown("<h2 style='color:#60a5fa;'>⚙️ Configuration</h2>", unsafe_allow_html=True)
@@ -1006,7 +1029,7 @@ def main():
         - PDL/PDH
         """)
     
-    if st.button("🔍 LANCER SCAN V7.0"):
+    if st.button("🔍 SCAN ULTIMATE 7"):
         config = {
             'min_score': min_score,
             'min_adx': min_adx,
