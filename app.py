@@ -857,16 +857,20 @@ def run_scan_bluestar_v7(api, config):
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(scan_single_asset, args): args[0] for args in args_list}
         
-        for future in as_completed(futures, timeout=60):
-            try:
-                result = future.result(timeout=10)
-                if isinstance(result, list):
-                    signals.extend(result)
-                elif isinstance(result, str):
-                    logs.append(result)
-            except Exception as e:
-                sym_name = futures.get(future, "Unknown")
-                logs.append(f"Timeout/Error: {sym_name}")
+        try:
+            for future in as_completed(futures, timeout=180):
+                try:
+                    result = future.result(timeout=30)
+                    if isinstance(result, list):
+                        signals.extend(result)
+                    elif isinstance(result, str):
+                        logs.append(result)
+                except Exception as e:
+                    sym_name = futures.get(future, "Unknown")
+                    logs.append(f"Error {sym_name}: {str(e)[:50]}")
+        except Exception as e:
+            # Si timeout global, on retourne ce qu'on a déjà
+            logs.append(f"Scan timeout après 180s - {len(signals)} signaux trouvés")
     
     status.empty()
     return sorted(signals, key=lambda x: x['score'], reverse=True), logs
