@@ -223,7 +223,7 @@ class QuantEngine:
 
     @staticmethod
     def adx_wilder(df, di_length=14, adx_length=14):
-        """ADX Wilder EXACT (comme ton document)"""
+        """ADX Wilder EXACT"""
         high = df['high']
         low = df['low']
         close = df['close']
@@ -267,7 +267,7 @@ class QuantEngine:
 
     @staticmethod
     def calculate_rsi_ohlc4(df, period=10):
-        """RSI 10 OHLC4 pour M5 (GOCRZ Style)"""
+        """RSI 10 OHLC4 pour M5"""
         ohlc4 = (df['open'] + df['high'] + df['low'] + df['close']) / 4
         delta = ohlc4.diff()
         gain = (delta.where(delta > 0, 0)).fillna(0)
@@ -293,26 +293,6 @@ class QuantEngine:
         for i in range(1, len(df)):
             ha_open.iloc[i] = (ha_open.iloc[i-1] + ha_close.iloc[i-1]) / 2
         return ha_open, ha_close
-
-    @staticmethod
-    def detect_structure(df, direction, lookback=20):
-        """Détection HH/HL ou LL/LH"""
-        if len(df) < lookback: return False
-        
-        if direction == "BUY":
-            # HH / HL
-            recent_high = df['high'].iloc[-5:].max()
-            prev_high = df['high'].iloc[-lookback:-5].max()
-            recent_low = df['low'].iloc[-5:].min()
-            prev_low = df['low'].iloc[-lookback:-5].min()
-            return recent_high > prev_high and recent_low > prev_low
-        else:
-            # LL / LH
-            recent_low = df['low'].iloc[-5:].min()
-            prev_low = df['low'].iloc[-lookback:-5].min()
-            recent_high = df['high'].iloc[-5:].max()
-            prev_high = df['high'].iloc[-lookback:-5].max()
-            return recent_low < prev_low and recent_high < prev_high
 
     @staticmethod
     def get_midnight_open_ny(df):
@@ -352,25 +332,26 @@ class QuantEngine:
             return recent_low < prev_low and recent_high < prev_high
 
     @staticmethod
-    def detect_structure(df, direction, lookback=20):
-        """Détection HH/HL (BUY) ou LL/LH (SELL)"""
-        if len(df) < lookback + 5: 
-            return False
+    def detect_structure_zscore(df, lookback=20):
+        """Détection de la déviation standard (Z-Score) pour le range"""
+        if len(df) < lookback: return 0.0, "Pas assez de données"
         
-        if direction == "BUY":
-            # Higher Highs / Higher Lows
-            recent_high = df['high'].iloc[-5:].max()
-            prev_high = df['high'].iloc[-lookback:-5].max()
-            recent_low = df['low'].iloc[-5:].min()
-            prev_low = df['low'].iloc[-lookback:-5].min()
-            return recent_high > prev_high and recent_low > prev_low
-        else:
-            # Lower Lows / Lower Highs
-            recent_low = df['low'].iloc[-5:].min()
-            prev_low = df['low'].iloc[-lookback:-5].min()
-            recent_high = df['high'].iloc[-5:].max()
-            prev_high = df['high'].iloc[-lookback:-5].max()
-            return recent_low < prev_low and recent_high < prev_high
+        # Calcul simple du Z-Score sur le Close
+        series = df['close']
+        mean = series.rolling(lookback).mean().iloc[-1]
+        std = series.rolling(lookback).std().iloc[-1]
+        
+        if std == 0: return 0.0, "Volatilité nulle"
+        
+        z_score = (series.iloc[-1] - mean) / std
+        
+        status = "Neutre"
+        if z_score > 2.0: status = "Extension Haussière (Possible Reversal)"
+        elif z_score < -2.0: status = "Extension Baissière (Possible Reversal)"
+        elif -1.0 <= z_score <= 1.0: status = "Consolidation / Range"
+        else: status = "Tendance Saine"
+            
+        return z_score, status
 
     @staticmethod
     def detect_valid_ob(df, atr, direction):
