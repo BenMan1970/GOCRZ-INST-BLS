@@ -236,6 +236,175 @@ def get_asset_params(symbol):
         return {'type': 'COMMODITY', 'sl_base': 1.8, 'tp_rr': 2.5}
     return {'type': 'FOREX', 'sl_base': 1.5, 'tp_rr': 2.0}
 
+class VolumeProfileEngine:
+    """
+    Institutional-Grade Volume Profile Analysis
+    Utilisé par les hedge funds pour identifier les zones de liquidité
+    """
+    
+    @staticmethod
+    def calculate_volume_profile(df, lookback=100, bins=50):
+        """
+        Calcule le Volume Profile avec POC, VAH, VAL
+        
+        Args:
+            df: DataFrame avec colonnes ['high', 'low', 'close', 'volume']
+            lookback: Nombre de bougies à analyser
+            bins: Nombre de niveaux de prix (plus = précision)
+        
+        Returns:
+            dict avec POC, VAH, VAL, profile_data, hvn_zones, lvn_zones
+        """
+        if len(df) < lookback:
+            return None
+        
+        # Prendre les dernières bougies
+        df_slice = df.iloc[-lookback:].copy()
+        
+        # Définir le range de prix
+        price_min = df_slice['low'].min()
+        price_max = df_slice['high'].max()
+        price_range = price_max - price_min
+        
+        if price_range == 0:
+            return None
+        
+        # Créer les bins de prix
+        bin_size = price_range / bins
+        price_levels = np.linspace(price_min, price_max, bins + 1)
+        
+        # Accumuler le volume à chaque niveau de prix
+        volume_at_price = np.zeros(bins)
+        
+        for idx, row in df_slice.iterrows():
+            candle_low = row['low']
+            candle_high = row['high']
+            candle_volume = row['volume']
+            
+            # Distribuer le volume proportionnellement sur le range de la bougie
+            for i in range(bins):
+                level_low = price_levels[i]
+                level_high = price_levels[i + 1]
+                
+                # Calculer l'intersection entre la bougie et le niveau
+                overlap_low = max(candle_low, level_low)
+                overlap_high = min(candle_high, level_high)
+                
+                if overlap_high > overlap_low:
+                    # Proportion du volume pour ce niveau
+                    overlap_ratio = (overlap_high - overlap_low) / (candle_high - candle_low) if candle_high > candle_low else 1.0
+                    volume_at_price[i] += candle_volume * overlap_ratio
+        
+        # POC (Point of Control) = niveau avec le plus de volume
+        poc_index = np.argmax(volume_at_price)
+        poc_price = (price_levels[poc_index] + price_levels[poc_index + 1]) / 2
+        
+        # Value Area (70% du volume total)
+        total_volume = volume_at_price.sum()
+        target_volume = total_volume * 0.70
+        
+        # Trouver VAH et VAL (expansion depuis POC)
+        accumulated_volume = volume_at_price[poc_index]
+        upper_index = poc_index
+        lower_index = poc_index
+        
+        while accumulated_volume < target_volume and (upper_index < bins - 1 or lower_index > 0):
+            # Étendre vers le haut ou le bas selon où il y a plus de volume
+            upper_vol = volume_at_price[upper_index + 1] if upper_index < bins - 1 else 0
+            lower_vol = volume_at_price[lower_index - 1] if lower_index > 0 else 0
+            
+            if upper_vol > lower_vol and upper_index < bins - 1:
+                upper_index += 1
+                accumulated_volume += upper_vol
+            elif lower_index > 0:
+                lower_index -= 1
+                accumulated_volume += lower_vol
+            else:
+                break
+        
+        vah_price = price_levels[upper_index + 1]
+        val_price = price_levels[lower_index]
+        
+        # High Volume Nodes (HVN) - Zones à fort volume (top 20%)
+        volume_threshold_hvn = np.percentile(volume_at_price, 80)
+        hvn_zones = []
+        
+        for i in range(bins):
+            if volume_at_price[i] >= volume_threshold_hvn:
+                hvn_zones.append({
+                    'price_low': price_levels[i],
+                    'price_high': price_levels[i + 1],
+                    'volume': volume_at_price[i],
+                    'strength': volume_at_price[i] / volume_at_price[poc_index]
+                })
+        
+        # VWAP (Volume Weighted Average Price)
+        vwap = (df_slice['close'] * df_slice['volume']).sum() / df_slice['volume'].sum()
+        
+        # Volume Delta (estimation acheteurs vs vendeurs)
+        bullish_volume = df_slice[df_slice['close'] > df_slice['open']]['volume'].sum()
+        bearish_volume = df_slice[df_slice['close'] < df_slice['open']]['volume'].sum()
+        volume_delta = bullish_volume - bearish_volume
+        volume_delta_ratio = volume_delta / total_volume if total_volume > 0 else 0
+        
+        return {
+            'poc': poc_price,
+            'vah': vah_price,
+            'val': val_price,
+            'vwap': vwap,
+            'hvn_zones': hvn_zones,
+            'volume_delta_ratio': volume_delta_ratio,
+            'total_volume': total_volume,
+        }
+    
+    @staticmethod
+    def validate_zone_with_volume(zone_price_low, zone_price_high, vp_data, min_strength=0.6):
+        """
+        Valide si une zone (OB/FVG) coïncide avec un HVN
+        """
+        if not vp_data:
+            return False, 0
+        
+        zone_mid = (zone_price_low + zone_price_high) / 2
+        
+        for hvn in vp_data['hvn_zones']:
+            if hvn['price_low'] <= zone_mid <= hvn['price_high']:
+                if hvn['strength'] >= min_strength:
+                    return True, hvn['strength']
+        
+        return False, 0
+    
+    @staticmethod
+    def get_institutional_levels(vp_data, current_price):
+        """
+        Identifie les niveaux clés pour les institutionnels
+        """
+        if not vp_data:
+            return {}
+        
+        levels = {}
+        
+        # Position par rapport à la Value Area
+        if vp_data['val'] <= current_price <= vp_data['vah']:
+            levels['position'] = 'INSIDE_VALUE_AREA'
+            levels['bias'] = 'NEUTRAL'
+        elif current_price > vp_data['vah']:
+            levels['position'] = 'ABOVE_VALUE_AREA'
+            levels['bias'] = 'PREMIUM_ZONE'
+        else:
+            levels['position'] = 'BELOW_VALUE_AREA'
+            levels['bias'] = 'DISCOUNT_ZONE'
+        
+        # Pression volume
+        if vp_data['volume_delta_ratio'] > 0.1:
+            levels['volume_pressure'] = 'BULLISH'
+        elif vp_data['volume_delta_ratio'] < -0.1:
+            levels['volume_pressure'] = 'BEARISH'
+        else:
+            levels['volume_pressure'] = 'NEUTRAL'
+        
+        return levels
+
 class QuantEngine:
     @staticmethod
     def calculate_atr_wilder(df, period=14):
@@ -701,6 +870,8 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     # ========================================
     
     zone_text = "NO_ZONE"
+    ob_zone = None
+    fvg_zone = None
     
     if config['use_zones']:
         ob_valid, ob_zone = QuantEngine.detect_valid_ob(df_m5, atr, direction)
@@ -735,10 +906,90 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
             reasons.append("✅ Premium Zone")
     
     # ========================================
+    # PHASE 4.5: VOLUME PROFILE CONFLUENCE (BONUS)
+    # ========================================
+    
+    vp_score = 0
+    vp_info = "NO_VP"
+    vp_details = {}
+    
+    if config.get('use_vp', True):
+        vp_data = VolumeProfileEngine.calculate_volume_profile(df_h1, lookback=100, bins=50)
+        
+        if vp_data:
+            levels = VolumeProfileEngine.get_institutional_levels(vp_data, price)
+            
+            # BONUS 1: Prix près du POC (Point of Control)
+            if abs(price - vp_data['poc']) < atr * 0.3:
+                vp_score += 10
+                vp_info = "POC"
+                reasons.append("⭐ VP: Prix @ POC")
+            
+            # BONUS 2: Order Block dans HVN (High Volume Node)
+            if ob_zone:
+                is_valid, strength = VolumeProfileEngine.validate_zone_with_volume(
+                    ob_zone[0], ob_zone[1], vp_data, min_strength=0.6
+                )
+                if is_valid:
+                    bonus = int(strength * 10)
+                    vp_score += bonus
+                    vp_info = "OB+HVN"
+                    reasons.append(f"⭐ VP: OB dans HVN ({strength:.1f}x)")
+            
+            # BONUS 3: FVG validé par volume
+            if fvg_zone:
+                is_valid, strength = VolumeProfileEngine.validate_zone_with_volume(
+                    fvg_zone[0], fvg_zone[1], vp_data, min_strength=0.5
+                )
+                if is_valid:
+                    bonus = int(strength * 8)
+                    vp_score += bonus
+                    vp_info = "FVG+HVN"
+                    reasons.append(f"⭐ VP: FVG dans HVN ({strength:.1f}x)")
+            
+            # BONUS 4: Position favorable (Discount/Premium selon Value Area)
+            if direction == "BUY" and levels['bias'] == 'DISCOUNT_ZONE':
+                vp_score += 5
+                reasons.append("⭐ VP: Discount Zone")
+            elif direction == "SELL" and levels['bias'] == 'PREMIUM_ZONE':
+                vp_score += 5
+                reasons.append("⭐ VP: Premium Zone")
+            
+            # BONUS 5: Volume Delta aligné avec direction
+            if direction == "BUY" and levels.get('volume_pressure') == 'BULLISH':
+                vp_score += 5
+                reasons.append("⭐ VP: Volume Bullish")
+            elif direction == "SELL" and levels.get('volume_pressure') == 'BEARISH':
+                vp_score += 5
+                reasons.append("⭐ VP: Volume Bearish")
+            
+            # BONUS 6: Prix près VAH/VAL (support/resistance institutionnel)
+            if direction == "BUY" and abs(price - vp_data['val']) < atr * 0.3:
+                vp_score += 5
+                reasons.append("⭐ VP: Prix @ VAL")
+            elif direction == "SELL" and abs(price - vp_data['vah']) < atr * 0.3:
+                vp_score += 5
+                reasons.append("⭐ VP: Prix @ VAH")
+            
+            vp_details = {
+                'poc': vp_data['poc'],
+                'vah': vp_data['vah'],
+                'val': vp_data['val'],
+                'vwap': vp_data['vwap'],
+                'position': levels.get('position', 'N/A'),
+                'volume_pressure': levels.get('volume_pressure', 'N/A'),
+                'delta_ratio': vp_data['volume_delta_ratio']
+            }
+    
+    score += vp_score  # Maximum +30 points bonus
+    
+    # ========================================
     # CLASSIFICATION & TARGETS
     # ========================================
     
-    if score >= 90:
+    if score >= 95:
+        quality = "INSTITUTIONAL ⭐⭐"
+    elif score >= 90:
         quality = "ELITE 🏆"
     elif score >= 80:
         quality = "PREMIUM ⭐"
@@ -762,6 +1013,9 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         "rsi_h1": rsi_h1_val,
         "rsi_m5": rsi_m5_current,
         "hma_m5": hma_m5_current,
+        "vp_score": vp_score,
+        "vp_info": vp_info,
+        "vp_details": vp_details,
     }
     
     return score / 100, details, atr / price * 100, None, {'sl': sl, 'tp': tp}
@@ -914,6 +1168,8 @@ def display_signal_v7(s):
     
     if "ELITE" in d['quality']:
         badge = "<span class='badge badge-elite'>🏆 ELITE</span>"
+    elif "INSTITUTIONAL" in d['quality']:
+        badge = "<span class='badge' style='background:linear-gradient(135deg, #f59e0b 0%, #d97706 100%); animation: pulse-gold 2s infinite;'>⭐⭐ INSTITUTIONAL</span>"
     elif "PREMIUM" in d['quality']:
         badge = "<span class='badge badge-premium'>⭐ PREMIUM</span>"
     else:
@@ -929,7 +1185,7 @@ def display_signal_v7(s):
             <div style='margin-top:12px;'>{badge} {trigger_badge}</div>
         </div>""", unsafe_allow_html=True)
         
-        st.info(f"**Score:** {d['score']}/100 | **Zone:** {d['zone_type']} | **ADX H1:** {d['adx_h1']:.1f} | **ADX M5:** {d['adx_m5']:.1f}")
+        st.info(f"**Score:** {d['score']}/100 | **Zone:** {d['zone_type']} | **ADX H1:** {d['adx_h1']:.1f} | **ADX M5:** {d['adx_m5']:.1f} | **VP:** {d['vp_info']} (+{d['vp_score']})")
         
         st.markdown("### 📋 Confluences Validées")
         col1, col2 = st.columns(2)
@@ -975,6 +1231,22 @@ def display_signal_v7(s):
         
         c4.metric("PDH/PDL", d['pdh_pdl'])
         
+        # Volume Profile Details
+        if d['vp_details']:
+            st.markdown("### 📈 Volume Profile (Institutional)")
+            vp = d['vp_details']
+            col_vp1, col_vp2, col_vp3, col_vp4 = st.columns(4)
+            col_vp1.metric("POC", f"{vp['poc']:.5f}")
+            col_vp2.metric("VAH", f"{vp['vah']:.5f}")
+            col_vp3.metric("VAL", f"{vp['val']:.5f}")
+            col_vp4.metric("Position", vp['position'].replace('_', ' '))
+            
+            col_vp5, col_vp6 = st.columns(2)
+            vol_pressure = vp['volume_pressure']
+            vol_color = "#10b981" if vol_pressure == "BULLISH" else ("#ef4444" if vol_pressure == "BEARISH" else "#94a3b8")
+            col_vp5.markdown(f"**Volume Pressure:** <span style='color:{vol_color};font-weight:700;'>{vol_pressure}</span>", unsafe_allow_html=True)
+            col_vp6.metric("Delta Ratio", f"{vp['delta_ratio']:.2%}")
+        
         st.markdown("### 🎯 Niveaux de Trade")
         col_sl, col_tp = st.columns(2)
         col_sl.error(f"**🛑 STOP LOSS:** {s['sl']:.5f}")
@@ -1007,6 +1279,9 @@ def main():
         use_zones = st.checkbox("🎯 Order Blocks / FVG", value=True,
             help="Active la détection des zones institutionnelles")
         
+        use_vp = st.checkbox("📊 Volume Profile (Institutional)", value=True,
+            help="Ajoute confluence Volume Profile - Niveau Hedge Fund")
+        
         st.markdown("---")
         
         st.info("""
@@ -1033,13 +1308,26 @@ def main():
         - Order Blocks
         - Fair Value Gaps
         - PDL/PDH
+        
+        **Phase 4.5 - Volume Profile:**
+        - POC / VAH / VAL
+        - HVN Confluence
+        - Volume Delta
+        - Institutional Levels
+        
+        **Score:**
+        - 75-79: STANDARD ✅
+        - 80-89: PREMIUM ⭐
+        - 90-94: ELITE 🏆
+        - 95+: INSTITUTIONAL ⭐⭐
         """)
     
     if st.button("🔍 SCAN ULTIMATE 7"):
         config = {
             'min_score': min_score,
             'min_adx': min_adx,
-            'use_zones': use_zones
+            'use_zones': use_zones,
+            'use_vp': use_vp
         }
         
         with st.spinner("⚡ Scan parallèle en cours..."):
@@ -1058,15 +1346,17 @@ def main():
             
             # Statistiques
             elite = sum(1 for r in results if "ELITE" in r['details']['quality'])
+            institutional = sum(1 for r in results if "INSTITUTIONAL" in r['details']['quality'])
             premium = sum(1 for r in results if "PREMIUM" in r['details']['quality'])
-            standard = len(results) - elite - premium
+            standard = len(results) - elite - premium - institutional
             pirm = sum(1 for r in results if r['details']['trigger'] == "PIRM")
             
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("🏆 Elite", elite)
-            col2.metric("⭐ Premium", premium)
-            col3.metric("✅ Standard", standard)
-            col4.metric("🎯 PIRM", pirm)
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("⭐⭐ Institutional", institutional)
+            col2.metric("🏆 Elite", elite)
+            col3.metric("⭐ Premium", premium)
+            col4.metric("✅ Standard", standard)
+            col5.metric("🎯 PIRM", pirm)
             
             st.markdown("---")
             
