@@ -154,14 +154,6 @@ st.markdown("""
         0%, 100% { box-shadow: 0 0 10px rgba(59, 130, 246, 0.4); }
         50% { box-shadow: 0 0 20px rgba(59, 130, 246, 0.8); }
     }
-    
-    .metric-card {
-        background: linear-gradient(135deg, rgba(30, 41, 59, 0.8) 0%, rgba(15, 23, 42, 0.8) 100%);
-        border: 1px solid rgba(59, 130, 246, 0.2);
-        border-radius: 10px;
-        padding: 12px;
-        margin: 5px 0;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -620,6 +612,9 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
     tp = price + (atr * params['tp_rr']) if direction == "BUY" else price - (atr * params['tp_rr'])
     
+    # Heure du signal (M5 candle time)
+    signal_time = pd.to_datetime(df_m5['time'].iloc[-1])
+    
     details = {
         "quality": quality, "score": int(score), "reasons": reasons, "trigger": trigger_type,
         "midnight": f"{midnight_open:.5f}" if midnight_open else "N/A",
@@ -627,7 +622,8 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         "zone_type": "OB" if ob_valid else ("FVG" if fvg_valid else "S/R"),
         "rsi_m5": rsi_m5.iloc[-1], "hma_m5": hma20_m5.iloc[-1],
         "vp_score": vp_score, "vp_info": vp_info, "vp_details": vp_details,
-        "fuel_gap": f"{gap_display:.1f}"
+        "fuel_gap": f"{gap_display:.1f}",
+        "time_str": signal_time.strftime("%H:%M")
     }
     return score / 100, details, atr / price * 100, None, {'sl': sl, 'tp': tp}
 
@@ -746,11 +742,24 @@ def display_signal_v9(s):
                     else: st.info(reason)
                         
         st.markdown("### 📊 Indicateurs & Niveaux")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("RSI M5", f"{d['rsi_m5']:.1f}")
-        c2.metric("HMA M5", f"{d['hma_m5']:.5f}")
-        c3.metric("Midnight", d['midnight'])
-        c4.metric("PDH/PDL", d['pdh_pdl'])
+        # Création du tableau
+        data = {
+            "Métrique": ["Heure Signal", "Prix Actuel", "Score / 100", "RSI M5", "HMA M5", "Spread (pips)", "Midnight", "PDH / PDL", "VP Position", "Fuel Gap"],
+            "Valeur": [
+                d['time_str'],
+                f"{s['price']:.5f}",
+                d['score'],
+                f"{d['rsi_m5']:.1f}",
+                f"{d['hma_m5']:.5f}",
+                f"{s['spread']:.1f}",
+                d['midnight'],
+                d['pdh_pdl'],
+                d['vp_details'].get('position', 'N/A'),
+                d['fuel_gap']
+            ]
+        }
+        df_display = pd.DataFrame(data)
+        st.dataframe(df_display, use_container_width=True, hide_index=True)
         
         if d['vp_details']:
             st.markdown("### 📈 Volume Profile")
@@ -792,12 +801,11 @@ def main():
         **📊 ÉCHELLE DE SCORING**
         
         Les signaux sont calculés sur 4 blocs. 
-        Voici comment qualifier le résultat :
         
         *   **< 50 : STANDARD** -> Setup présent mais manque de Fuel ou de Zone de valeur.
         *   **50 - 74 : PREMIUM** -> Alignement MTF + Fuel correct. Trade solide.
         *   **75 - 89 : ELITE** -> Zone Discount + Fuel Fort + Trigger précis.
-        *   **90+ : INSTITUTIONAL** -> Parfaite confluence (Weekly/Daily + Massive Fuel + HVN).
+        *   **90+ : INSTITUTIONAL** -> Parfaite confluence.
         
         **Les 4 Blocs :**
         1.  **MTF (35%)** : Tendance Weekly > Daily > H1.
