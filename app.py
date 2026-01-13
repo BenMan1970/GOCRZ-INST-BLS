@@ -470,12 +470,6 @@ class QuantEngine:
 
 
 def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direction, live_price, cs_scores, config):
-    """
-    BLUESTAR SNIPER V9.1 - HMA COLOR FILTERED
-    Blocs : MTF (35pts) + Prix (30pts) + Fuel (20pts) + Tech (15pts)
-    MAJ : HMA 20 doit être colorée (Vente/Rouge, Achat/Verte) pour valider le trigger.
-    FIX : Correction calcul fuel_gap pour eviter erreur dict-dict.
-    """
     price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
     atr = QuantEngine.calculate_atr_wilder(df_m5)
     w_open, d_open = df_w['open'].iloc[-1], df_d['open'].iloc[-1]
@@ -484,49 +478,28 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     
     score = 0; reasons = []; trigger_type = "WAIT"
     
-    # SAFETY CHECK
     if df_m5.empty or df_h1.empty or df_d.empty or df_w.empty: return 0, {}, 0, "Données insuffisantes", {}
     if atr < price * 0.0002: return 0, {}, 0, "Volatilité trop faible", {}
 
-    # ==========================================
     # BLOC 1 : CONTEXTE MTF (MAX 35 PTS)
-    # ==========================================
-    # A. Weekly Bias
     w_aligned = (direction == "BUY" and price > w_open) or (direction == "SELL" and price < w_open)
-    if w_aligned: 
-        score += 10
-        reasons.append("📅 Weekly Trend Aligné")
-    else: 
-        score -= 5
+    if w_aligned: score += 10; reasons.append("📅 Weekly Trend Aligné")
+    else: score -= 5
     
-    # B. Daily Bias
     d_aligned = (direction == "BUY" and price > d_open) or (direction == "SELL" and price < d_open)
-    if d_aligned: 
-        score += 10
-        reasons.append("📅 Daily Trend Aligné")
-    else: 
-        score -= 10
+    if d_aligned: score += 10; reasons.append("📅 Daily Trend Aligné")
+    else: score -= 10
     
-    # C. H1 Structure & Trend
     hma50_h1 = QuantEngine.calculate_hma(df_h1['close'], 50)
     h1_trend_aligned = (direction == "BUY" and price > hma50_h1.iloc[-1]) or (direction == "SELL" and price < hma50_h1.iloc[-1])
-    
     if h1_trend_aligned:
-        score += 15
-        reasons.append("🏔️ H1 HMA50 Aligné")
-        if QuantEngine.detect_structure(df_h1, direction):
-            score += 5
-            reasons.append("🏗️ Structure H1 Confirmée")
+        score += 15; reasons.append("🏔️ H1 HMA50 Aligné")
+        if QuantEngine.detect_structure(df_h1, direction): score += 5; reasons.append("🏗️ Structure H1 Confirmée")
     else:
-        if d_aligned and not h1_trend_aligned: 
-            score -= 15
-            reasons.append("⚠️ CONFLIT H1 vs Daily")
-        else: 
-            score -= 5
+        if d_aligned and not h1_trend_aligned: score -= 15; reasons.append("⚠️ CONFLIT H1 vs Daily")
+        else: score -= 5
 
-    # ==========================================
     # BLOC 2 : VALEUR DU PRIX (MAX 30 PTS)
-    # ==========================================
     price_zone_score = 0
     if direction == "BUY":
         if price < pdl: price_zone_score = 30; reasons.append("💎 ZONE DISCOUNT (PDL)")
@@ -540,17 +513,13 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         elif midnight_open and price < midnight_open: price_zone_score = -5; reasons.append("⚠️ En-dessous Midnight")
     score += price_zone_score
 
-    # ==========================================
     # BLOC 3 : FUEL & FORCE (MAX 20 PTS)
-    # ==========================================
     fuel_score = 0
     if "_" in symbol and cs_scores:
         base, quote = symbol.split('_')
-        # Fix extraction dict -> value
         b_force = cs_scores.get(base, {}).get('force', 5.0)
         q_force = cs_scores.get(quote, {}).get('force', 5.0)
         gap = b_force - q_force
-        
         if direction == "BUY":
             if gap > 2.5: fuel_score = 20; reasons.append(f"🚀 FORCE MASSIVE (Gap {gap:.1f})")
             elif gap > 1.0: fuel_score = 10; reasons.append(f"💪 FORCE Alignée (Gap {gap:.1f})")
@@ -563,15 +532,12 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
             else: fuel_score = -20; reasons.append(f"⚠️ FORCE CONTRE (Gap {gap:.1f})")
     score += fuel_score
 
-    # ==========================================
     # BLOC 4 : TRIGGER TECHNIQUE (MAX 15 PTS)
-    # ==========================================
     tech_score = 0
     hma20_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
     rsi_m5 = QuantEngine.calculate_rsi_ohlc4(df_m5, 10)
     ha_o_m5, ha_c_m5 = QuantEngine.get_ha_ohlc(df_m5)
     
-    # V9.1: Détermination de la couleur HMA 20
     hma20_slope_up = hma20_m5.iloc[-1] > hma20_m5.iloc[-2]
     hma20_is_green = hma20_slope_up
     hma20_is_red = not hma20_slope_up
@@ -584,9 +550,7 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     elif fvg_valid:
         tech_score += 12; reasons.append("🚀 FVG (Trigger)"); trigger_type = "FVG_ENTRY"
     else:
-        # LOGIQUE HMA 20 COLORÉE V9.1
         if direction == "BUY":
-            # Le prix doit toucher l'HMA 20 ET l'HMA 20 doit être VERTE
             touches_hma = (df_m5['low'].iloc[-3:] <= hma20_m5.iloc[-1] * 1.001).any()
             if touches_hma:
                 if hma20_is_green:
@@ -594,10 +558,9 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
                     reasons.append("📉 Support HMA 20 (Verte)")
                     trigger_type = "HMA_BOUNCE"
                 else:
-                    tech_score += 2 # Score très bas si mauvaise couleur
+                    tech_score += 2
                     reasons.append("🔻 HMA 20 Rouge (Risque)")
         else: # SELL
-            # Le prix doit toucher l'HMA 20 ET l'HMA 20 doit être ROUGE
             touches_hma = (df_m5['high'].iloc[-3:] >= hma20_m5.iloc[-1] * 0.999).any()
             if touches_hma:
                 if hma20_is_red:
@@ -607,28 +570,17 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
                 else:
                     tech_score += 2
                     reasons.append("🔺 HMA 20 Verte (Risque)")
-        
-        # Si pas de touch HMA, on regarde juste le momentum basique (peu de points)
-        if tech_score == 0: 
-            tech_score += 2
+        if tech_score == 0: tech_score += 2
     
-    # Momentum RSI / HA
     if direction == "BUY":
-        if rsi_m5.iloc[-1] > rsi_m5.iloc[-2] and rsi_m5.iloc[-1] < 70: 
-            tech_score += 3
-        if ha_c_m5.iloc[-1] > ha_o_m5.iloc[-1]: 
-            tech_score += 2
+        if rsi_m5.iloc[-1] > rsi_m5.iloc[-2] and rsi_m5.iloc[-1] < 70: tech_score += 3
+        if ha_c_m5.iloc[-1] > ha_o_m5.iloc[-1]: tech_score += 2
     else:
-        if rsi_m5.iloc[-1] < rsi_m5.iloc[-2] and rsi_m5.iloc[-1] > 30: 
-            tech_score += 3
-        if ha_c_m5.iloc[-1] < ha_o_m5.iloc[-1]: 
-            tech_score += 2
-            
+        if rsi_m5.iloc[-1] < rsi_m5.iloc[-2] and rsi_m5.iloc[-1] > 30: tech_score += 3
+        if ha_c_m5.iloc[-1] < ha_o_m5.iloc[-1]: tech_score += 2
     score += tech_score
 
-    # ==========================================
     # BONUS : VOLUME PROFILE
-    # ==========================================
     vp_score = 0; vp_info = "NO_VP"; vp_details = {}
     if config.get('use_vp', True):
         vp_data = VolumeProfileEngine.calculate_volume_profile(df_h1, lookback=100, bins=50)
@@ -650,10 +602,7 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
             }
     score += vp_score
 
-    # ==========================================
-    # CLASSIFICATION & EXPORT (avec FIX FUEL GAP)
-    # ==========================================
-    # Calcul sécurisé pour l'affichage
+    # CLASSIFICATION & EXPORT
     gap_display = 0.0
     if cs_scores:
         base_sym = symbol.split('_')[0]; quote_sym = symbol.split('_')[1]
@@ -826,45 +775,51 @@ def main():
     <div class='header-container'>
         <span class='star-logo'>⭐</span><h1>BLUESTAR SNIPER V9.1</h1>
     </div>
-    <p style='text-align:center;color:#94a3b8;font-size:1.1em;margin-top:-10px;'>LOGIQUE GOVERNOR : MTF (35%) + PRIX (30%) + FUEL (20%) + TECH (15%)</p>
     """, unsafe_allow_html=True)
     
     with st.sidebar:
-        st.markdown("<h2 style='color:#60a5fa;'>⚙️ Configuration V9.1</h2>", unsafe_allow_html=True)
+        st.markdown("<h2 style='color:#60a5fa;'>⚙️ Configuration</h2>", unsafe_allow_html=True)
         
-        min_score = st.slider("🎯 Score Minimum", 20, 100, 40, 5, help="20-39: Avoid | 40-59: Standard | 60-79: Premium | 80+: Elite/Inst.")
+        min_score = st.slider("🎯 Score Minimum", 20, 100, 40, 5)
         
         st.markdown("---")
         st.markdown("<h3 style='color:#60a5fa;'>Zones & Profils</h3>", unsafe_allow_html=True)
         
-        use_vp = st.checkbox("📊 Volume Profile (Institutional)", value=True, help="Ajoute +10pts si confluence HVN")
+        use_vp = st.checkbox("📊 Volume Profile (Institutional)", value=True)
         
         st.markdown("---")
         st.info("""
-        **⚖️ Logique V9.1 : HMA 20 Colorée**
+        **📊 ÉCHELLE DE SCORING**
         
-        Le Trigger HMA 20 M5 n'accorde les points (+8) que si :
-        - **BUY** : Prix touche HMA 20 + HMA 20 **VERTE**.
-        - **SELL** : Prix touche HMA 20 + HMA 20 **ROUGE**.
+        Les signaux sont calculés sur 4 blocs. 
+        Voici comment qualifier le résultat :
         
-        Si la couleur est mauvaise : Trigger faible (+2pts).
+        *   **< 50 : STANDARD** -> Setup présent mais manque de Fuel ou de Zone de valeur.
+        *   **50 - 74 : PREMIUM** -> Alignement MTF + Fuel correct. Trade solide.
+        *   **75 - 89 : ELITE** -> Zone Discount + Fuel Fort + Trigger précis.
+        *   **90+ : INSTITUTIONAL** -> Parfaite confluence (Weekly/Daily + Massive Fuel + HVN).
+        
+        **Les 4 Blocs :**
+        1.  **MTF (35%)** : Tendance Weekly > Daily > H1.
+        2.  **Prix (30%)** : Zone Discount (PDL/PDH) > Premium.
+        3.  **Fuel (20%)** : Force des devises (Gap > 2.5).
+        4.  **Tech (15%)** : Trigger OB/FVG ou HMA Colorée.
         """)
     
     if st.button("🔍 SCANNER V9.1"):
         config = {'min_score': min_score, 'use_vp': use_vp}
         
-        with st.spinner("⚡ Analyse des biais MTF et filtre HMA Color..."):
+        with st.spinner("⚡ Scan en cours..."):
             api = OandaClient()
             signals, logs = run_scan_bluestar_v9(api, config)
         
         if not signals:
-            st.warning("⚠️ Aucun setup Sniper détecté. Vérifiez les filtres (HMA couleur, Fuel, Zone Prix).")
+            st.warning("⚠️ Aucun setup détecté.")
             if logs:
                 with st.expander("📜 Logs"):
-                    for log in logs:
-                        st.write(log)
+                    for log in logs: st.write(log)
         else:
-            st.success(f"✅ Scan terminé : {len(signals)} opportunité(s) Sniper trouvée(s).")
+            st.success(f"✅ Scan terminé : {len(signals)} opportunité(s).")
             for s in signals:
                 display_signal_v9(s)
 
