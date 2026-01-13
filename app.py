@@ -276,11 +276,9 @@ class VolumeProfileEngine:
             upper_vol = volume_at_price[upper_index + 1] if upper_index < bins - 1 else 0
             lower_vol = volume_at_price[lower_index - 1] if lower_index > 0 else 0
             if upper_vol > lower_vol and upper_index < bins - 1:
-                upper_index += 1
-                accumulated_volume += upper_vol
+                upper_index += 1; accumulated_volume += upper_vol
             elif lower_index > 0:
-                lower_index -= 1
-                accumulated_volume += lower_vol
+                lower_index -= 1; accumulated_volume += lower_vol
             else: break
         
         vah_price = price_levels[upper_index + 1]
@@ -476,6 +474,7 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     BLUESTAR SNIPER V9.1 - HMA COLOR FILTERED
     Blocs : MTF (35pts) + Prix (30pts) + Fuel (20pts) + Tech (15pts)
     MAJ : HMA 20 doit être colorée (Vente/Rouge, Achat/Verte) pour valider le trigger.
+    FIX : Correction calcul fuel_gap pour eviter erreur dict-dict.
     """
     price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
     atr = QuantEngine.calculate_atr_wilder(df_m5)
@@ -530,31 +529,15 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     # ==========================================
     price_zone_score = 0
     if direction == "BUY":
-        if price < pdl: 
-            price_zone_score = 30
-            reasons.append("💎 ZONE DISCOUNT (PDL)")
-        elif midnight_open and price < midnight_open: 
-            price_zone_score = 25
-            reasons.append("💎 ZONE DISCOUNT (Midnight)")
-        elif price > pdh: 
-            price_zone_score = -30
-            reasons.append("🚫 ZONE PREMIUM (PDH) - RISKY")
-        elif midnight_open and price > midnight_open: 
-            price_zone_score = -5
-            reasons.append("⚠️ Au-dessus Midnight")
+        if price < pdl: price_zone_score = 30; reasons.append("💎 ZONE DISCOUNT (PDL)")
+        elif midnight_open and price < midnight_open: price_zone_score = 25; reasons.append("💎 ZONE DISCOUNT (Midnight)")
+        elif price > pdh: price_zone_score = -30; reasons.append("🚫 ZONE PREMIUM (PDH) - RISKY")
+        elif midnight_open and price > midnight_open: price_zone_score = -5; reasons.append("⚠️ Au-dessus Midnight")
     else: # SELL
-        if price > pdh: 
-            price_zone_score = 30
-            reasons.append("💎 ZONE DISCOUNT (PDH)")
-        elif midnight_open and price > midnight_open: 
-            price_zone_score = 25
-            reasons.append("💎 ZONE DISCOUNT (Midnight)")
-        elif price < pdl: 
-            price_zone_score = -30
-            reasons.append("🚫 ZONE PREMIUM (PDL) - RISKY")
-        elif midnight_open and price < midnight_open: 
-            price_zone_score = -5
-            reasons.append("⚠️ En-dessous Midnight")
+        if price > pdh: price_zone_score = 30; reasons.append("💎 ZONE DISCOUNT (PDH)")
+        elif midnight_open and price > midnight_open: price_zone_score = 25; reasons.append("💎 ZONE DISCOUNT (Midnight)")
+        elif price < pdl: price_zone_score = -30; reasons.append("🚫 ZONE PREMIUM (PDL) - RISKY")
+        elif midnight_open and price < midnight_open: price_zone_score = -5; reasons.append("⚠️ En-dessous Midnight")
     score += price_zone_score
 
     # ==========================================
@@ -563,34 +546,21 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     fuel_score = 0
     if "_" in symbol and cs_scores:
         base, quote = symbol.split('_')
-        b_force = cs_scores.get(base, {'force': 5.0})['force']
-        q_force = cs_scores.get(quote, {'force': 5.0})['force']
+        # Fix extraction dict -> value
+        b_force = cs_scores.get(base, {}).get('force', 5.0)
+        q_force = cs_scores.get(quote, {}).get('force', 5.0)
         gap = b_force - q_force
         
         if direction == "BUY":
-            if gap > 2.5: 
-                fuel_score = 20
-                reasons.append(f"🚀 FORCE MASSIVE (Gap {gap:.1f})")
-            elif gap > 1.0: 
-                fuel_score = 10
-                reasons.append(f"💪 FORCE Alignée (Gap {gap:.1f})")
-            elif gap > 0: 
-                fuel_score = 0
-            else: 
-                fuel_score = -20
-                reasons.append(f"⚠️ FORCE CONTRE (Gap {gap:.1f})")
+            if gap > 2.5: fuel_score = 20; reasons.append(f"🚀 FORCE MASSIVE (Gap {gap:.1f})")
+            elif gap > 1.0: fuel_score = 10; reasons.append(f"💪 FORCE Alignée (Gap {gap:.1f})")
+            elif gap > 0: fuel_score = 0
+            else: fuel_score = -20; reasons.append(f"⚠️ FORCE CONTRE (Gap {gap:.1f})")
         else: # SELL
-            if gap < -2.5: 
-                fuel_score = 20
-                reasons.append(f"🚀 FORCE MASSIVE (Gap {gap:.1f})")
-            elif gap < -1.0: 
-                fuel_score = 10
-                reasons.append(f"💪 FORCE Alignée (Gap {gap:.1f})")
-            elif gap < 0: 
-                fuel_score = 0
-            else: 
-                fuel_score = -20
-                reasons.append(f"⚠️ FORCE CONTRE (Gap {gap:.1f})")
+            if gap < -2.5: fuel_score = 20; reasons.append(f"🚀 FORCE MASSIVE (Gap {gap:.1f})")
+            elif gap < -1.0: fuel_score = 10; reasons.append(f"💪 FORCE Alignée (Gap {gap:.1f})")
+            elif gap < 0: fuel_score = 0
+            else: fuel_score = -20; reasons.append(f"⚠️ FORCE CONTRE (Gap {gap:.1f})")
     score += fuel_score
 
     # ==========================================
@@ -610,13 +580,9 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     fvg_valid, fvg_zone = QuantEngine.detect_fvg(df_m5, atr, direction)
     
     if ob_valid:
-        tech_score += 15
-        reasons.append("🏗️ ORDER BLOCK (Trigger)"); 
-        trigger_type = "OB_ENTRY"
+        tech_score += 15; reasons.append("🏗️ ORDER BLOCK (Trigger)"); trigger_type = "OB_ENTRY"
     elif fvg_valid:
-        tech_score += 12
-        reasons.append("🚀 FVG (Trigger)"); 
-        trigger_type = "FVG_ENTRY"
+        tech_score += 12; reasons.append("🚀 FVG (Trigger)"); trigger_type = "FVG_ENTRY"
     else:
         # LOGIQUE HMA 20 COLORÉE V9.1
         if direction == "BUY":
@@ -685,8 +651,16 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     score += vp_score
 
     # ==========================================
-    # CLASSIFICATION & EXPORT
+    # CLASSIFICATION & EXPORT (avec FIX FUEL GAP)
     # ==========================================
+    # Calcul sécurisé pour l'affichage
+    gap_display = 0.0
+    if cs_scores:
+        base_sym = symbol.split('_')[0]; quote_sym = symbol.split('_')[1]
+        b_f_val = cs_scores.get(base_sym, {}).get('force', 5.0)
+        q_f_val = cs_scores.get(quote_sym, {}).get('force', 5.0)
+        gap_display = b_f_val - q_f_val
+
     if score >= 85: quality = "INSTITUTIONAL ⭐⭐"
     elif score >= 70: quality = "ELITE 🏆"
     elif score >= 50: quality = "PREMIUM ⭐"
@@ -704,7 +678,7 @@ def calculate_signal_bluestar_v9(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         "zone_type": "OB" if ob_valid else ("FVG" if fvg_valid else "S/R"),
         "rsi_m5": rsi_m5.iloc[-1], "hma_m5": hma20_m5.iloc[-1],
         "vp_score": vp_score, "vp_info": vp_info, "vp_details": vp_details,
-        "fuel_gap": f"{(cs_scores.get(symbol.split('_')[0],5) - cs_scores.get(symbol.split('_')[1],5)) if cs_scores else 0:.1f}"
+        "fuel_gap": f"{gap_display:.1f}"
     }
     return score / 100, details, atr / price * 100, None, {'sl': sl, 'tp': tp}
 
@@ -858,14 +832,12 @@ def main():
     with st.sidebar:
         st.markdown("<h2 style='color:#60a5fa;'>⚙️ Configuration V9.1</h2>", unsafe_allow_html=True)
         
-        min_score = st.slider("🎯 Score Minimum", 20, 100, 40, 5,
-            help="20-39: Avoid | 40-59: Standard | 60-79: Premium | 80+: Elite/Inst.")
+        min_score = st.slider("🎯 Score Minimum", 20, 100, 40, 5, help="20-39: Avoid | 40-59: Standard | 60-79: Premium | 80+: Elite/Inst.")
         
         st.markdown("---")
         st.markdown("<h3 style='color:#60a5fa;'>Zones & Profils</h3>", unsafe_allow_html=True)
         
-        use_vp = st.checkbox("📊 Volume Profile (Institutional)", value=True,
-            help="Ajoute +10pts si confluence HVN")
+        use_vp = st.checkbox("📊 Volume Profile (Institutional)", value=True, help="Ajoute +10pts si confluence HVN")
         
         st.markdown("---")
         st.info("""
