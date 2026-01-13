@@ -15,7 +15,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 logging.getLogger().setLevel(logging.ERROR)
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-st.set_page_config(page_title="BlueStar Sniper Ultimate 7", layout="centered", page_icon="⭐")
+st.set_page_config(page_title="BlueStar Scanner Ultimate 7 (Mode Setup)", layout="centered", page_icon="🔍")
 
 if 'active_zones' not in st.session_state:
     st.session_state.active_zones = {}
@@ -37,7 +37,7 @@ st.markdown("""
         -webkit-background-clip: text; 
         -webkit-text-fill-color: transparent;
         font-weight: 900; 
-        font-size: 2.5em; 
+        font-size: 2.2em; 
         text-align: left;
         margin-bottom: 0.3em;
         text-shadow: 0 0 30px rgba(59, 130, 246, 0.3);
@@ -141,7 +141,11 @@ st.markdown("""
         animation: pulse-blue 2s infinite;
     }
     
-    .badge-pirm {
+    .badge-watch {
+        background: linear-gradient(135deg, #fbbf24 0%, #d97706 100%);
+    }
+    
+    .badge-standard {
         background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
     }
     
@@ -153,14 +157,6 @@ st.markdown("""
     @keyframes pulse-blue {
         0%, 100% { box-shadow: 0 0 10px rgba(59, 130, 246, 0.4); }
         50% { box-shadow: 0 0 20px rgba(59, 130, 246, 0.8); }
-    }
-    
-    .metric-card {
-        background: linear-gradient(135deg, rgba(30, 41, 59, 0.8) 0%, rgba(15, 23, 42, 0.8) 100%);
-        border: 1px solid rgba(59, 130, 246, 0.2);
-        border-radius: 10px;
-        padding: 12px;
-        margin: 5px 0;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -239,29 +235,14 @@ def get_asset_params(symbol):
 class VolumeProfileEngine:
     """
     Institutional-Grade Volume Profile Analysis
-    Utilisé par les hedge funds pour identifier les zones de liquidité
     """
     
     @staticmethod
     def calculate_volume_profile(df, lookback=100, bins=50):
-        """
-        Calcule le Volume Profile avec POC, VAH, VAL
-        
-        Args:
-            df: DataFrame avec colonnes ['high', 'low', 'close', 'volume']
-            lookback: Nombre de bougies à analyser
-            bins: Nombre de niveaux de prix (plus = précision)
-        
-        Returns:
-            dict avec POC, VAH, VAL, profile_data, hvn_zones, lvn_zones
-        """
         if len(df) < lookback:
             return None
         
-        # Prendre les dernières bougies
         df_slice = df.iloc[-lookback:].copy()
-        
-        # Définir le range de prix
         price_min = df_slice['low'].min()
         price_max = df_slice['high'].max()
         price_range = price_max - price_min
@@ -269,11 +250,8 @@ class VolumeProfileEngine:
         if price_range == 0:
             return None
         
-        # Créer les bins de prix
         bin_size = price_range / bins
         price_levels = np.linspace(price_min, price_max, bins + 1)
-        
-        # Accumuler le volume à chaque niveau de prix
         volume_at_price = np.zeros(bins)
         
         for idx, row in df_slice.iterrows():
@@ -281,42 +259,35 @@ class VolumeProfileEngine:
             candle_high = row['high']
             candle_volume = row['volume']
             
-            # Distribuer le volume proportionnellement sur le range de la bougie
             for i in range(bins):
                 level_low = price_levels[i]
                 level_high = price_levels[i + 1]
                 
-                # Calculer l'intersection entre la bougie et le niveau
                 overlap_low = max(candle_low, level_low)
                 overlap_high = min(candle_high, level_high)
                 
                 if overlap_high > overlap_low:
-                    # Proportion du volume pour ce niveau
                     overlap_ratio = (overlap_high - overlap_low) / (candle_high - candle_low) if candle_high > candle_low else 1.0
                     volume_at_price[i] += candle_volume * overlap_ratio
         
-        # POC (Point of Control) = niveau avec le plus de volume
         poc_index = np.argmax(volume_at_price)
         poc_price = (price_levels[poc_index] + price_levels[poc_index + 1]) / 2
         
-        # Value Area (70% du volume total)
         total_volume = volume_at_price.sum()
         target_volume = total_volume * 0.70
         
-        # Trouver VAH et VAL (expansion depuis POC)
         accumulated_volume = volume_at_price[poc_index]
         upper_index = poc_index
         lower_index = poc_index
         
         while accumulated_volume < target_volume and (upper_index < bins - 1 or lower_index > 0):
-            # Étendre vers le haut ou le bas selon où il y a plus de volume
             upper_vol = volume_at_price[upper_index + 1] if upper_index < bins - 1 else 0
             lower_vol = volume_at_price[lower_index - 1] if lower_index > 0 else 0
             
             if upper_vol > lower_vol and upper_index < bins - 1:
                 upper_index += 1
                 accumulated_volume += upper_vol
-            elif lower_index > 0:
+            elif lower_vol > 0:
                 lower_index -= 1
                 accumulated_volume += lower_vol
             else:
@@ -325,7 +296,6 @@ class VolumeProfileEngine:
         vah_price = price_levels[upper_index + 1]
         val_price = price_levels[lower_index]
         
-        # High Volume Nodes (HVN) - Zones à fort volume (top 20%)
         volume_threshold_hvn = np.percentile(volume_at_price, 80)
         hvn_zones = []
         
@@ -338,10 +308,8 @@ class VolumeProfileEngine:
                     'strength': volume_at_price[i] / volume_at_price[poc_index]
                 })
         
-        # VWAP (Volume Weighted Average Price)
         vwap = (df_slice['close'] * df_slice['volume']).sum() / df_slice['volume'].sum()
         
-        # Volume Delta (estimation acheteurs vs vendeurs)
         bullish_volume = df_slice[df_slice['close'] > df_slice['open']]['volume'].sum()
         bearish_volume = df_slice[df_slice['close'] < df_slice['open']]['volume'].sum()
         volume_delta = bullish_volume - bearish_volume
@@ -359,9 +327,6 @@ class VolumeProfileEngine:
     
     @staticmethod
     def validate_zone_with_volume(zone_price_low, zone_price_high, vp_data, min_strength=0.6):
-        """
-        Valide si une zone (OB/FVG) coïncide avec un HVN
-        """
         if not vp_data:
             return False, 0
         
@@ -376,15 +341,11 @@ class VolumeProfileEngine:
     
     @staticmethod
     def get_institutional_levels(vp_data, current_price):
-        """
-        Identifie les niveaux clés pour les institutionnels
-        """
         if not vp_data:
             return {}
         
         levels = {}
         
-        # Position par rapport à la Value Area
         if vp_data['val'] <= current_price <= vp_data['vah']:
             levels['position'] = 'INSIDE_VALUE_AREA'
             levels['bias'] = 'NEUTRAL'
@@ -395,7 +356,6 @@ class VolumeProfileEngine:
             levels['position'] = 'BELOW_VALUE_AREA'
             levels['bias'] = 'DISCOUNT_ZONE'
         
-        # Pression volume
         if vp_data['volume_delta_ratio'] > 0.1:
             levels['volume_pressure'] = 'BULLISH'
         elif vp_data['volume_delta_ratio'] < -0.1:
@@ -423,20 +383,17 @@ class QuantEngine:
         low = df['low']
         close = df['close']
         
-        # 1. Directional Movement
         up = high.diff()
         down = -low.diff()
         plus_dm = np.where((up > down) & (up > 0), up, 0.0)
         minus_dm = np.where((down > up) & (down > 0), down, 0.0)
         
-        # 2. True Range
         tr = pd.concat([
             high - low,
             (high - close.shift()).abs(),
             (low - close.shift()).abs()
         ], axis=1).max(axis=1)
         
-        # 3. RMA (Wilder's Moving Average)
         def rma(series, length):
             return series.ewm(alpha=1/length, adjust=False).mean()
         
@@ -444,7 +401,6 @@ class QuantEngine:
         plus_di = 100 * rma(pd.Series(plus_dm), di_length) / atr
         minus_di = 100 * rma(pd.Series(minus_dm), di_length) / atr
         
-        # 4. ADX
         dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
         adx = rma(dx, adx_length)
         
@@ -512,14 +468,12 @@ class QuantEngine:
             return False
         
         if direction == "BUY":
-            # Higher Highs / Higher Lows
             recent_high = df['high'].iloc[-5:].max()
             prev_high = df['high'].iloc[-lookback:-5].max()
             recent_low = df['low'].iloc[-5:].min()
             prev_low = df['low'].iloc[-lookback:-5].min()
             return recent_high > prev_high and recent_low > prev_low
         else:
-            # Lower Lows / Lower Highs
             recent_low = df['low'].iloc[-5:].min()
             prev_low = df['low'].iloc[-lookback:-5].min()
             recent_high = df['high'].iloc[-5:].max()
@@ -531,7 +485,6 @@ class QuantEngine:
         """Détection de la déviation standard (Z-Score) pour le range"""
         if len(df) < lookback: return 0.0, "Pas assez de données"
         
-        # Calcul simple du Z-Score sur le Close
         series = df['close']
         mean = series.rolling(lookback).mean().iloc[-1]
         std = series.rolling(lookback).std().iloc[-1]
@@ -541,8 +494,8 @@ class QuantEngine:
         z_score = (series.iloc[-1] - mean) / std
         
         status = "Neutre"
-        if z_score > 2.0: status = "Extension Haussière (Possible Reversal)"
-        elif z_score < -2.0: status = "Extension Baissière (Possible Reversal)"
+        if z_score > 2.0: status = "Extension Haussière"
+        elif z_score < -2.0: status = "Extension Baissière"
         elif -1.0 <= z_score <= 1.0: status = "Consolidation / Range"
         else: status = "Tendance Saine"
             
@@ -644,10 +597,11 @@ class QuantEngine:
         
         return False, None
 
-def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direction, live_price, cs_scores, config):
+def calculate_signal_bluestar_scanner(df_m5, df_m15, df_h1, df_d, df_w, symbol, direction, live_price, cs_scores, config):
     """
-    BlueStar Sniper Pro V7.0 - FUSION ULTIME
-    Combine: Logique stricte + PIRM Trigger + Zones institutionnelles
+    BlueStar Scanner Mode V7.1
+    Logique: SCORING au lieu de REJET.
+    L'objectif est de détecter les SETUPS, pas l'exécution parfaite.
     """
     
     price = live_price if live_price > 0 else df_m5['close'].iloc[-1]
@@ -657,216 +611,211 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
     
     score = 0
     reasons = []
-    trigger_type = "STANDARD"
+    trigger_type = "SCANNER"
     
     # ========================================
-    # PHASE 1: BIAIS H1 (PRÉREQUIS OBLIGATOIRES)
+    # PHASE 1: BIAIS H1 (SCORING)
     # ========================================
     
-    # 1. ADX Wilder > seuil
+    # 1. ADX Wilder
     adx_h1, plus_di_h1, minus_di_h1 = QuantEngine.adx_wilder(df_h1, 14, 14)
     
-    if adx_h1 < config['min_adx']:
-        return 0, {}, 0, f"ADX {adx_h1:.1f} < {config['min_adx']}", {}
-    
-    score += 15
-    reasons.append(f"✅ ADX Wilder {adx_h1:.1f}")
+    if adx_h1 >= config['min_adx']:
+        score += 15
+        reasons.append(f"✅ ADX H1 {adx_h1:.1f} Fort")
+    else:
+        score -= 10  # Pénalité légère
+        reasons.append(f"⚠️ ADX Faible ({adx_h1:.1f})")
     
     # 2. Structure HH/HL ou LL/LH
-    if not QuantEngine.detect_structure(df_h1, direction, lookback=20):
-        return 0, {}, 0, "Structure H1 invalide", {}
-    
-    score += 10
-    reasons.append("✅ Structure H1 (HH/HL)" if direction == "BUY" else "✅ Structure H1 (LL/LH)")
+    if QuantEngine.detect_structure(df_h1, direction, lookback=20):
+        score += 15
+        reasons.append("✅ Structure H1 Parfaite")
+    else:
+        score -= 10
+        reasons.append("⚠️ Structure H1 Hésitante")
     
     # 3. HMA 50 H1 + Position prix
     hma50_h1 = QuantEngine.calculate_hma(df_h1['close'], 50)
-    if len(hma50_h1) < 3:
-        return 0, {}, 0, "HMA H1 données insuffisantes", {}
-    
     price_h1 = df_h1['close'].iloc[-1]
     
     if direction == "BUY":
-        if price_h1 <= hma50_h1.iloc[-1]:
-            return 0, {}, 0, "Prix sous HMA 50 (H1)", {}
+        if price_h1 > hma50_h1.iloc[-1]:
+            score += 10
+            reasons.append("✅ Prix > HMA 50")
+        else:
+            score -= 10
+            reasons.append("⚠️ Prix sous HMA 50 (Contre)")
     else:
-        if price_h1 >= hma50_h1.iloc[-1]:
-            return 0, {}, 0, "Prix sur HMA 50 (H1)", {}
+        if price_h1 < hma50_h1.iloc[-1]:
+            score += 10
+            reasons.append("✅ Prix < HMA 50")
+        else:
+            score -= 10
+            reasons.append("⚠️ Prix sur HMA 50 (Contre)")
     
-    score += 10
-    reasons.append("✅ HMA 50 + Prix OK")
-    
-    # 4. RSI 14 H1 > 50 (BUY) ou < 50 (SELL)
+    # 4. RSI 14 H1
     rsi_h1 = QuantEngine.calculate_rsi_standard(df_h1['close'], 14)
-    if len(rsi_h1) < 2:
-        return 0, {}, 0, "RSI H1 insuffisant", {}
-    
     rsi_h1_val = rsi_h1.iloc[-1]
     
-    if direction == "BUY" and rsi_h1_val <= 50:
-        return 0, {}, 0, f"RSI H1 {rsi_h1_val:.1f} <= 50", {}
-    if direction == "SELL" and rsi_h1_val >= 50:
-        return 0, {}, 0, f"RSI H1 {rsi_h1_val:.1f} >= 50", {}
-    
-    score += 10
-    reasons.append(f"✅ RSI H1 {rsi_h1_val:.1f}")
+    if direction == "BUY":
+        if rsi_h1_val > 50:
+            score += 10
+            reasons.append(f"✅ RSI H1 {rsi_h1_val:.1f}")
+        else:
+            score -= 5
+            reasons.append(f"⚠️ RSI H1 {rsi_h1_val:.1f} (Bearish)")
+    else:
+        if rsi_h1_val < 50:
+            score += 10
+            reasons.append(f"✅ RSI H1 {rsi_h1_val:.1f}")
+        else:
+            score -= 5
+            reasons.append(f"⚠️ RSI H1 {rsi_h1_val:.1f} (Bullish)")
     
     # ========================================
-    # PHASE 2: ALIGNEMENT M15
+    # PHASE 2: ALIGNEMENT M15 (SCORING)
     # ========================================
     
-    # 5. HMA 20 M15 alignée
     hma20_m15 = QuantEngine.calculate_hma(df_m15['close'], 20)
-    if len(hma20_m15) < 3:
-        return 0, {}, 0, "HMA M15 insuffisant", {}
-    
     hma_m15_slope_up = hma20_m15.iloc[-1] > hma20_m15.iloc[-2]
     
     if direction == "BUY":
-        if not hma_m15_slope_up:
-            return 0, {}, 0, "HMA M15 Rouge", {}
-    else:
         if hma_m15_slope_up:
-            return 0, {}, 0, "HMA M15 Verte", {}
+            score += 8
+            reasons.append("✅ HMA M15 Haussière")
+        else:
+            score -= 5
+            reasons.append("⚠️ HMA M15 Baissière")
+    else:
+        if not hma_m15_slope_up:
+            score += 8
+            reasons.append("✅ HMA M15 Baissière")
+        else:
+            score -= 5
+            reasons.append("⚠️ HMA M15 Haussière")
     
-    # 6. Heiken Ashi M15
     ha_o_m15, ha_c_m15 = QuantEngine.get_ha_ohlc(df_m15)
     ha_m15_bullish = ha_c_m15.iloc[-2] > ha_o_m15.iloc[-2]
     
     if direction == "BUY":
-        if not ha_m15_bullish:
-            return 0, {}, 0, "HA M15 Rouge", {}
-    else:
         if ha_m15_bullish:
-            return 0, {}, 0, "HA M15 Verte", {}
-    
-    score += 10
-    reasons.append("✅ M15 Aligné (HMA+HA)")
+            score += 8
+            reasons.append("✅ HA M15 Verte")
+        else:
+            score -= 5
+            reasons.append("⚠️ HA M15 Rouge")
+    else:
+        if not ha_m15_bullish:
+            score += 8
+            reasons.append("✅ HA M15 Rouge")
+        else:
+            score -= 5
+            reasons.append("⚠️ HA M15 Verte")
     
     # ========================================
-    # PHASE 2.5: Z-SCORE STRUCTURE CHECK
+    # PHASE 2.5: Z-SCORE
     # ========================================
-    
-    # Check structure sur H1 pour éviter les ranges serrés
     z_score_val, z_status = QuantEngine.detect_structure_zscore(df_h1, lookback=20)
     
-    if abs(z_score_val) < 0.5:
-        return 0, {}, 0, f"Range serré (Z-Score {z_score_val:.2f})", {}
-    
-    score += 5
-    reasons.append(f"✅ {z_status}")
+    if abs(z_score_val) > 0.5:
+        score += 5
+        reasons.append(f"✅ {z_status}")
+    else:
+        score -= 5
+        reasons.append("⚠️ Range Serré")
     
     # ========================================
-    # PHASE 3: CURRENCY STRENGTH
+    # PHASE 3: CURRENCY STRENGTH (SOFT FILTER)
     # ========================================
-    cs_valid = False
     if "_" in symbol and cs_scores:
         base, quote = symbol.split('_')
         b_force = cs_scores.get(base, {'force': 5.0})['force']
         q_force = cs_scores.get(quote, {'force': 5.0})['force']
         gap = b_force - q_force
         
-        if direction == "BUY" and gap > 0.5:
-            cs_valid = True
-        elif direction == "SELL" and gap < -0.5:
-            cs_valid = True
-        
-        if not cs_valid:
-            return 0, {}, 0, f"CS Gap {gap:.1f} insuffisant", {}
-        
-        score += 5
-        reasons.append(f"✅ CS Gap {gap:.1f}")
+        if direction == "BUY":
+            if gap > 0.5:
+                score += 10
+                reasons.append(f"✅ Forte Devise Base (+{gap:.1f})")
+            elif gap > 0:
+                score += 5
+                reasons.append(f"ℹ️ Force Base OK ({gap:.1f})")
+            else:
+                score -= 10
+                reasons.append(f"⚠️ Force Base Faible ({gap:.1f})")
+        else:
+            if gap < -0.5:
+                score += 10
+                reasons.append(f"✅ Forte Devise Quote ({gap:.1f})")
+            elif gap < 0:
+                score += 5
+                reasons.append(f"ℹ️ Force Quote OK ({gap:.1f})")
+            else:
+                score -= 10
+                reasons.append(f"⚠️ Force Quote Faible ({gap:.1f})")
     
     # ========================================
-    # PHASE 3: TRIGGER M5 (PIRM INSTITUTIONAL)
+    # PHASE 3: SETUP M5 (AU LIEU DU TRIGGER STRICT)
     # ========================================
     
-    # 8. HMA 20 M5
     hma20_m5 = QuantEngine.calculate_hma(df_m5['close'], 20)
-    if len(hma20_m5) < 5:
-        return 0, {}, 0, "HMA M5 insuffisant", {}
-    
-    hma_m5_current = hma20_m5.iloc[-1]
-    
-    # 9. RSI 10 OHLC4 (La clé du PIRM)
     rsi_m5 = QuantEngine.calculate_rsi_ohlc4(df_m5, 10)
-    if len(rsi_m5) < 5:
-        return 0, {}, 0, "RSI M5 insuffisant", {}
-    
     rsi_m5_current = rsi_m5.iloc[-1]
-    rsi_m5_prev = rsi_m5.iloc[-4:-1]  # Les 3 bougies précédentes
     
-    # 10. ADX M5 > 18 (Momentum check)
-    adx_m5, _, _ = QuantEngine.adx_wilder(df_m5, 14, 14)
-    if adx_m5 < 18:
-        return 0, {}, 0, f"ADX M5 {adx_m5:.1f} < 18", {}
+    # On cherche des CONDITIONS DE SETUP, pas l'exécution parfaite
+    # Prix proche de HMA 20 ?
+    dist_to_hma_pct = abs(price - hma20_m5.iloc[-1]) / price
     
-    # 11. PIRM TRIGGER VALIDATION
-    pirm_valid = False
+    if dist_to_hma_pct < 0.001: # Très proche
+        score += 15
+        reasons.append("🎯 Prix @ HMA 20 (Entry Zone)")
+    elif dist_to_hma_pct < 0.002: # Assez proche
+        score += 10
+        reasons.append("ℹ️ Prix proche HMA 20")
+    else:
+        score -= 10 # Trop loin
+        reasons.append("⚠️ Prix loin HMA 20 (Pullback?)")
     
+    # RSI M5 configuration (Directionnel)
     if direction == "BUY":
-        # Pullback vers HMA 20
-        touched_hma = (df_m5['low'].iloc[-4:] <= hma_m5_current * 1.0005).any()
-        if not touched_hma:
-            return 0, {}, 0, "Pas de Pullback HMA", {}
-        
-        # RSI: Zone reload 45-50, puis break 50
-        rsi_reload = ((rsi_m5_prev >= 45) & (rsi_m5_prev <= 50)).any()
-        rsi_above_40 = (rsi_m5_prev >= 40).all()  # Ne doit PAS passer sous 40
-        
-        if not rsi_above_40:
-            return 0, {}, 0, f"RSI cassé 40 ({rsi_m5_prev.min():.1f})", {}
-        
-        if rsi_reload and rsi_m5_current > 50:
-            # Heiken Ashi vert
-            ha_o_m5, ha_c_m5 = QuantEngine.get_ha_ohlc(df_m5)
-            ha_bullish = ha_c_m5.iloc[-1] > ha_o_m5.iloc[-1]
-            
-            if ha_bullish:
-                pirm_valid = True
-                trigger_type = "PIRM"
-            else:
-                return 0, {}, 0, "HA M5 pas vert", {}
+        if 45 <= rsi_m5_current <= 60:
+            score += 15
+            reasons.append(f"🔥 RSI M5 Bullish ({rsi_m5_current:.1f})")
+            trigger_type = "READY_TO_BUY"
+        elif rsi_m5_current > 60:
+            score += 5
+            reasons.append(f"ℹ️ RSI M5 Élevé ({rsi_m5_current:.1f})")
+            trigger_type = "EXTENSION"
         else:
-            if not rsi_reload:
-                return 0, {}, 0, "Pas de Reload RSI (45-50)", {}
-            else:
-                return 0, {}, 0, f"RSI pas break 50 ({rsi_m5_current:.1f})", {}
-    
-    else:  # SELL
-        # Pullback vers HMA 20
-        touched_hma = (df_m5['high'].iloc[-4:] >= hma_m5_current * 0.9995).any()
-        if not touched_hma:
-            return 0, {}, 0, "Pas de Pullback HMA", {}
-        
-        # RSI: Zone reload 50-55, puis break 50
-        rsi_reload = ((rsi_m5_prev >= 50) & (rsi_m5_prev <= 55)).any()
-        rsi_below_60 = (rsi_m5_prev <= 60).all()  # Ne doit PAS dépasser 60
-        
-        if not rsi_below_60:
-            return 0, {}, 0, f"RSI cassé 60 ({rsi_m5_prev.max():.1f})", {}
-        
-        if rsi_reload and rsi_m5_current < 50:
-            # Heiken Ashi rouge
-            ha_o_m5, ha_c_m5 = QuantEngine.get_ha_ohlc(df_m5)
-            ha_bearish = ha_c_m5.iloc[-1] < ha_o_m5.iloc[-1]
-            
-            if ha_bearish:
-                pirm_valid = True
-                trigger_type = "PIRM"
-            else:
-                return 0, {}, 0, "HA M5 pas rouge", {}
+            score -= 5
+            reasons.append(f"⚠️ RSI M5 Faible ({rsi_m5_current:.1f})")
+    else:
+        if 40 <= rsi_m5_current <= 55:
+            score += 15
+            reasons.append(f"🔥 RSI M5 Bearish ({rsi_m5_current:.1f})")
+            trigger_type = "READY_TO_SELL"
+        elif rsi_m5_current < 40:
+            score += 5
+            reasons.append(f"ℹ️ RSI M5 Bas ({rsi_m5_current:.1f})")
+            trigger_type = "EXTENSION"
         else:
-            if not rsi_reload:
-                return 0, {}, 0, "Pas de Reload RSI (50-55)", {}
-            else:
-                return 0, {}, 0, f"RSI pas break 50 ({rsi_m5_current:.1f})", {}
-    
-    score += 25
-    reasons.append(f"🔥 PIRM TRIGGER: RSI {rsi_m5_current:.1f}")
+            score -= 5
+            reasons.append(f"⚠️ RSI M5 Élevé ({rsi_m5_current:.1f})")
+
+    # Heiken Ashi M5
+    ha_o_m5, ha_c_m5 = QuantEngine.get_ha_ohlc(df_m5)
+    if direction == "BUY":
+        if ha_c_m5.iloc[-1] > ha_o_m5.iloc[-1]:
+            score += 5
+            reasons.append("✅ HA M5 Verte")
+    else:
+        if ha_c_m5.iloc[-1] < ha_o_m5.iloc[-1]:
+            score += 5
+            reasons.append("✅ HA M5 Rouge")
     
     # ========================================
-    # PHASE 4: ZONES & CONFLUENCES (BONUS)
+    # PHASE 4: ZONES & CONFLUENCES
     # ========================================
     
     zone_text = "NO_ZONE"
@@ -878,35 +827,35 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         fvg_valid, fvg_zone = QuantEngine.detect_fvg(df_m5, atr, direction)
         
         if ob_valid:
-            score += 10
-            reasons.append("✅ ORDER BLOCK")
+            score += 15
+            reasons.append("✅ ORDER BLOCK ACTIF")
             zone_text = "OB"
         elif fvg_valid:
-            score += 8
-            reasons.append("✅ FVG")
+            score += 10
+            reasons.append("✅ FVG ACTIF")
             zone_text = "FVG"
         elif pdl and direction == "BUY" and abs(price - pdl) < atr * 0.5:
-            score += 6
-            reasons.append("✅ PDL Zone")
+            score += 10
+            reasons.append("✅ PDL SUPPORT")
             zone_text = "PDL"
         elif pdh and direction == "SELL" and abs(price - pdh) < atr * 0.5:
-            score += 6
-            reasons.append("✅ PDH Zone")
+            score += 10
+            reasons.append("✅ PDH RESISTANCE")
             zone_text = "PDH"
-    else:
-        score += 5
     
     # Midnight validation
     if midnight_open:
         if direction == "BUY" and price < midnight_open:
-            score += 5
-            reasons.append("✅ Discount Zone")
+            score += 10
+            reasons.append("✅ Discount Zone (Daily)")
         elif direction == "SELL" and price > midnight_open:
-            score += 5
-            reasons.append("✅ Premium Zone")
+            score += 10
+            reasons.append("✅ Premium Zone (Daily)")
+        else:
+            score -= 5 # Mauvais prix par rapport à l'ouverture
     
     # ========================================
-    # PHASE 4.5: VOLUME PROFILE CONFLUENCE (BONUS)
+    # PHASE 4.5: VOLUME PROFILE
     # ========================================
     
     vp_score = 0
@@ -919,13 +868,13 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         if vp_data:
             levels = VolumeProfileEngine.get_institutional_levels(vp_data, price)
             
-            # BONUS 1: Prix près du POC (Point of Control)
-            if abs(price - vp_data['poc']) < atr * 0.3:
-                vp_score += 10
+            # POC Confluence
+            if abs(price - vp_data['poc']) < atr * 0.5:
+                vp_score += 15
                 vp_info = "POC"
                 reasons.append("⭐ VP: Prix @ POC")
             
-            # BONUS 2: Order Block dans HVN (High Volume Node)
+            # OB dans HVN
             if ob_zone:
                 is_valid, strength = VolumeProfileEngine.validate_zone_with_volume(
                     ob_zone[0], ob_zone[1], vp_data, min_strength=0.6
@@ -936,7 +885,7 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
                     vp_info = "OB+HVN"
                     reasons.append(f"⭐ VP: OB dans HVN ({strength:.1f}x)")
             
-            # BONUS 3: FVG validé par volume
+            # FVG dans HVN
             if fvg_zone:
                 is_valid, strength = VolumeProfileEngine.validate_zone_with_volume(
                     fvg_zone[0], fvg_zone[1], vp_data, min_strength=0.5
@@ -947,29 +896,21 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
                     vp_info = "FVG+HVN"
                     reasons.append(f"⭐ VP: FVG dans HVN ({strength:.1f}x)")
             
-            # BONUS 4: Position favorable (Discount/Premium selon Value Area)
+            # Value Area Position
             if direction == "BUY" and levels['bias'] == 'DISCOUNT_ZONE':
-                vp_score += 5
+                vp_score += 10
                 reasons.append("⭐ VP: Discount Zone")
             elif direction == "SELL" and levels['bias'] == 'PREMIUM_ZONE':
-                vp_score += 5
+                vp_score += 10
                 reasons.append("⭐ VP: Premium Zone")
             
-            # BONUS 5: Volume Delta aligné avec direction
+            # Delta
             if direction == "BUY" and levels.get('volume_pressure') == 'BULLISH':
                 vp_score += 5
                 reasons.append("⭐ VP: Volume Bullish")
             elif direction == "SELL" and levels.get('volume_pressure') == 'BEARISH':
                 vp_score += 5
                 reasons.append("⭐ VP: Volume Bearish")
-            
-            # BONUS 6: Prix près VAH/VAL (support/resistance institutionnel)
-            if direction == "BUY" and abs(price - vp_data['val']) < atr * 0.3:
-                vp_score += 5
-                reasons.append("⭐ VP: Prix @ VAL")
-            elif direction == "SELL" and abs(price - vp_data['vah']) < atr * 0.3:
-                vp_score += 5
-                reasons.append("⭐ VP: Prix @ VAH")
             
             vp_details = {
                 'poc': vp_data['poc'],
@@ -981,20 +922,21 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
                 'delta_ratio': vp_data['volume_delta_ratio']
             }
     
-    score += vp_score  # Maximum +30 points bonus
+    score += vp_score
     
     # ========================================
-    # CLASSIFICATION & TARGETS
+    # CLASSIFICATION
     # ========================================
     
-    if score >= 95:
+    # Ajustement du seuil pour le scanner
+    if score >= 90:
         quality = "INSTITUTIONAL ⭐⭐"
-    elif score >= 90:
-        quality = "ELITE 🏆"
-    elif score >= 80:
-        quality = "PREMIUM ⭐"
+    elif score >= 75:
+        quality = "HIGH SETUP 🏆"
+    elif score >= 60:
+        quality = "STANDARD SETUP ⭐"
     else:
-        quality = "STANDARD ✅"
+        quality = "WEAK SETUP ⚠️"
     
     params = get_asset_params(symbol)
     sl = price - (atr * params['sl_base']) if direction == "BUY" else price + (atr * params['sl_base'])
@@ -1009,10 +951,9 @@ def calculate_signal_bluestar_v7(df_m5, df_m15, df_h1, df_d, df_w, symbol, direc
         "pdh_pdl": f"{pdh:.5f} / {pdl:.5f}" if pdh else "N/A",
         "zone_type": zone_text,
         "adx_h1": adx_h1,
-        "adx_m5": adx_m5,
         "rsi_h1": rsi_h1_val,
         "rsi_m5": rsi_m5_current,
-        "hma_m5": hma_m5_current,
+        "hma_m5": hma20_m5.iloc[-1],
         "vp_score": vp_score,
         "vp_info": vp_info,
         "vp_details": vp_details,
@@ -1105,11 +1046,12 @@ def scan_single_asset(args):
         results = []
         
         for direction in ["BUY", "SELL"]:
-            prob, details, atr_pct, reject, extras = calculate_signal_bluestar_v7(
+            prob, details, atr_pct, reject, extras = calculate_signal_bluestar_scanner(
                 df_m5, df_m15, df_h1, df_d, df_w, sym, direction, live_price, cs_scores, config
             )
             
-            if not reject and details['score'] >= config['min_score']:
+            # On affiche tout ce qui dépasse le score min configuré
+            if details['score'] >= config['min_score']:
                 results.append({
                     'symbol': sym,
                     'type': direction,
@@ -1133,7 +1075,7 @@ def run_scan_bluestar_v7(api, config):
     logs = []
     
     status = st.empty()
-    status.info("🚀 BlueStar Sniper Ultimate 7 - Scan en cours...")
+    status.info("🔍 BlueStar Scanner Mode - Analyse Multi-Timeframe...")
     
     args_list = [(sym, api, config) for sym in ASSETS]
     
@@ -1152,7 +1094,6 @@ def run_scan_bluestar_v7(api, config):
                     sym_name = futures.get(future, "Unknown")
                     logs.append(f"Error {sym_name}: {str(e)[:50]}")
         except Exception as e:
-            # Si timeout global, on retourne ce qu'on a déjà
             logs.append(f"Scan timeout après 180s - {len(signals)} signaux trouvés")
     
     status.empty()
@@ -1160,24 +1101,24 @@ def run_scan_bluestar_v7(api, config):
 
 
 def display_signal_v7(s):
-    """Affichage signal avec nouveau design"""
+    """Affichage signal"""
     is_buy = s['type'] == 'BUY'
     col_type = "#10b981" if is_buy else "#ef4444"
     bg = "linear-gradient(135deg, #064e3b 0%, #065f46 100%)" if is_buy else "linear-gradient(135deg, #7f1d1d 0%, #991b1b 100%)"
     d = s['details']
     
-    if "ELITE" in d['quality']:
-        badge = "<span class='badge badge-elite'>🏆 ELITE</span>"
-    elif "INSTITUTIONAL" in d['quality']:
-        badge = "<span class='badge' style='background:linear-gradient(135deg, #f59e0b 0%, #d97706 100%); animation: pulse-gold 2s infinite;'>⭐⭐ INSTITUTIONAL</span>"
-    elif "PREMIUM" in d['quality']:
-        badge = "<span class='badge badge-premium'>⭐ PREMIUM</span>"
+    if "INSTITUTIONAL" in d['quality']:
+        badge = "<span class='badge badge-elite'>⭐⭐ INSTITUTIONAL</span>"
+    elif "HIGH SETUP" in d['quality']:
+        badge = "<span class='badge badge-premium'>🏆 HIGH SETUP</span>"
+    elif "STANDARD SETUP" in d['quality']:
+        badge = "<span class='badge badge-standard'>⭐ STANDARD</span>"
     else:
-        badge = "<span class='badge' style='background:#3b82f6;'>✅ STANDARD</span>"
+        badge = "<span class='badge badge-watch'>⚠️ WEAK</span>"
     
     trigger_badge = f"<span class='badge badge-pirm'>🎯 {d['trigger']}</span>"
     
-    with st.expander(f"{'📈' if is_buy else '📉'} **{s['symbol']}** | {s['type']} | Score: **{s['score']}/100**", expanded=True):
+    with st.expander(f"{'📈' if is_buy else '📉'} **{s['symbol']}** | {s['type']} | Score: **{s['score']}/100**", expanded=(s['score'] > 70)):
         st.markdown(f"""
         <div style="background:{bg};padding:18px;border-radius:12px;border:2px solid {col_type};margin-bottom:12px;box-shadow: 0 4px 15px rgba(0,0,0,0.3);">
             <span style="font-size:1.6em;font-weight:900;color:white;">{s['symbol']}</span>
@@ -1185,45 +1126,44 @@ def display_signal_v7(s):
             <div style='margin-top:12px;'>{badge} {trigger_badge}</div>
         </div>""", unsafe_allow_html=True)
         
-        st.info(f"**Score:** {d['score']}/100 | **Zone:** {d['zone_type']} | **ADX H1:** {d['adx_h1']:.1f} | **ADX M5:** {d['adx_m5']:.1f} | **VP:** {d['vp_info']} (+{d['vp_score']})")
+        st.info(f"**Score:** {d['score']}/100 | **Zone:** {d['zone_type']} | **ADX H1:** {d['adx_h1']:.1f} | **VP:** {d['vp_info']}")
         
-        st.markdown("### 📋 Confluences Validées")
+        st.markdown("### 📋 Analyse Multi-Timeframe")
         col1, col2 = st.columns(2)
         
         with col1:
             for i, reason in enumerate(d['reasons']):
                 if i % 2 == 0:
-                    if "🔥" in reason:
-                        st.success(reason)
-                    elif "✅" in reason:
-                        st.success(reason)
-                    else:
+                    if "⚠️" in reason:
+                        st.warning(reason)
+                    elif "ℹ️" in reason:
                         st.info(reason)
+                    else:
+                        st.success(reason)
         
         with col2:
             for i, reason in enumerate(d['reasons']):
                 if i % 2 == 1:
-                    if "🔥" in reason:
-                        st.success(reason)
-                    elif "✅" in reason:
-                        st.success(reason)
-                    else:
+                    if "⚠️" in reason:
+                        st.warning(reason)
+                    elif "ℹ️" in reason:
                         st.info(reason)
+                    else:
+                        st.success(reason)
         
         st.markdown("### 📊 Indicateurs Clés")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("RSI H1", f"{d['rsi_h1']:.1f}")
         c2.metric("RSI M5", f"{d['rsi_m5']:.1f}")
         
-        # Premium/Discount Status
         midnight_val = d['midnight']
         if midnight_val != "N/A":
             try:
                 mid_price = float(midnight_val)
                 if s['price'] > mid_price:
-                    c3.markdown(f"**Midnight**<br><span style='color:#ef4444;font-weight:700;'>🔴 PREMIUM</span><br><span style='font-size:0.8em;color:#64748b;'>{midnight_val}</span>", unsafe_allow_html=True)
+                    c3.markdown(f"**Midnight**<br><span style='color:#ef4444;font-weight:700;'>🔴 PREMIUM</span>", unsafe_allow_html=True)
                 else:
-                    c3.markdown(f"**Midnight**<br><span style='color:#10b981;font-weight:700;'>🟢 DISCOUNT</span><br><span style='font-size:0.8em;color:#64748b;'>{midnight_val}</span>", unsafe_allow_html=True)
+                    c3.markdown(f"**Midnight**<br><span style='color:#10b981;font-weight:700;'>🟢 DISCOUNT</span>", unsafe_allow_html=True)
             except:
                 c3.metric("Midnight", midnight_val)
         else:
@@ -1231,7 +1171,6 @@ def display_signal_v7(s):
         
         c4.metric("PDH/PDL", d['pdh_pdl'])
         
-        # Volume Profile Details
         if d['vp_details']:
             st.markdown("### 📈 Volume Profile (Institutional)")
             vp = d['vp_details']
@@ -1240,14 +1179,8 @@ def display_signal_v7(s):
             col_vp2.metric("VAH", f"{vp['vah']:.5f}")
             col_vp3.metric("VAL", f"{vp['val']:.5f}")
             col_vp4.metric("Position", vp['position'].replace('_', ' '))
-            
-            col_vp5, col_vp6 = st.columns(2)
-            vol_pressure = vp['volume_pressure']
-            vol_color = "#10b981" if vol_pressure == "BULLISH" else ("#ef4444" if vol_pressure == "BEARISH" else "#94a3b8")
-            col_vp5.markdown(f"**Volume Pressure:** <span style='color:{vol_color};font-weight:700;'>{vol_pressure}</span>", unsafe_allow_html=True)
-            col_vp6.metric("Delta Ratio", f"{vp['delta_ratio']:.2%}")
         
-        st.markdown("### 🎯 Niveaux de Trade")
+        st.markdown("### 🎯 Niveaux Calculés")
         col_sl, col_tp = st.columns(2)
         col_sl.error(f"**🛑 STOP LOSS:** {s['sl']:.5f}")
         col_tp.success(f"**🎯 TAKE PROFIT:** {s['tp']:.5f} (RR: {s['rr']:.1f})")
@@ -1256,73 +1189,47 @@ def display_signal_v7(s):
 def main():
     st.markdown("""
     <div class='header-container'>
-        <span class='star-logo'>⭐</span><h1>BLUESTAR SNIPER ULTIMATE 7</h1>
+        <span class='star-logo'>⭐</span><h1>BLUESTAR SCANNER V7.1</h1>
     </div>
-    <p style='text-align:center;color:#94a3b8;font-size:1.1em;margin-top:-10px;'>ULTIMATE FUSION: H1 Bias → M15 Alignment → M5 PIRM Trigger</p>
+    <p style='text-align:center;color:#94a3b8;font-size:1.1em;margin-top:-10px;'>MODE SETUP: DÉTECTION D'OPPORTUNITÉS (NON EXÉCUTION)</p>
     """, unsafe_allow_html=True)
     
     with st.sidebar:
-        st.markdown("<h2 style='color:#60a5fa;'>⚙️ Configuration</h2>", unsafe_allow_html=True)
+        st.markdown("<h2 style='color:#60a5fa;'>⚙️ Configuration Scanner</h2>", unsafe_allow_html=True)
         
-        min_score = st.slider("🎯 Score Minimum", 60, 95, 75, 5,
-            help="60-79: Standard | 80-89: Premium | 90+: Elite")
+        min_score = st.slider("🎯 Score Minimum", 50, 90, 60, 5,
+            help="Scanner Mode: 50-69 (Weak) | 60-79 (Standard) | 80-89 (High Setup) | 90+ (Institutional)")
         
         st.markdown("---")
-        st.markdown("<h3 style='color:#60a5fa;'>Filtres ADX Wilder</h3>", unsafe_allow_html=True)
+        st.markdown("<h3 style='color:#60a5fa;'>Filtres Principaux</h3>", unsafe_allow_html=True)
         
-        adx_enabled = st.checkbox("✅ Activer Filtre ADX", value=True)
-        min_adx = st.slider("ADX H1 Minimum", 15, 30, 20, 1) if adx_enabled else 15
+        adx_enabled = st.checkbox("✅ Filtre ADX H1 (Pénalité si faible)", value=True)
+        min_adx = st.slider("ADX H1 Minimum", 15, 30, 18, 1) if adx_enabled else 15
         
         st.markdown("---")
         st.markdown("<h3 style='color:#60a5fa;'>Zones & Confluences</h3>", unsafe_allow_html=True)
         
-        use_zones = st.checkbox("🎯 Order Blocks / FVG", value=True,
-            help="Active la détection des zones institutionnelles")
-        
-        use_vp = st.checkbox("📊 Volume Profile (Institutional)", value=True,
-            help="Ajoute confluence Volume Profile - Niveau Hedge Fund")
-        
-        st.markdown("---")
+        use_zones = st.checkbox("🎯 Order Blocks / FVG / PDH-PDL", value=True)
+        use_vp = st.checkbox("📊 Volume Profile (HVN/POC)", value=True)
         
         st.info("""
-        **🎯 Système V7.0:**
+        **Mode Scanner Activé:**
         
-        **Phase 1 - Biais H1:**
-        - ADX Wilder > 20
-        - Structure HH/HL ou LL/LH
-        - HMA 50 + Position
-        - RSI 14 > 50 (BUY)
+        Ce code détecte les conditions de marché propices (Setup), 
+        même si l'alignement n'est pas parfait.
         
-        **Phase 2 - Alignement M15:**
-        - HMA 20 alignée
-        - Heiken Ashi confirmé
-        - Currency Strength
+        **Les signaux avec ⚠️ indiquent des défauts:**
+        - ADX Faible (Pas de tendance)
+        - Prix contre HMA (Retest possible)
+        - Structure H1 Hésitante
         
-        **Phase 3 - PIRM Trigger M5:**
-        - Pullback HMA 20
-        - RSI 10 OHLC4 Reload
-        - Break niveau 50
-        - ADX M5 > 18
-        
-        **Phase 4 - Zones (Bonus):**
-        - Order Blocks
-        - Fair Value Gaps
-        - PDL/PDH
-        
-        **Phase 4.5 - Volume Profile:**
-        - POC / VAH / VAL
-        - HVN Confluence
-        - Volume Delta
-        - Institutional Levels
-        
-        **Score:**
-        - 75-79: STANDARD ✅
-        - 80-89: PREMIUM ⭐
-        - 90-94: ELITE 🏆
-        - 95+: INSTITUTIONAL ⭐⭐
+        **Les signaux avec 🔥 indiquent les forces:**
+        - RSI M5 dans la zone d'entrée
+        - Proximité HMA 20
+        - Volume Profile aligné
         """)
     
-    if st.button("🔍 SCAN ULTIMATE 7"):
+    if st.button("🔍 LANCER LE SCAN"):
         config = {
             'min_score': min_score,
             'min_adx': min_adx,
@@ -1330,33 +1237,26 @@ def main():
             'use_vp': use_vp
         }
         
-        with st.spinner("⚡ Scan parallèle en cours..."):
+        with st.spinner("⚡ Analyse multi-timeframe en cours..."):
             api = OandaClient()
             results, logs = run_scan_bluestar_v7(api, config)
         
         if not results:
-            st.warning("⚠️ Aucun signal PIRM validé pour le moment")
-            
-            if logs:
-                with st.expander("📜 Logs d'Erreurs"):
-                    for log in logs[:20]:
-                        st.text(log)
+            st.warning("⚠️ Aucun setup détecté au-dessus du score minimum.")
+            st.info("💡 Conseil: Baissez le 'Score Minimum' dans la sidebar pour voir plus d'opportunités.")
         else:
-            st.success(f"✅ **{len(results)} Signal(s) BlueStar Validé(s)**")
+            st.success(f"✅ **{len(results)} Setup(s) détecté(s)**")
             
-            # Statistiques
-            elite = sum(1 for r in results if "ELITE" in r['details']['quality'])
+            high = sum(1 for r in results if "HIGH SETUP" in r['details']['quality'])
             institutional = sum(1 for r in results if "INSTITUTIONAL" in r['details']['quality'])
-            premium = sum(1 for r in results if "PREMIUM" in r['details']['quality'])
-            standard = len(results) - elite - premium - institutional
-            pirm = sum(1 for r in results if r['details']['trigger'] == "PIRM")
+            standard = sum(1 for r in results if "STANDARD SETUP" in r['details']['quality'])
+            weak = sum(1 for r in results if "WEAK SETUP" in r['details']['quality'])
             
-            col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("⭐⭐ Institutional", institutional)
-            col2.metric("🏆 Elite", elite)
-            col3.metric("⭐ Premium", premium)
-            col4.metric("✅ Standard", standard)
-            col5.metric("🎯 PIRM", pirm)
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("⭐⭐ Inst.", institutional)
+            col2.metric("🏆 High", high)
+            col3.metric("⭐ Standard", standard)
+            col4.metric("⚠️ Weak", weak)
             
             st.markdown("---")
             
@@ -1365,7 +1265,7 @@ def main():
             
             if logs:
                 with st.expander("📜 Logs"):
-                    for log in logs[:30]:
+                    for log in logs[:10]:
                         st.text(log)
 
 if __name__ == "__main__":
