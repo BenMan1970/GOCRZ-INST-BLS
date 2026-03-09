@@ -3,63 +3,18 @@ import pandas as pd
 import numpy as np
 import oandapyV20
 import oandapyV20.endpoints.instruments as instruments
+import oandapyV20.endpoints.accounts as accounts
 from datetime import datetime
 import pytz
 import time
+from collections import Counter
 
 # ================================================================
 #  BLUESTAR SNIPER V10  —  ICT SIGNAL ENGINE
-#
-#  SIGNAL  = HMA 20 M15 flip de couleur  (≤ 30 min)
-#  SCORE   = système de notation pondéré /100
-#  GRADE   = A+ / A / B+ / B / C  affiché à côté de l'actif
 # ================================================================
-
 
 # ----------------------------------------------------------------
 #  SYSTÈME DE NOTATION  (inspiré du scoring manuel ICT/SMC)
-#
-#  Les traders manuels pèsent chaque condition selon son importance :
-#  - Le trigger (HMA flip frais) est le plus important : sans lui, pas de trade
-#  - Le biais Daily et la zone sont les fondations structurelles
-#  - Le FVG confirme la zone d'intérêt précise
-#  - ADX/ATR confirment le momentum
-#
-#  Points max = 100
-#
-#  TRIGGER (30 pts max)
-#    HMA flip ≤ 15 min  → 30 pts   (signal ultra-frais)
-#    HMA flip ≤ 30 min  → 20 pts   (signal frais)
-#    HMA flip ≤ 45 min  → 10 pts   (signal qui vieillit)
-#    HMA flip > 45 min  →  0 pts   (expiré)
-#
-#  BIAIS DAILY concordant  → 20 pts
-#
-#  ZONE D'INTÉRÊT (20 pts max)
-#    Discount + proche PDL (LONG)  → 20 pts
-#    Discount seulement            → 10 pts
-#    Premium + proche PDH (SHORT)  → 20 pts
-#    Premium seulement             → 10 pts
-#
-#  FVG M15 (15 pts max)
-#    Prix dans le FVG              → 15 pts
-#    FVG proche (< 1 ATR)          →  7 pts
-#
-#  ADX + momentum (10 pts max)
-#    ADX > 25 + DI concordant      → 10 pts
-#    ADX > 20 + DI concordant      →  6 pts
-#    ADX > 20 seulement            →  3 pts
-#
-#  ATR actif (5 pts max)
-#    ATR ≥ moyenne                 →  5 pts
-#    ATR ≥ 50% moyenne             →  3 pts
-#
-#  GRADE :
-#    A+  : 85-100  (setup parfait, tout aligné)
-#    A   : 70-84   (très bon setup, 1 élément mineur manque)
-#    B+  : 55-69   (bon setup en formation, surveiller)
-#    B   : 40-54   (partiel, attendre confirmation)
-#    C   : < 40    (faible, ne pas trader)
 # ----------------------------------------------------------------
 
 def compute_score(flip_type, candles_ago, bias, zone_discount, zone_premium,
@@ -82,12 +37,12 @@ def compute_score(flip_type, candles_ago, bias, zone_discount, zone_premium,
     score += pts
     score_detail["Trigger"] = pts
 
-    # Direction du signal HMA
     signal_is_bull = (flip_type == "BULL")
     signal_is_bear = (flip_type == "BEAR")
 
     # ── BIAIS DAILY ──────────────────────────────────────────────
-    bias_ok = (signal_is_bull and bias in ("BULLISH","STRONG BULLISH")) or (signal_is_bear and bias in ("BEARISH","STRONG BEARISH"))
+    bias_ok = (signal_is_bull and bias in ("BULLISH","STRONG BULLISH")) or \
+              (signal_is_bear and bias in ("BEARISH","STRONG BEARISH"))
     pts = 20 if bias_ok else 0
     score += pts
     score_detail["Biais"] = pts
@@ -150,7 +105,6 @@ def compute_score(flip_type, candles_ago, bias, zone_discount, zone_premium,
 
 
 def grade_badge(grade, score):
-    """Formate le badge affiché dans la colonne Actif."""
     badges = {
         "A+": f"💎 A+  [{score}/100]",
         "A":  f"🥇 A   [{score}/100]",
@@ -205,59 +159,10 @@ class QuantEngine:
         return dx.ewm(alpha=1/period, adjust=False).mean(), pdi, mdi
 
 
-# ================================================================
-#  BIAIS DAILY  —  MÉTHODE INSTITUTIONNELLE MULTI-FACTEURS
-#
-#  4 facteurs indépendants votent BULLISH / BEARISH / NEUTRAL.
-#  Règle stricte : 3 votes minimum dans le même sens pour un biais
-#  valide. En dessous → NEUTRAL (marché sans conviction = pas de trade).
-#
-#  FACTEUR 1 — MARKET STRUCTURE (poids : 2 votes)
-#  ─────────────────────────────────────────────────────────────
-#  Méthode utilisée par les traders ICT / Smart Money :
-#  on identifie les derniers swing highs et swing lows sur le Daily
-#  (pivot détecté si la bougie est entourée de 2 bougies plus basses/hautes).
-#
-#  HH + HL (Higher High + Higher Low) → structure haussière  → BULLISH
-#  LH + LL (Lower High  + Lower Low)  → structure baissière  → BEARISH
-#  Mélange                            → structure cassée      → NEUTRAL
-#
-#  C'est le facteur le plus important (2 votes au lieu d'1).
-#  Un institutionnel ne trade JAMAIS contre la structure.
-#
-#  FACTEUR 2 — EMA STACK 21 / 50 DAILY (poids : 1 vote)
-#  ─────────────────────────────────────────────────────────────
-#  Filtre de tendance classique adopté par les desks macro et les
-#  fonds systématiques (CTA, trend-following).
-#  Prix > EMA21 > EMA50 → BULLISH
-#  Prix < EMA21 < EMA50 → BEARISH
-#
-#  FACTEUR 3 — WEEKLY OPEN (poids : 1 vote)
-#  ─────────────────────────────────────────────────────────────
-#  Le niveau d'ouverture de la semaine est la référence numéro 1
-#  des market makers et des banques centrales (ICT "Weekly Open").
-#  Prix au-dessus du Weekly Open → biais acheteur cette semaine
-#  Prix en dessous               → biais vendeur
-#
-#  FACTEUR 4 — CLOSE DU JOUR PRÉCÉDENT (poids : 1 vote)
-#  ─────────────────────────────────────────────────────────────
-#  Les institutionnels regardent où le marché a fermé par rapport
-#  au milieu de range de la veille (50% du range daily J-1).
-#  Close > 50% du range J-1 → journée fermée en force haussière
-#  Close < 50% du range J-1 → journée fermée en force baissière
-#
-#  RÉSULTAT :
-#  Total max = 5 votes (2 structure + 1 + 1 + 1)
-#  ≥ 4 votes concordants → STRONG BULLISH / STRONG BEARISH
-#  = 3 votes concordants → BULLISH / BEARISH
-#  ≤ 2 votes             → NEUTRAL  (condition non remplie, pas de trade)
-# ================================================================
-
+# ----------------------------------------------------------------
+#  BIAIS DAILY
+# ----------------------------------------------------------------
 def _find_swing_points(series, wing=2):
-    """
-    Retourne les indices des swing highs et swing lows.
-    Un swing high[i] = series[i] > tous les wing voisins de chaque côté.
-    """
     highs, lows = [], []
     for i in range(wing, len(series) - wing):
         window = series.iloc[i - wing: i + wing + 1]
@@ -269,11 +174,6 @@ def _find_swing_points(series, wing=2):
 
 
 def get_daily_bias(df_d):
-    """
-    Retourne (bias_str, detail_dict).
-    bias_str  : "STRONG BULLISH" | "BULLISH" | "NEUTRAL" | "BEARISH" | "STRONG BEARISH"
-    detail    : dict avec le vote de chaque facteur pour affichage
-    """
     if len(df_d) < 60:
         return "NEUTRAL", {}
 
@@ -296,10 +196,10 @@ def get_daily_bias(df_d):
         last_sl  = low.iloc[sl_idx_l[-1]]
         prev_sl  = low.iloc[sl_idx_l[-2]]
 
-        hh = last_sh > prev_sh   # Higher High
-        hl = last_sl > prev_sl   # Higher Low
-        lh = last_sh < prev_sh   # Lower High
-        ll = last_sl < prev_sl   # Lower Low
+        hh = last_sh > prev_sh
+        hl = last_sl > prev_sl
+        lh = last_sh < prev_sh
+        ll = last_sl < prev_sl
 
         if hh and hl:
             struct_vote = "BULLISH"
@@ -325,12 +225,10 @@ def get_daily_bias(df_d):
     detail["EMA 21/50"] = ema_vote
 
     # ── FACTEUR 3 : WEEKLY OPEN (1 vote) ─────────────────────────
-    # Cherche la première bougie du lundi de la semaine en cours
     df_d_copy = df_d.copy()
     if df_d_copy.index.tz is not None:
         df_d_copy.index = df_d_copy.index.tz_convert('UTC')
 
-    # Lundi = dayofweek 0
     weekly_open_rows = df_d_copy[df_d_copy.index.dayofweek == 0]
     if not weekly_open_rows.empty:
         weekly_open = weekly_open_rows['open'].iloc[-1]
@@ -344,7 +242,6 @@ def get_daily_bias(df_d):
     detail["Weekly Open"] = wo_vote
 
     # ── FACTEUR 4 : CLOSE J-1 vs RANGE J-1 (1 vote) ─────────────
-    # Milieu de range = (High J-1 + Low J-1) / 2
     if len(df_d) >= 2:
         prev_high  = high.iloc[-2]
         prev_low   = low.iloc[-2]
@@ -359,8 +256,6 @@ def get_daily_bias(df_d):
         pc_vote = "NEUTRAL"
 
     detail["Close J-1"] = pc_vote
-
-    # ── CONSENSUS ─────────────────────────────────────────────────
     detail["Votes"] = f"{votes_bull}B / {votes_bear}S"
 
     if   votes_bull >= 4: bias = "STRONG BULLISH"
@@ -373,7 +268,7 @@ def get_daily_bias(df_d):
 
 
 # ----------------------------------------------------------------
-#  FLIP HMA — dernier changement de couleur
+#  FLIP HMA
 # ----------------------------------------------------------------
 def find_last_hma_flip(hma_series, max_lookback=10):
     colors = []
@@ -415,58 +310,146 @@ def detect_fvg(df, price, lookback=80):
     in_bull = any(lo <= price <= hi  for lo, hi in bull_fvgs)
     in_bear = any(lo <= price <= hi  for lo, hi in bear_fvgs)
 
-    # "Proche" = FVG le plus proche dans 1 ATR
     return (in_bull, in_bear,
             bull_fvgs[0] if bull_fvgs else None,
             bear_fvgs[0] if bear_fvgs else None)
 
 
 # ----------------------------------------------------------------
-#  ANALYSE PRINCIPALE
-#
-#  ORDRE DES OPÉRATIONS :
-#  1. Fetch données
-#  2. Biais daily → éliminatoire immédiat si NEUTRAL
-#  3. HMA flip M15 → éliminatoire si pas de flip ou contre biais
-#  4. Prix vs HMA  → éliminatoire si mauvais côté
-#  5. FVG          → éliminatoire si absent dans le bon sens
-#  6. Score & grade sur les actifs qui passent tous les filtres
+#  FETCH OANDA — avec retry + logs clairs
 # ----------------------------------------------------------------
-def analyze_asset(client, ticker, freshness_limit_min=30):
-    try:
-        df_d   = fetch_oanda_data(client, ticker, "D",   100)
-        df_m15 = fetch_oanda_data(client, ticker, "M15", 400)
-        df_h1  = fetch_oanda_data(client, ticker, "H1",  100)
+MAX_RETRIES = 3
+RETRY_DELAY = 1.5
 
-        if df_d.empty or df_m15.empty:
-            return None
+def fetch_oanda_data(client, instrument, granularity, count):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = instruments.InstrumentsCandles(
+                instrument=instrument,
+                params={"count": count, "granularity": granularity}
+            )
+            client.request(r)
+
+            if not isinstance(r.response, dict) or "candles" not in r.response:
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY * attempt)
+                    continue
+                return pd.DataFrame(), f"Réponse inattendue (pas de 'candles')"
+
+            rows = [
+                {"time":  pd.to_datetime(c["time"]),
+                 "open":  float(c["mid"]["o"]),
+                 "high":  float(c["mid"]["h"]),
+                 "low":   float(c["mid"]["l"]),
+                 "close": float(c["mid"]["c"])}
+                for c in r.response["candles"] if c.get("complete")
+            ]
+
+            if not rows:
+                return pd.DataFrame(), "Aucune bougie complète retournée"
+
+            df = pd.DataFrame(rows).set_index("time")
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            return df, None
+
+        except Exception as e:
+            err_str = str(e)
+            if "401" in err_str or "Unauthorized" in err_str:
+                return pd.DataFrame(), "TOKEN_INVALID"
+            elif "403" in err_str:
+                return pd.DataFrame(), "TOKEN_FORBIDDEN (mauvais environment?)"
+            elif "429" in err_str:
+                wait = RETRY_DELAY * attempt * 3
+                time.sleep(wait)
+            elif "500" in err_str or "503" in err_str:
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY * attempt)
+                    continue
+            # Dernière tentative échouée
+            if attempt == MAX_RETRIES:
+                return pd.DataFrame(), str(e)
+
+    return pd.DataFrame(), "MAX_RETRIES atteint"
+
+
+# ----------------------------------------------------------------
+#  TEST DE CONNEXION OANDA
+# ----------------------------------------------------------------
+def test_oanda_connection(client, account_id=None):
+    """Retourne (ok: bool, message: str)"""
+    try:
+        if account_id:
+            # Test précis avec l'account_id connu
+            r = accounts.AccountDetails(account_id)
+        else:
+            r = accounts.AccountList()
+        client.request(r)
+
+        if account_id:
+            acc = r.response.get("account", {})
+            currency = acc.get("currency", "?")
+            balance  = acc.get("balance", "?")
+            return True, f"✅ Connecté — compte `{account_id}` · {currency} {balance}"
+        else:
+            accs = r.response.get("accounts", [])
+            ids = [a.get("id","?") for a in accs]
+            return True, f"✅ Connecté — {len(ids)} compte(s) : {', '.join(ids)}"
+    except Exception as e:
+        err = str(e)
+        if "401" in err or "Unauthorized" in err:
+            return False, "❌ Token invalide ou expiré"
+        if "403" in err:
+            return False, "❌ Accès refusé — vérifiez l'environment (practice vs live)"
+        return False, f"❌ Erreur : {err}"
+
+
+# ----------------------------------------------------------------
+#  ANALYSE PRINCIPALE
+# ----------------------------------------------------------------
+def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
+    """
+    Retourne un dict de résultat ou None.
+    debug_log : liste à laquelle on ajoute (ticker, raison_rejet) si fournie.
+    """
+    def _reject(reason):
+        if debug_log is not None:
+            debug_log.append((ticker, reason))
+        return None
+
+    try:
+        df_d,   err_d   = fetch_oanda_data(client, ticker, "D",   100)
+        df_m15, err_m15 = fetch_oanda_data(client, ticker, "M15", 400)
+        df_h1,  err_h1  = fetch_oanda_data(client, ticker, "H1",  100)
+
+        if df_d.empty:
+            return _reject(f"FETCH_D_FAILED: {err_d}")
+        if df_m15.empty:
+            return _reject(f"FETCH_M15_FAILED: {err_m15}")
 
         price = df_m15['close'].iloc[-1]
 
         # ══ GATE 1 — BIAIS DAILY ═════════════════════════════════
-        # Éliminatoire immédiat : NEUTRAL = pas de trade
-        bias, _ = get_daily_bias(df_d)
-        bias_bull  = bias in ("BULLISH", "STRONG BULLISH")
-        bias_bear  = bias in ("BEARISH", "STRONG BEARISH")
+        bias, bias_detail = get_daily_bias(df_d)
+        bias_bull = bias in ("BULLISH", "STRONG BULLISH")
+        bias_bear = bias in ("BEARISH", "STRONG BEARISH")
         if not bias_bull and not bias_bear:
-            return None
+            return _reject(f"NEUTRAL_BIAS ({bias_detail.get('Votes','?')})")
 
         # ══ GATE 2 — HMA 20 FLIP M15 ════════════════════════════
-        # Le flip DOIT exister et concorder avec le biais
         hma = QuantEngine.hma(df_m15['close'], 20)
         if hma.isna().iloc[-5:].any():
-            return None
+            return _reject("HMA_NAN")
 
         flip_type, candles_ago = find_last_hma_flip(hma, max_lookback=10)
 
         if flip_type is None:
-            return None
+            return _reject("NO_HMA_FLIP")
         if flip_type == "BULL" and not bias_bull:
-            return None
+            return _reject(f"FLIP_BULL_VS_BIAS_{bias}")
         if flip_type == "BEAR" and not bias_bear:
-            return None
+            return _reject(f"FLIP_BEAR_VS_BIAS_{bias}")
 
-        # Fraîcheur du signal (0 min = flip sur bougie en cours → affiché "< 15 min")
         mins_ago = candles_ago * 15
         if mins_ago == 0:
             freshness_str = "⚡ < 15 min"
@@ -478,46 +461,41 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
         signal_fresh = mins_ago <= freshness_limit_min
 
         # ══ GATE 3 — PRIX DU BON CÔTÉ DE LA HMA ════════════════
-        # LONG  → prix au-dessus de la HMA
-        # SHORT → prix en-dessous de la HMA
         hma_now = hma.iloc[-1]
         if flip_type == "BULL" and price <= hma_now:
-            return None
+            return _reject("PRICE_BELOW_HMA_ON_BULL")
         if flip_type == "BEAR" and price >= hma_now:
-            return None
+            return _reject("PRICE_ABOVE_HMA_ON_BEAR")
 
         # ══ GATE 4 — FVG DANS LE BON SENS ══════════════════════
-        # Un FVG dans la direction du signal doit exister (dans ou proche)
         atr_m15  = QuantEngine.atr(df_m15, 14)
         atr_val  = atr_m15.iloc[-1]
         atr_mean = atr_m15.iloc[-50:].mean()
 
         in_bull_fvg, in_bear_fvg, nb_fvg, nr_fvg = detect_fvg(df_m15, price, lookback=80)
 
-        # "Proche" = FVG le plus récent à moins de 2 ATR (plus permissif que 1)
         fvg_near_bull = (nb_fvg is not None
                          and abs(price - (nb_fvg[0] + nb_fvg[1]) / 2) < atr_val * 2)
         fvg_near_bear = (nr_fvg is not None
                          and abs(price - (nr_fvg[0] + nr_fvg[1]) / 2) < atr_val * 2)
 
         if flip_type == "BULL" and not (in_bull_fvg or fvg_near_bull):
-            return None
+            return _reject("NO_BULL_FVG")
         if flip_type == "BEAR" and not (in_bear_fvg or fvg_near_bear):
-            return None
+            return _reject("NO_BEAR_FVG")
 
         # ══ TOUS LES GATES PASSÉS — CALCUL SCORE ════════════════
-
-        # PDH / PDL et zone d'intérêt
         pdh = df_d['high'].iloc[-2]
         pdl = df_d['low'].iloc[-2]
 
         ny_tz    = pytz.timezone('America/New_York')
-        df_m15.index = df_m15.index.tz_convert(ny_tz)
+        df_m15_ny = df_m15.copy()
+        df_m15_ny.index = df_m15_ny.index.tz_convert(ny_tz)
         today_ny = datetime.now(ny_tz).date()
-        mask     = ((df_m15.index.date == today_ny) &
-                    (df_m15.index.hour == 0) & (df_m15.index.minute == 0))
-        mid_c    = df_m15[mask]
-        m_open   = mid_c['open'].iloc[0] if not mid_c.empty else df_m15['open'].iloc[0]
+        mask     = ((df_m15_ny.index.date == today_ny) &
+                    (df_m15_ny.index.hour == 0) & (df_m15_ny.index.minute == 0))
+        mid_c    = df_m15_ny[mask]
+        m_open   = mid_c['open'].iloc[0] if not mid_c.empty else df_m15_ny['open'].iloc[0]
 
         atr_d         = QuantEngine.atr(df_d, 14).iloc[-1]
         below_mid     = price < m_open
@@ -532,15 +510,13 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
             "NEUTRE"
         )
 
-        # ADX H1 (fallback M15 si H1 vide)
-        df_adx_src      = df_h1 if not df_h1.empty and len(df_h1) >= 20 else df_m15
-        adx_s, pdi_s, mdi_s = QuantEngine.adx(df_adx_src, 14)
+        df_adx_src           = df_h1 if not df_h1.empty and len(df_h1) >= 20 else df_m15
+        adx_s, pdi_s, mdi_s  = QuantEngine.adx(df_adx_src, 14)
         adx_val = round(adx_s.iloc[-1], 1)
         pdi_val = round(pdi_s.iloc[-1], 1)
         mdi_val = round(mdi_s.iloc[-1], 1)
 
-        # Score
-        score, grade, _ = compute_score(
+        score, grade, score_detail = compute_score(
             flip_type, candles_ago, bias,
             zone_discount, zone_premium,
             near_pdl, near_pdh,
@@ -551,334 +527,426 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
             atr_val, atr_mean
         )
 
-        # Signal texte
         if signal_fresh:
             sig = "▲ LONG"  if flip_type == "BULL" else "▼ SHORT"
         else:
             sig = "LONG (expiré)" if flip_type == "BULL" else "SHORT (expiré)"
 
         return {
-            "Actif + Note": ticker,   # ticker brut, badge construit dans HTML
+            "Actif + Note": ticker,
             "Signal":       sig,
             "Fraîcheur":    freshness_str,
             "Score /100":   score,
             "Grade":        grade,
             "Biais Daily":  bias,
             "Zone":         zone_label,
-            "ADX":          adx_val,
+            "ADX H1":       adx_val,
+            "Score Detail": score_detail,
         }
 
     except Exception as e:
-        st.warning(f"⚠️ Erreur {ticker} : {e}")
+        if debug_log is not None:
+            debug_log.append((ticker, f"EXCEPTION: {e}"))
         return None
-
-
-# ----------------------------------------------------------------
-#  FETCH OANDA
-# ----------------------------------------------------------------
-MAX_RETRIES = 3
-RETRY_DELAY = 1.5   # secondes entre tentatives
-
-def fetch_oanda_data(client, instrument, granularity, count):
-    """
-    Fetch avec 3 tentatives et délai exponentiel.
-    Gère les erreurs OANDA (500, HTML inattendu, timeout, rate-limit).
-    """
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = instruments.InstrumentsCandles(
-                instrument=instrument,
-                params={"count": count, "granularity": granularity}
-            )
-            client.request(r)
-
-            # Vérification que la réponse est bien un dict OANDA (pas une page HTML)
-            if not isinstance(r.response, dict) or "candles" not in r.response:
-                print(f"[OANDA] {instrument} {granularity} : réponse inattendue (tentative {attempt})")
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY * attempt)
-                    continue
-                return pd.DataFrame()
-
-            rows = [
-                {"time":  pd.to_datetime(c["time"]),
-                 "open":  float(c["mid"]["o"]),
-                 "high":  float(c["mid"]["h"]),
-                 "low":   float(c["mid"]["l"]),
-                 "close": float(c["mid"]["c"])}
-                for c in r.response["candles"] if c.get("complete")
-            ]
-
-            if not rows:
-                return pd.DataFrame()
-
-            df = pd.DataFrame(rows).set_index("time")
-            if df.index.tz is None:
-                df.index = df.index.tz_localize("UTC")
-            return df
-
-        except Exception as e:
-            err_str = str(e)
-            # Rate limit OANDA (429) → attendre plus longtemps
-            if "429" in err_str:
-                wait = RETRY_DELAY * attempt * 3
-                print(f"[OANDA] Rate limit {instrument} {granularity} — attente {wait}s")
-                time.sleep(wait)
-            # Erreur serveur OANDA (500) → retry rapide
-            elif "500" in err_str or "503" in err_str:
-                print(f"[OANDA] Erreur serveur {instrument} {granularity} (tentative {attempt})")
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY * attempt)
-                    continue
-            else:
-                print(f"[OANDA] {instrument} {granularity} : {e}")
-            return pd.DataFrame()
-
-    return pd.DataFrame()
 
 
 # ----------------------------------------------------------------
 #  INTERFACE
 # ----------------------------------------------------------------
 def main():
-    st.set_page_config(page_title="BLUESTAR SNIPER V10", layout="wide")
-    st.title("🎯 BLUESTAR SNIPER V10 — ICT Signal Scanner")
-    st.caption("Signal = HMA 20 flip | Score /100 | Grade A+ → C")
+    st.set_page_config(
+        page_title="BLUESTAR SNIPER V10",
+        layout="wide",
+        initial_sidebar_state="collapsed"
+    )
 
-    if "OANDA_ACCESS_TOKEN" not in st.secrets:
-        st.error("Clé API OANDA manquante.")
+    # ── CSS global ────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;600;700&display=swap');
+
+    html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
+    .stApp { background: #080812; }
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background: #0d0d1f !important;
+        border-right: 1px solid #1e1e3a;
+    }
+
+    /* Titres */
+    h1 { font-family: 'IBM Plex Mono', monospace !important; letter-spacing: .04em; }
+
+    /* Boutons */
+    .stButton > button {
+        background: linear-gradient(135deg, #1a3a6b 0%, #0f2548 100%) !important;
+        color: #7ab8f5 !important;
+        border: 1px solid #2a5299 !important;
+        font-family: 'IBM Plex Mono', monospace !important;
+        font-weight: 700 !important;
+        letter-spacing: .06em !important;
+        border-radius: 4px !important;
+        transition: all .2s ease !important;
+    }
+    .stButton > button:hover {
+        background: linear-gradient(135deg, #2a5299 0%, #1a3a6b 100%) !important;
+        border-color: #4a82c9 !important;
+        box-shadow: 0 0 16px rgba(74,130,201,.25) !important;
+    }
+
+    /* Selectbox */
+    .stSelectbox label { color: #7a7aaa !important; font-size: 12px !important; text-transform: uppercase !important; letter-spacing: .08em !important; }
+
+    /* Metric cards */
+    [data-testid="stMetric"] {
+        background: #0d0d1f;
+        border: 1px solid #1e1e3a;
+        border-radius: 6px;
+        padding: 12px 16px !important;
+    }
+    [data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace !important; }
+
+    /* Progress bar */
+    .stProgress > div > div { background: linear-gradient(90deg, #1a6b4a, #3dba7e) !important; }
+
+    /* Expander */
+    .streamlit-expanderHeader { color: #7a7aaa !important; font-size: 12px !important; text-transform: uppercase !important; }
+
+    /* Divider */
+    hr { border-color: #1e1e3a !important; }
+
+    /* Toast-like debug */
+    .debug-box {
+        background: #0d0d1f;
+        border: 1px solid #2a2a4a;
+        border-radius: 6px;
+        padding: 12px 16px;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 11px;
+        color: #6a6a9a;
+        margin-top: 8px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ── HEADER ─────────────────────────────────────────────────────
+    st.markdown("""
+    <div style="display:flex;align-items:center;gap:14px;margin-bottom:4px">
+      <span style="font-size:36px">🎯</span>
+      <div>
+        <h1 style="margin:0;font-size:28px;color:#e8e8f8">BLUESTAR SNIPER V10</h1>
+        <p style="margin:0;color:#4a4a7a;font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.1em">
+          HMA 20 M15 · SCORE /100 · GRADE A+ → C · ICT / SMC ENGINE
+        </p>
+      </div>
+    </div>
+    <hr>
+    """, unsafe_allow_html=True)
+
+    # ── VÉRIF TOKEN ────────────────────────────────────────────────
+    missing = [k for k in ("OANDA_ACCESS_TOKEN", "OANDA_ACCOUNT_ID") if k not in st.secrets]
+    if missing:
+        st.error(f"🔑 **Secret(s) manquant(s) :** `{'`, `'.join(missing)}`")
+        st.code("""# Settings → Secrets (format attendu)
+OANDA_ACCESS_TOKEN = "ton-token-ici"
+OANDA_ACCOUNT_ID   = "ton-account-id"
+""", language="toml")
         st.stop()
 
+    ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
+    ACCOUNT_ID   = st.secrets["OANDA_ACCOUNT_ID"]
+    env          = "practice"   # change en "live" si token live
+
+    # ── CONTRÔLES ─────────────────────────────────────────────────
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        freshness = st.selectbox("Fraîcheur max du signal (min)", [15, 30, 45, 60], index=1)
+    with col2:
+        min_grade = st.selectbox("Grade minimum", ["Tous", "B", "B+", "A", "A+"], index=0)
+    with col3:
+        show_debug = st.toggle("🐛 Debug", value=False)
+
+
+    with st.expander("📘 Grille de notation"):
+        st.markdown("""
+| Critère | Max | Détail |
+|---|---|---|
+| **Trigger HMA flip** | 30 pts | ≤15 min = 30 · ≤30 min = 20 · ≤45 min = 10 · >45 min = 0 |
+| **Biais Daily** | 20 pts | Concordant = 20 · Opposé = 0 |
+| **Zone d'intérêt** | 20 pts | Discount+PDL ou Premium+PDH = 20 · Zone seule = 10 · Hors zone = 0 |
+| **FVG M15** | 15 pts | Dans le FVG = 15 · FVG proche = 7 · Absent = 0 |
+| **ADX momentum** | 10 pts | ADX>25+DI ok = 10 · ADX>20+DI ok = 6 · ADX>20 seul = 3 |
+| **ATR actif** | 5 pts | ≥ moyenne = 5 · ≥ 50% = 3 · Plat = 0 |
+
+| Grade | Score | Signal |
+|---|---|---|
+| 💎 **A+** | 85-100 | Tout aligné — trader immédiatement |
+| 🥇 **A** | 70-84 | Très bon — 1 élément mineur manque |
+| 🥈 **B+** | 55-69 | En formation — surveiller |
+| 🔵 **B** | 40-54 | Partiel — attendre confirmation |
+| ⚪ **C** | < 40 | Faible — ignorer |
+        """)
+
+    # ── LANCER ────────────────────────────────────────────────────
+    run = st.button("🚀  LANCER LE SCANNER", use_container_width=True)
+
+    if not run:
+        st.markdown("""
+        <div style="text-align:center;padding:60px 0;color:#2a2a4a">
+          <div style="font-size:48px">📡</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:14px;letter-spacing:.1em;margin-top:12px">
+            EN ATTENTE — APPUIE SUR LANCER
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    # ── INIT CLIENT ───────────────────────────────────────────────
     client = oandapyV20.API(
-        access_token=st.secrets["OANDA_ACCESS_TOKEN"],
-        environment="practice"
+        access_token=ACCESS_TOKEN,
+        environment=env
     )
 
     assets = [
-        # ── 28 paires Forex ──────────────────────────────────────
-        # Majeurs (7)
+        # Majeurs
         "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF",
         "AUD_USD", "USD_CAD", "NZD_USD",
-        # Croisés EUR (6)
+        # Croisés EUR
         "EUR_GBP", "EUR_JPY", "EUR_CHF",
         "EUR_AUD", "EUR_CAD", "EUR_NZD",
-        # Croisés GBP (5)
+        # Croisés GBP
         "GBP_JPY", "GBP_CHF", "GBP_AUD",
         "GBP_CAD", "GBP_NZD",
-        # Croisés JPY (4)
+        # Croisés JPY
         "AUD_JPY", "CAD_JPY", "CHF_JPY", "NZD_JPY",
-        # Croisés mineurs (6)
+        # Mineurs
         "AUD_CAD", "AUD_CHF", "AUD_NZD",
         "CAD_CHF", "NZD_CAD", "NZD_CHF",
-        # ── Métaux (2) ───────────────────────────────────────────
-        "XAU_USD",   # Gold
-        "XAG_USD",   # Silver
-        # ── Indices (3) ──────────────────────────────────────────
-        "US30_USD",  # Dow Jones
-        "NAS100_USD",# Nasdaq 100
-        "DE30_EUR",  # DAX
+        # Métaux
+        "XAU_USD", "XAG_USD",
+        # Indices
+        "US30_USD", "NAS100_USD", "DE30_EUR",
     ]
 
-    with st.expander("📘 Grille de notation — comment le score est calculé"):
-        st.markdown("""
-        | Critère | Max | Détail |
-        |---|---|---|
-        | **Trigger HMA flip** | 30 pts | ≤15 min = 30 · ≤30 min = 20 · ≤45 min = 10 · >45 min = 0 |
-        | **Biais Daily** | 20 pts | Concordant avec le flip = 20 · Opposé = 0 |
-        | **Zone d'intérêt** | 20 pts | Discount+PDL ou Premium+PDH = 20 · Zone seule = 10 · Hors zone = 0 |
-        | **FVG M15** | 15 pts | Dans le FVG = 15 · FVG proche = 7 · Absent = 0 |
-        | **ADX momentum** | 10 pts | ADX>25+DI ok = 10 · ADX>20+DI ok = 6 · ADX>20 seul = 3 |
-        | **ATR actif** | 5 pts | ≥ moyenne = 5 · ≥ 50% moyenne = 3 · Plat = 0 |
+    results   = []
+    debug_log = []
+    progress  = st.progress(0)
+    status    = st.empty()
+    t_start   = time.time()
 
-        | Grade | Score | Interprétation |
-        |---|---|---|
-        | 💎 **A+** | 85-100 | Tout aligné — trader immédiatement |
-        | 🥇 **A**  | 70-84  | Très bon — 1 élément mineur manque |
-        | 🥈 **B+** | 55-69  | En formation — surveiller, attendre |
-        | 🔵 **B**  | 40-54  | Partiel — pas encore tradable |
-        | ⚪ **C**  | < 40   | Faible — ignorer |
-        """)
+    with st.spinner("Analyse en cours…"):
+        for i, ticker in enumerate(assets):
+            status.caption(f"⏳ Analyse {ticker}… ({i+1}/{len(assets)})")
+            res = analyze_asset(client, ticker,
+                                freshness_limit_min=freshness,
+                                debug_log=debug_log)
+            if res:
+                results.append(res)
+            time.sleep(0.15)
+            progress.progress((i + 1) / len(assets))
 
-    col1, col2, col3 = st.columns([3, 1, 1])
-    with col1:
-        run = st.button("🚀 LANCER LE SCANNER", use_container_width=True)  # noqa
-    with col2:
-        freshness = st.selectbox("Fraîcheur max", [15, 30, 45, 60], index=1)
-    with col3:
-        min_grade = st.selectbox("Grade min affiché", ["Tous", "B", "B+", "A", "A+"], index=0)
+    elapsed = round(time.time() - t_start, 1)
+    status.empty()
+    progress.empty()
 
-    if run:
-        results  = []
-        progress = st.progress(0)
-        status   = st.empty()
+    # ── DEBUG LOG ─────────────────────────────────────────────────
+    if show_debug:
+        with st.expander(f"🐛 Debug — {len(debug_log)} actifs rejetés en {elapsed}s"):
+            if debug_log:
+                counts = Counter(r for _, r in debug_log)
+                cols_d = st.columns(2)
+                with cols_d[0]:
+                    st.markdown("**Raisons de rejet (agrégées)**")
+                    # Group by category
+                    cats = Counter()
+                    for _, reason in debug_log:
+                        cat = reason.split("_")[0] if "_" in reason else reason[:20]
+                        cats[cat] += 1
+                    for cat, n in cats.most_common():
+                        st.markdown(f"- `{cat}` → **{n}**")
+                with cols_d[1]:
+                    st.markdown("**Détail par actif**")
+                    for ticker, reason in debug_log[:30]:
+                        st.markdown(f"`{ticker}` — {reason}")
+                    if len(debug_log) > 30:
+                        st.caption(f"… et {len(debug_log)-30} autres")
+            else:
+                st.success("Aucun rejet — tous les actifs ont passé les gates !")
 
-        with st.spinner("Analyse en cours..."):
-            for i, ticker in enumerate(assets):
-                status.caption(f"⏳ {ticker}...")
-                res = analyze_asset(client, ticker, freshness_limit_min=freshness)
-                if res:
-                    results.append(res)
-                time.sleep(0.2)
-                progress.progress((i + 1) / len(assets))
+    # ── PAS DE RÉSULTATS ─────────────────────────────────────────
+    if not results:
+        st.warning("**Aucun signal valide détecté** sur cette session.")
+        counts = Counter(r for _, r in debug_log)
+        top_reasons = counts.most_common(5)
+        if top_reasons:
+            st.markdown("**Top raisons de rejet :**")
+            for reason, n in top_reasons:
+                icon = "📡" if "FETCH" in reason else "📊" if "BIAS" in reason else "🔄" if "HMA" in reason else "📐" if "FVG" in reason else "⚙️"
+                st.markdown(f"{icon} `{reason}` → **{n}** actif(s)")
 
-        status.empty()
+            # Diagnostic automatique
+            fetch_fails = sum(n for r, n in top_reasons if "FETCH" in r or "TOKEN" in r)
+            if fetch_fails > len(assets) * 0.5:
+                st.error("""🔴 **Diagnostic : Problème de connexion OANDA**  
+Plus de 50 % des actifs échouent au fetch.  
+→ Vérifie que `OANDA_ACCESS_TOKEN` et `OANDA_ACCOUNT_ID` sont corrects dans les secrets  
+→ Vérifie que la variable `env` dans le code correspond à ton type de token (`practice` ou `live`)""")
+        return
 
-        if not results:
-            st.warning("Aucun résultat — vérifie la connexion OANDA.")
-            return
+    df = pd.DataFrame(results)
 
-        df = pd.DataFrame(results)
+    # ── FILTRE GRADE MIN ──────────────────────────────────────────
+    grade_order = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1}
+    min_map     = {"Tous": 0, "B": 2, "B+": 3, "A": 4, "A+": 5}
+    min_val     = min_map[min_grade]
+    df = df[df["Grade"].map(grade_order) >= min_val]
 
-        # ── FILTRE PAR GRADE MIN ──────────────────────────────────
-        grade_order = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1}
-        min_map     = {"Tous": 0, "B": 2, "B+": 3, "A": 4, "A+": 5}
-        min_val     = min_map[min_grade]
-        df = df[df["Grade"].map(grade_order) >= min_val]
+    if df.empty:
+        st.info(f"Aucun signal de grade ≥ **{min_grade}** — élargis le filtre.")
+        return
 
-        # ── TRI : A+ frais → A frais → B+ frais → ... → score décroissant
-        def sort_key(row):
-            fresh = 1 if "⚡" in str(row["Fraîcheur"]) else 0
-            g     = grade_order.get(row["Grade"], 0)
-            s     = row["Score /100"]
-            return (-fresh, -g, -s)
+    # ── TRI ───────────────────────────────────────────────────────
+    def sort_key(row):
+        fresh = 1 if "⚡" in str(row["Fraîcheur"]) else 0
+        g     = grade_order.get(row["Grade"], 0)
+        s     = row["Score /100"]
+        return (-fresh, -g, -s)
 
-        df["_sk"] = df.apply(sort_key, axis=1)
-        df = df.sort_values("_sk").drop(columns=["_sk"]).reset_index(drop=True)
+    df["_sk"] = df.apply(sort_key, axis=1)
+    df = df.sort_values("_sk").drop(columns=["_sk"]).reset_index(drop=True)
 
-        # ── STYLE ─────────────────────────────────────────────────
+    # ── MÉTRIQUES RAPIDES ─────────────────────────────────────────
+    a_plus  = len(df[(df["Grade"] == "A+") & df["Fraîcheur"].str.contains("⚡", na=False)])
+    a_grade = len(df[(df["Grade"] == "A")  & df["Fraîcheur"].str.contains("⚡", na=False)])
+    b_watch = len(df[df["Grade"].isin(["B+","B"]) & df["Fraîcheur"].str.contains("⚡", na=False)])
+    longs   = len(df[df["Signal"].str.contains("LONG", na=False) & ~df["Signal"].str.contains("expiré")])
+    shorts  = len(df[df["Signal"].str.contains("SHORT", na=False) & ~df["Signal"].str.contains("expiré")])
 
-        # ── RENAME ADX column ─────────────────────────────────────
-        if "ADX" in df.columns:
-            df = df.rename(columns={"ADX": "ADX H1"})
+    mc = st.columns(5)
+    with mc[0]: st.metric("💎 Signaux A+", a_plus)
+    with mc[1]: st.metric("🥇 Signaux A",  a_grade)
+    with mc[2]: st.metric("👀 Watch B/B+", b_watch)
+    with mc[3]: st.metric("▲ LONG actifs", longs)
+    with mc[4]: st.metric("▼ SHORT actifs", shorts)
 
-        # ── TABLE HTML ────────────────────────────────────────────
-        # Palette sobre, professionnel — pas de couleurs neon
-        # Vert sobre  : #3dba7e   Rouge sobre : #c0392b
-        # Jaune sobre : #c8960c   Gris texte  : #8a8a9a
-        # Fond ligne A+/A actif   : légère teinte sans agressivité
+    st.markdown("<br>", unsafe_allow_html=True)
 
-        GRADE_STYLE = {
-            "A+": {"color": "#3dba7e", "bg": "rgba(61,186,126,0.07)", "label": "A+"},
-            "A":  {"color": "#5aab8a", "bg": "rgba(90,171,138,0.05)", "label": "A"},
-            "B+": {"color": "#a07c30", "bg": "transparent",           "label": "B+"},
-            "B":  {"color": "#6a7a9a", "bg": "transparent",           "label": "B"},
-            "C":  {"color": "#444455", "bg": "transparent",           "label": "C"},
-        }
+    # ── TABLE HTML ────────────────────────────────────────────────
+    GRADE_STYLE = {
+        "A+": {"color": "#3dba7e", "bg": "rgba(61,186,126,0.06)", "label": "A+"},
+        "A":  {"color": "#5aab8a", "bg": "rgba(90,171,138,0.04)", "label": "A"},
+        "B+": {"color": "#c8960c", "bg": "transparent",           "label": "B+"},
+        "B":  {"color": "#6a7a9a", "bg": "transparent",           "label": "B"},
+        "C":  {"color": "#3a3a55", "bg": "transparent",           "label": "C"},
+    }
 
-        def sig_style(s):
-            if "LONG"  in s and "expiré" not in s and "🚫" not in s:
-                return "color:#3dba7e;font-weight:700;font-size:15px;letter-spacing:.03em"
-            if "SHORT" in s and "expiré" not in s and "🚫" not in s:
-                return "color:#c0392b;font-weight:700;font-size:15px;letter-spacing:.03em"
-            if "🚫" in s or "⚠️" in s:
-                return "color:#a05010;font-weight:600"
-            return "color:#55556a;font-size:13px"
+    def sig_style(s):
+        if "LONG"  in s and "expiré" not in s:
+            return "color:#3dba7e;font-weight:700;font-size:15px;letter-spacing:.03em"
+        if "SHORT" in s and "expiré" not in s:
+            return "color:#c0392b;font-weight:700;font-size:15px;letter-spacing:.03em"
+        return "color:#3a3a55;font-size:12px"
 
-        def adx_style(v):
-            try:
-                f = float(v)
-                if f >= 25: return "color:#3dba7e;font-weight:700"
-                if f >= 20: return "color:#c8960c;font-weight:700"
-                return "color:#555566"
-            except: return "color:#444"
+    def adx_style(v):
+        try:
+            f = float(v)
+            if f >= 25: return "color:#3dba7e;font-weight:700"
+            if f >= 20: return "color:#c8960c;font-weight:700"
+            return "color:#4a4a6a"
+        except: return "color:#333"
 
-        def bias_style(b):
-            if "BULLISH" in b: return "color:#3dba7e;font-weight:600"
-            if "BEARISH" in b: return "color:#c0392b;font-weight:600"
-            return "color:#555566"
+    def zone_style(z):
+        if "DISCOUNT" in z: return "color:#4a8fc0;font-weight:600"
+        if "PREMIUM"  in z: return "color:#b07030;font-weight:600"
+        return "color:#4a4a6a"
 
-        def zone_style(z):
-            if "DISCOUNT" in z: return "color:#4a8fc0;font-weight:600"
-            if "PREMIUM"  in z: return "color:#b07030;font-weight:600"
-            return "color:#60607a"
+    def fresh_style(f):
+        return "color:#c8960c;font-weight:700" if "⚡" in f else "color:#3a3a5a"
 
-        def fvg_style(f):
-            if "Dans FVG" in f: return "color:#3dba7e;font-weight:600"
-            if "proche"   in f: return "color:#c8960c"
-            return "color:#55556a"
+    def score_bar(score):
+        color = "#3dba7e" if score >= 70 else "#c8960c" if score >= 40 else "#c0392b"
+        width = max(4, score)
+        return f"""<div style="display:flex;align-items:center;gap:8px">
+          <div style="width:60px;height:4px;background:#1a1a2e;border-radius:2px;overflow:hidden">
+            <div style="width:{width}%;height:100%;background:{color};border-radius:2px"></div>
+          </div>
+          <span style="color:{color};font-weight:700;font-size:13px">{score}</span>
+        </div>"""
 
-        def fresh_style(f):
-            return "color:#c8960c;font-weight:700" if "⚡" in f else "color:#3a3a4a"
-
-        html = """
+    html = """
 <style>
-.sc-wrap{overflow-x:auto;margin-top:8px}
+.sc-wrap{overflow-x:auto;margin-top:4px}
 .sc-tbl{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono','Courier New',monospace;font-size:13px}
-.sc-tbl thead tr{border-bottom:1px solid #2a2a3e}
+.sc-tbl thead tr{border-bottom:2px solid #1e1e3a}
 .sc-tbl th{
-  padding:10px 16px;text-align:left;color:#7a7aaa;
-  font-size:11px;text-transform:uppercase;letter-spacing:.1em;font-weight:600;white-space:nowrap
+  padding:10px 16px;text-align:left;color:#3a3a6a;
+  font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:600;white-space:nowrap
 }
-.sc-tbl td{padding:12px 16px;border-bottom:1px solid #161622;vertical-align:middle}
-.sc-tbl tr:hover td{background:#0e0e1a}
-.ticker{font-size:22px;font-weight:800;color:#e8e8f0;letter-spacing:.04em;white-space:nowrap}
-.bias-tag{font-size:12px;font-weight:700;letter-spacing:.06em;vertical-align:middle;margin-left:6px;text-transform:uppercase}
+.sc-tbl td{padding:13px 16px;border-bottom:1px solid #0f0f1e;vertical-align:middle}
+.sc-tbl tr:hover td{background:#0c0c1a !important}
+.ticker{font-size:20px;font-weight:800;color:#d8d8f0;letter-spacing:.04em;white-space:nowrap;font-family:'IBM Plex Mono',monospace}
+.bias-tag{font-size:11px;font-weight:700;letter-spacing:.07em;vertical-align:middle;margin-left:8px;text-transform:uppercase;opacity:.85}
 .grade-pill{
-  display:inline-block;padding:3px 9px;border-radius:3px;
-  font-size:12px;font-weight:700;letter-spacing:.06em;
-  border:1px solid;margin-left:10px;vertical-align:middle
+  display:inline-block;padding:2px 8px;border-radius:2px;
+  font-size:11px;font-weight:700;letter-spacing:.08em;
+  border:1px solid currentColor;margin-left:10px;vertical-align:middle;font-family:'IBM Plex Mono',monospace
 }
-.score-val{font-size:12px;font-weight:600;margin-left:5px;opacity:.8}
-.hma-g{color:#3dba7e;font-weight:600}
-.hma-r{color:#c0392b;font-weight:600}
 </style>
 <div class="sc-wrap"><table class="sc-tbl">
 <thead><tr>
-  <th>⚡</th>
+  <th style="width:90px">Fraîcheur</th>
   <th>Actif</th>
   <th>Signal</th>
   <th>Zone</th>
+  <th>Score /100</th>
   <th>ADX H1</th>
 </tr></thead><tbody>
 """
-        for _, row in df.iterrows():
-            grade     = str(row.get("Grade","C"))
-            fresh     = "⚡" in str(row.get("Fraîcheur",""))
-            gs        = GRADE_STYLE.get(grade, GRADE_STYLE["C"])
-            score     = int(row.get("Score /100", 0))
-            ticker    = str(row.get("Actif + Note","")).split("  ")[0].strip()
-            sig       = str(row.get("Signal","—"))
-            adx_v     = str(row.get("ADX H1","—"))
-            bias      = str(row.get("Biais Daily","—"))
-            zone      = str(row.get("Zone","—"))
-            fvg       = str(row.get("FVG M15","—"))
-            hma       = str(row.get("HMA","—"))
-            fresh_str = str(row.get("Fraîcheur","—"))
 
-            hma_cls = "hma-g" if "VERT" in hma else "hma-r"
-            row_bg  = gs["bg"] if fresh and grade in ("A+","A") else "transparent"
+    for _, row in df.iterrows():
+        grade     = str(row.get("Grade","C"))
+        fresh     = "⚡" in str(row.get("Fraîcheur",""))
+        gs        = GRADE_STYLE.get(grade, GRADE_STYLE["C"])
+        score     = int(row.get("Score /100", 0))
+        ticker    = str(row.get("Actif + Note","")).split("  ")[0].strip()
+        sig       = str(row.get("Signal","—"))
+        adx_v     = str(row.get("ADX H1","—"))
+        bias      = str(row.get("Biais Daily","—"))
+        zone      = str(row.get("Zone","—"))
+        fresh_str = str(row.get("Fraîcheur","—"))
 
-            html += f"""<tr style="background:{row_bg}">
-  <td style="{fresh_style(fresh_str)};font-size:15px;text-align:center">{fresh_str}</td>
+        bull_bias = "BULLISH" in bias
+        bias_icon = "▲" if bull_bias else "▼"
+        bias_lbl  = ("STRONG BULL" if bias == "STRONG BULLISH"
+                     else "BULL"       if bias == "BULLISH"
+                     else "STRONG BEAR" if bias == "STRONG BEARISH"
+                     else "BEAR")
+        bias_color = "#3dba7e" if bull_bias else "#c0392b"
+
+        row_bg = gs["bg"] if fresh and grade in ("A+","A") else "transparent"
+
+        html += f"""<tr style="background:{row_bg}">
+  <td style="{fresh_style(fresh_str)}">{fresh_str}</td>
   <td style="white-space:nowrap">
     <span class="ticker">{ticker}</span>
-    <span class="bias-tag" style="color:{'#3dba7e' if 'BULLISH' in bias else '#c0392b'}">&nbsp;{'▲' if 'BULLISH' in bias else '▼'} {'BULL' if bias == 'BULLISH' else 'STRONG BULL' if bias == 'STRONG BULLISH' else 'BEAR' if bias == 'BEARISH' else 'STRONG BEAR'}</span>
-    <span class="grade-pill" style="color:{gs['color']};border-color:{gs['color']}">{gs['label']}</span>
-    <span class="score-val" style="color:{gs['color']}">{score}</span>
+    <span class="bias-tag" style="color:{bias_color}">{bias_icon} {bias_lbl}</span>
+    <span class="grade-pill" style="color:{gs['color']}">{gs['label']}</span>
   </td>
   <td style="{sig_style(sig)}">{sig}</td>
   <td style="{zone_style(zone)}">{zone}</td>
+  <td>{score_bar(score)}</td>
   <td style="{adx_style(adx_v)}">{adx_v}</td>
 </tr>"""
 
-        html += "</tbody></table></div>"
-        st.markdown(html, unsafe_allow_html=True)
-        st.markdown("---")
+    html += "</tbody></table></div>"
+    st.markdown(html, unsafe_allow_html=True)
 
-        # ── RÉSUMÉ ────────────────────────────────────────────────
-        a_plus  = len(df[(df["Grade"] == "A+") & df["Fraîcheur"].str.contains("⚡", na=False)])
-        a_grade = len(df[(df["Grade"] == "A")  & df["Fraîcheur"].str.contains("⚡", na=False)])
-        watch   = len(df[df["Grade"].isin(["B+", "B"]) & df["Fraîcheur"].str.contains("⚡", na=False)])
-
-        cols = st.columns(3)
-        with cols[0]:
-            if a_plus:  st.success(f"💎 {a_plus} setup(s) A+ actif(s)")
-            else:       st.info("Aucun signal A+ actif")
-        with cols[1]:
-            if a_grade: st.success(f"🥇 {a_grade} setup(s) A actif(s)")
-        with cols[2]:
-            if watch:   st.warning(f"👀 {watch} setup(s) B/B+ à surveiller")
-
+    st.markdown(f"""
+    <div style="color:#2a2a4a;font-family:'IBM Plex Mono',monospace;font-size:10px;
+                text-align:right;margin-top:6px;letter-spacing:.06em">
+      {len(df)} signal(s) · scanné en {elapsed}s · {datetime.now().strftime('%H:%M:%S')}
+    </div>
+    """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
