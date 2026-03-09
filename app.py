@@ -814,94 +814,118 @@ def main():
         if "ADX" in df.columns:
             df = df.rename(columns={"ADX": "ADX H1"})
 
-        # ── TABLE HTML CUSTOM ─────────────────────────────────────
-        def grade_color(grade, fresh):
-            if grade == "A+" and fresh: return "#00ff88", "rgba(0,255,136,0.12)"
-            if grade == "A"  and fresh: return "#66ffaa", "rgba(0,255,136,0.06)"
-            if grade == "B+" and fresh: return "#ffd700", "rgba(255,215,0,0.07)"
-            if grade == "B"  and fresh: return "#aaccff", "rgba(100,150,255,0.05)"
-            return "#444444", "transparent"
+        # ── TABLE HTML ────────────────────────────────────────────
+        # Palette sobre, professionnel — pas de couleurs neon
+        # Vert sobre  : #3dba7e   Rouge sobre : #c0392b
+        # Jaune sobre : #c8960c   Gris texte  : #8a8a9a
+        # Fond ligne A+/A actif   : légère teinte sans agressivité
 
-        def sig_color(s):
-            if "LONG" in s and "expiré" not in s and "🚫" not in s: return "#00ff88"
-            if "SHORT" in s and "expiré" not in s and "🚫" not in s: return "#ff4b4b"
-            if "🚫" in s or "⚠️" in s: return "#ff6600"
-            return "#555"
+        GRADE_STYLE = {
+            "A+": {"color": "#3dba7e", "bg": "rgba(61,186,126,0.07)", "label": "A+"},
+            "A":  {"color": "#5aab8a", "bg": "rgba(90,171,138,0.05)", "label": "A"},
+            "B+": {"color": "#a07c30", "bg": "transparent",           "label": "B+"},
+            "B":  {"color": "#6a7a9a", "bg": "transparent",           "label": "B"},
+            "C":  {"color": "#444455", "bg": "transparent",           "label": "C"},
+        }
 
-        def adx_color(v):
+        def sig_style(s):
+            if "LONG"  in s and "expiré" not in s and "🚫" not in s:
+                return "color:#3dba7e;font-weight:700;font-size:15px;letter-spacing:.03em"
+            if "SHORT" in s and "expiré" not in s and "🚫" not in s:
+                return "color:#c0392b;font-weight:700;font-size:15px;letter-spacing:.03em"
+            if "🚫" in s or "⚠️" in s:
+                return "color:#a05010;font-weight:600"
+            return "color:#3a3a4a;font-size:13px"
+
+        def adx_style(v):
             try:
                 f = float(v)
-                return "#00ff88" if f >= 25 else "#ffd700" if f >= 20 else "#ff4b4b"
-            except: return "#888"
+                if f >= 25: return "color:#3dba7e;font-weight:700"
+                if f >= 20: return "color:#c8960c;font-weight:700"
+                return "color:#555566"
+            except: return "color:#444"
 
-        badge_map = {"A+": ("💎", "A+", "#00ff88"), "A": ("🥇", "A", "#66ffaa"),
-                     "B+": ("🥈", "B+", "#ffd700"), "B": ("🔵", "B", "#aaccff"),
-                     "C":  ("⚪", "C",  "#444444")}
+        def bias_style(b):
+            if "BULLISH" in b: return "color:#3dba7e;font-weight:600"
+            if "BEARISH" in b: return "color:#c0392b;font-weight:600"
+            return "color:#555566"
+
+        def zone_style(z):
+            if "DISCOUNT" in z: return "color:#4a8fc0;font-weight:600"
+            if "PREMIUM"  in z: return "color:#b07030;font-weight:600"
+            return "color:#444455"
+
+        def fvg_style(f):
+            if "Dans FVG" in f: return "color:#3dba7e;font-weight:600"
+            if "proche"   in f: return "color:#c8960c"
+            return "color:#3a3a4a"
+
+        def fresh_style(f):
+            return "color:#c8960c;font-weight:700" if "⚡" in f else "color:#3a3a4a"
 
         html = """
 <style>
-.sn-wrap { overflow-x: auto; }
-.sn-tbl { width:100%; border-collapse:collapse; font-family:'Courier New',monospace; }
-.sn-tbl th {
-    background:#070712; color:#3366cc; padding:9px 14px;
-    text-align:left; border-bottom:2px solid #1a1a3a;
-    font-size:10px; text-transform:uppercase; letter-spacing:.08em; white-space:nowrap;
+.sc-wrap{overflow-x:auto;margin-top:8px}
+.sc-tbl{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono','Courier New',monospace;font-size:13px}
+.sc-tbl thead tr{border-bottom:1px solid #1e1e2e}
+.sc-tbl th{
+  padding:10px 16px;text-align:left;color:#3a3a5a;
+  font-size:10px;text-transform:uppercase;letter-spacing:.1em;font-weight:500;white-space:nowrap
 }
-.sn-tbl td { padding:10px 14px; border-bottom:1px solid #0e0e1e; vertical-align:middle; }
-.sn-tbl tr:hover td { background:#0a0a18; }
-.ticker { font-size:17px; font-weight:900; color:#fff; letter-spacing:.04em; }
-.badge  { display:inline-flex; align-items:center; gap:4px;
-          padding:4px 10px; border-radius:5px; font-size:14px;
-          font-weight:900; border-width:2px; border-style:solid; white-space:nowrap; }
-.sbar-wrap { display:flex; align-items:center; gap:7px; }
-.sbar { height:7px; border-radius:4px; }
-.score-num { font-size:14px; font-weight:800; }
-.qual { font-size:13px; font-weight:800; }
+.sc-tbl td{padding:11px 16px;border-bottom:1px solid #111118;vertical-align:middle}
+.sc-tbl tr:hover td{background:#0c0c16}
+.ticker{font-size:16px;font-weight:800;color:#d0d0e0;letter-spacing:.05em}
+.grade-pill{
+  display:inline-block;padding:3px 9px;border-radius:3px;
+  font-size:12px;font-weight:700;letter-spacing:.06em;
+  border:1px solid;margin-left:10px;vertical-align:middle
+}
+.score-val{font-size:12px;font-weight:600;margin-left:5px;opacity:.8}
+.hma-g{color:#3dba7e;font-weight:600}
+.hma-r{color:#c0392b;font-weight:600}
 </style>
-<div class="sn-wrap"><table class="sn-tbl">
+<div class="sc-wrap"><table class="sc-tbl">
 <thead><tr>
-  <th>Actif</th><th>Note &amp; Score</th><th>Signal</th><th>Fraîcheur</th>
-  <th>Biais Daily</th><th>Zone</th><th>FVG M15</th><th>HMA</th>
-  <th>ADX H1</th><th>Qualité</th><th>Prix</th>
+  <th>Actif</th>
+  <th>Signal</th>
+  <th>⚡ Fraîcheur</th>
+  <th>Biais Daily</th>
+  <th>Zone</th>
+  <th>FVG M15</th>
+  <th>HMA 20</th>
+  <th>ADX H1</th>
 </tr></thead><tbody>
 """
         for _, row in df.iterrows():
-            grade  = str(row.get("Grade","C"))
-            fresh  = "⚡" in str(row.get("Fraîcheur",""))
-            fc, bg = grade_color(grade, fresh)
-            score  = int(row.get("Score /100", 0))
-            emoji, glabel, gc = badge_map.get(grade, ("⚪","C","#444"))
-            ticker_raw = str(row.get("Actif + Note","")).split("  ")[0].strip()
-            sig   = str(row.get("Signal","—"))
-            adx_v = row.get("ADX H1","—")
-            bias  = str(row.get("Biais Daily","—"))
-            zone  = str(row.get("Zone","—"))
-            fvg   = str(row.get("FVG M15","—"))
-            hma   = str(row.get("HMA","—"))
-            qual  = str(row.get("Qualité","—"))
-            prix  = str(row.get("Prix","—"))
+            grade     = str(row.get("Grade","C"))
+            fresh     = "⚡" in str(row.get("Fraîcheur",""))
+            gs        = GRADE_STYLE.get(grade, GRADE_STYLE["C"])
+            score     = int(row.get("Score /100", 0))
+            ticker    = str(row.get("Actif + Note","")).split("  ")[0].strip()
+            sig       = str(row.get("Signal","—"))
+            adx_v     = str(row.get("ADX H1","—"))
+            bias      = str(row.get("Biais Daily","—"))
+            zone      = str(row.get("Zone","—"))
+            fvg       = str(row.get("FVG M15","—"))
+            hma       = str(row.get("HMA","—"))
             fresh_str = str(row.get("Fraîcheur","—"))
 
-            bar_w = max(4, int(score * 0.55))
-            bar_c = "#00ff88" if score>=85 else "#ffd700" if score>=55 else "#ff4b4b"
-            bias_c = "#00ff88" if "BULLISH" in bias else "#ff4b4b" if "BEARISH" in bias else "#888"
-            zone_c = "#00ccff" if "DISCOUNT" in zone else "#ff9900" if "PREMIUM" in zone else "#666"
-            fvg_c  = "#00ff88" if "Dans FVG" in fvg else "#ffd700" if "proche" in fvg else "#555"
-            qual_c = "#00ff88" if "A+ SETUP" in qual else "#66ffaa" if "A SETUP" in qual else "#ffd700" if "SURVEILLER" in qual else "#ff4444" if "HMA" in qual else "#444"
-            row_bg = bg if fresh and grade in ("A+","A") else "transparent"
+            hma_cls = "hma-g" if "VERT" in hma else "hma-r"
+            row_bg  = gs["bg"] if fresh and grade in ("A+","A") else "transparent"
 
             html += f"""<tr style="background:{row_bg}">
-  <td><span class="ticker">{ticker_raw}</span></td>
-  <td><span class="badge" style="color:{gc};border-color:{gc};background:rgba(128,128,128,0.05)">{emoji} {glabel} &nbsp;<span style="font-size:15px">{score}</span></span></td>
-  <td style="color:{sig_color(sig)};font-weight:800;font-size:14px">{sig}</td>
-  <td style="color:{'#ffd700' if fresh else '#555'};font-weight:{'800' if fresh else '400'}">{fresh_str}</td>
-  <td style="color:{bias_c};font-weight:700">{bias}</td>
-  <td style="color:{zone_c};font-weight:600">{zone}</td>
-  <td style="color:{fvg_c};font-weight:600">{fvg}</td>
-  <td>{hma}</td>
-  <td style="color:{adx_color(adx_v)};font-weight:800;font-size:15px">{adx_v}</td>
-  <td class="qual" style="color:{qual_c}">{qual}</td>
-  <td style="color:#777;font-size:12px">{prix}</td>
+  <td>
+    <span class="ticker">{ticker}</span>
+    <span class="grade-pill" style="color:{gs['color']};border-color:{gs['color']}">{gs['label']}</span>
+    <span class="score-val" style="color:{gs['color']}">{score}</span>
+  </td>
+  <td style="{sig_style(sig)}">{sig}</td>
+  <td style="{fresh_style(fresh_str)}">{fresh_str}</td>
+  <td style="{bias_style(bias)}">{bias}</td>
+  <td style="{zone_style(zone)}">{zone}</td>
+  <td style="{fvg_style(fvg)}">{fvg}</td>
+  <td class="{hma_cls}">{hma}</td>
+  <td style="{adx_style(adx_v)}">{adx_v}</td>
 </tr>"""
 
         html += "</tbody></table></div>"
@@ -916,7 +940,7 @@ def main():
         cols = st.columns(3)
         with cols[0]:
             if a_plus:  st.success(f"💎 {a_plus} setup(s) A+ actif(s)")
-            else:       st.info("Aucun A+ pour l'instant")
+            else:       st.info("Aucun signal A+ actif")
         with cols[1]:
             if a_grade: st.success(f"🥇 {a_grade} setup(s) A actif(s)")
         with cols[2]:
