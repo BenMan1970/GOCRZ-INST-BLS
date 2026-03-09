@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import oandapyV20
 import oandapyV20.endpoints.instruments as instruments
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pytz
 import time
 
@@ -32,64 +32,115 @@ class QuantEngine:
         high, low, close = df['high'], df['low'], df['close']
         tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
         atr = tr.ewm(alpha=1/period, adjust=False).mean()
-        
         up, down = high.diff(), -low.diff()
-        
-        # Calcul des DM lissés
         plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0), index=df.index).ewm(alpha=1/period, adjust=False).mean()
         minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0), index=df.index).ewm(alpha=1/period, adjust=False).mean()
-        
-        # Correction: Suppression de la ligne 'dx' buguée et calcul direct du retour
-        # Calcul du DX sans variable intermédiaire inutile pour éviter l'erreur NameError
         di_plus = plus_dm / atr
         di_minus = minus_dm / atr
-        
         dx = (abs(di_plus - di_minus) / (di_plus + di_minus)) * 100
         return dx.ewm(alpha=1/period, adjust=False).mean().iloc[-1]
 
 # ===============================
-# ANALYSE & ICT LOGIC
+# ANALYSE & ICT LOGIC (CORRIGÉ)
 # ===============================
 
 def analyze_asset(client, ticker):
     try:
-        # Récupération OANDA
+        # 1. Récupération des données
+        # Augmenter le count M15 pour bien trouver la bougie de minuit et les PDH/PDL
         df_d = fetch_oanda_data(client, ticker, "D", 10)
-        df_m15 = fetch_oanda_data(client, ticker, "M15", 100)
+        df_m15 = fetch_oanda_data(client, ticker, "M15", 200) 
+        
         if df_d.empty or df_m15.empty: return None
 
         price = df_m15['close'].iloc[-1]
         
-        # 1. MIDNIGHT OPEN (NY TIME)
+        # 2. TIMEZONE SETUP (NEW YORK)
         ny_tz = pytz.timezone('America/New_York')
         df_m15.index = df_m15.index.tz_convert(ny_tz)
-        today_ny = datetime.now(ny_tz).date()
-        m15_today = df_m15[df_m15.index.date == today_ny]
-        m_open = m15_today['open'].iloc[0] if not m15_today.empty else df_m15['open'].iloc[0]
+        
+        now_ny = datetime.now(ny_tz)
+        today_ny_date = now_ny.date()
+        
+        # 3. MIDNIGHT OPEN (00:00 NEW YORK)
+        # Recherche de la bougie M15 qui débute à 00:00 NY aujourd'hui
+        midnight_candle = df_m15[(df_m15.index.date == today_ny_date) & (df_m15.index.hour == 0) & (df_m15.index.minute == 0)]
+        
+        if midnight_candle.empty:
+            # Fallback si minuit n'est pas encore là (ex: dimanche soir ou early monday)
+            m_open = df_m15['open'].iloc[0] 
+        else:
+            m_open = midnight_candle['open'].iloc[0]
 
-        # 2. BIAIS & ZONES
-        # CORRECTION: Calcul d'une vraie EMA (ewm) au lieu de la SMA (rolling) pour correspondre au nom 'ema5'
+        # 4. PDH & PDL (Previous Day High/Low)
+        # On prend la journée précédente (hier) par rapport à aujourd'hui en NY time
+        yesterday_ny_date = today_ny_date - timedelta(days=1)
+        
+        # Filtre sur les données d'hier
+        df_yesterday = df_m15[df_m15.index.date == yesterday_ny_date]
+        
+        # Gestion des weekends (si hier est dimanche, on prend vendredi etc...)
+        # On recule jusqu'à trouver des données
+        while df_yesterday.empty and yesterday_ny_date > today_ny_date - timedelta(days=5):
+            yesterday_ny_date -= timedelta(days=1)
+            df_yesterday = df_m15[df_m15.index.date == yesterday_ny_date]
+
+        if df_yesterday.empty:
+            pdh, pdl = np.nan, np.nan
+        else:
+            pdh = df_yesterday['high'].max()
+            pdl = df_yesterday['low'].min()
+
+        # 5. BIAIS (Tendance Journalière)
+        # Calcul EMA 5 sur le Daily (Simple Momentum)
         ema5 = df_d['close'].ewm(span=5, adjust=False).mean().iloc[-1]
         bias = "BULLISH" if price > ema5 else "BEARISH"
-        
-        zone = "NEUTRAL"
-        if bias == "BULLISH" and price < m_open: zone = "DISCOUNT (BUY) 🟢"
-        elif bias == "BEARISH" and price > m_open: zone = "PREMIUM (SELL) 🔴"
 
-        # 3. SCORE V10
+        # 6. ZONES PREMIUM / DISCOUNT (LOGIQUE STRICTE ICT)
+        # Si Prix > Midnight Open -> PREMIUM (Chercher VENTE)
+        # Si Prix < Midnight Open -> DISCOUNT (Chercher ACHAT)
+        
+        if price > m_open:
+            zone = "PREMIUM 🔴" 
+        else:
+            zone = "DISCOUNT 🟢"
+            
+        # 7. LOGIQUE DE SCORE V10
         score = 0
+        
+        # Points pour le Biais
         if bias == "BULLISH": score += 3
+        
+        # Points pour HMA 20
         hma = QuantEngine.hma(df_m15['close'], 20)
         hma_t = "BULLISH" if hma.iloc[-1] > hma.iloc[-2] else "BEARISH"
         if hma_t == bias: score += 4
+        
+        # Points Momentum Bougie
         if price > df_m15['open'].iloc[-1]: score += 3 
-        if df_m15['low'].iloc[-1] > df_m15['high'].iloc[-3]: score += 4 
+        
+        # Points FVG (Détection simple)
+        if df_m15['low'].iloc[-1] > df_m15['high'].iloc[-3]: score += 4
 
+        # Qualité du Setup
         quality = "💎 A+ SETUP" if score >= 12 else "✅ A SETUP" if score >= 9 else "⚖️ B SETUP" if score >= 7 else "IGNORE"
 
-        return {"Actif": ticker, "Signal": bias, "Zone": zone, "Qualité": quality, "Score": score, "HMA 20": hma_t}
+        # Calcul distance PDH (optionnel pour affichage)
+        dist_pdh = ((pdh - price) / price) * 100 if not np.isnan(pdh) else 0
+
+        return {
+            "Actif": ticker, 
+            "Signal": bias, 
+            "Zone": zone, 
+            "Qualité": quality, 
+            "Score": score, 
+            "HMA 20": hma_t,
+            "Midnight": round(m_open, 5),
+            "PDH": round(pdh, 5) if not np.isnan(pdh) else 0,
+            "PDL": round(pdl, 5) if not np.isnan(pdl) else 0
+        }
+
     except Exception as e:
-        # Ajout d'un print pour debug dans les logs si nécessaire
         print(f"Erreur analyse {ticker}: {e}")
         return None
 
@@ -111,15 +162,12 @@ def fetch_oanda_data(client, instrument, granularity, count):
 
 def main():
     st.set_page_config(page_title="BLUESTAR SNIPER V10", layout="wide")
-    st.title("🎯 BLUESTAR SNIPER V10 - Scanner Manuel")
+    st.title("🎯 BLUESTAR SNIPER V10 - Scanner ICT")
 
-    # CORRECTION: Utilisation du nom de secret exact fourni (OANDA_ACCESS_TOKEN)
     if "OANDA_ACCESS_TOKEN" not in st.secrets:
-        st.error("ERREUR : La clé 'OANDA_ACCESS_TOKEN' est introuvable dans vos secrets Streamlit.")
+        st.error("ERREUR : La clé 'OANDA_ACCESS_TOKEN' est introuvable.")
         st.stop()
 
-    # Note: OANDA_ACCOUNT_ID n'est pas nécessaire pour récupérer les bougies (instruments), 
-    # mais nécessaire pour passer des ordres. On utilise ici uniquement le token.
     client = oandapyV20.API(access_token=st.secrets["OANDA_ACCESS_TOKEN"], environment="practice")
 
     assets = ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CAD", "AUD_USD", "XAU_USD", "NAS100_USD", "GBP_CHF", "CAD_CHF"]
@@ -133,22 +181,26 @@ def main():
             status_text.text(f"Analyse de {ticker}...")
             res = analyze_asset(client, ticker)
             if res: results.append(res)
-            time.sleep(0.1) # Petit délai pour ne pas saturer l'API
+            time.sleep(0.1) 
             progress.progress((i + 1) / len(assets))
 
         if results:
             df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
             
-            # Fonction de style améliorée
             def color_cells(val):
                 if 'BULLISH' in str(val) or '🟢' in str(val): return 'color: #00ff00'
                 elif 'BEARISH' in str(val) or '🔴' in str(val): return 'color: #ff4b4b'
                 return 'color: white'
 
-            st.dataframe(df.style.applymap(color_cells, subset=['Signal', 'HMA 20', 'Zone']), use_container_width=True)
+            # Affichage amélioré avec les nouvelles colonnes
+            st.dataframe(
+                df.style.applymap(color_cells, subset=['Signal', 'HMA 20', 'Zone'])
+                .format({"Midnight": "{:.5f}", "PDH": "{:.5f}", "PDL": "{:.5f}"}), 
+                use_container_width=True
+            )
             st.success("Scan terminé !")
         else:
-            st.warning("Aucun résultat trouvé. Vérifiez votre connexion API ou le marché (ex: week-end).")
+            st.warning("Aucun résultat.")
 
 if __name__ == "__main__":
     main()
