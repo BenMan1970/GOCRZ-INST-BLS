@@ -869,6 +869,7 @@ def main():
 .sc-tbl td{padding:12px 16px;border-bottom:1px solid #161622;vertical-align:middle}
 .sc-tbl tr:hover td{background:#0e0e1a}
 .ticker{font-size:22px;font-weight:800;color:#e8e8f0;letter-spacing:.04em;white-space:nowrap}
+.bias-tag{font-size:12px;font-weight:700;letter-spacing:.06em;vertical-align:middle;margin-left:6px;text-transform:uppercase}
 .grade-pill{
   display:inline-block;padding:3px 9px;border-radius:3px;
   font-size:12px;font-weight:700;letter-spacing:.06em;
@@ -883,7 +884,6 @@ def main():
   <th>⚡</th>
   <th>Actif</th>
   <th>Signal</th>
-  <th>Biais Daily</th>
   <th>Zone</th>
   <th>ADX H1</th>
 </tr></thead><tbody>
@@ -909,11 +909,11 @@ def main():
   <td style="{fresh_style(fresh_str)};font-size:15px;text-align:center">{fresh_str}</td>
   <td style="white-space:nowrap">
     <span class="ticker">{ticker}</span>
+    <span class="bias-tag" style="color:{'#3dba7e' if 'BULLISH' in bias else '#c0392b'}">&nbsp;{'▲' if 'BULLISH' in bias else '▼'} {bias}</span>
     <span class="grade-pill" style="color:{gs['color']};border-color:{gs['color']}">{gs['label']}</span>
     <span class="score-val" style="color:{gs['color']}">{score}</span>
   </td>
   <td style="{sig_style(sig)}">{sig}</td>
-  <td style="{bias_style(bias)}">{bias}</td>
   <td style="{zone_style(zone)}">{zone}</td>
   <td style="{adx_style(adx_v)}">{adx_v}</td>
 </tr>"""
