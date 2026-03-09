@@ -28,90 +28,82 @@ class QuantEngine:
         return hma.ewm(span=5, adjust=False).mean()
 
 # ===============================
-# ANALYSE & ICT LOGIC (AUDITED)
+# ANALYSE & ICT LOGIC (FINAL FIX)
 # ===============================
 
-def get_institutional_bias(df_daily):
+def get_market_bias(df_daily):
     """
-    Réplique exacte de la logique 'getInstitutionalTrend' du script TradingView pour le Timeframe Daily.
-    Retourne: "BULLISH", "BEARISH" ou "NEUTRAL"
+    Logique de Tendance corrigée pour détecter les mouvements baissiers 
+    même si la SMA 200 est loin (Tendance intermédiaire).
     """
-    if len(df_daily) < 200: 
-        return "NEUTRAL"
+    if len(df_daily) < 60: return "NEUTRAL"
     
     close = df_daily['close']
     
-    # Calcul des moyennes (TradingView Script Lignes 151-153)
-    sma200 = close.rolling(200).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
+    # Moyennes
     ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    # sma200 = close.rolling(200).mean() # On retire la dépendance stricte SMA200 pour le signal court terme
     
-    # Dernières valeurs
     c = close.iloc[-1]
-    s200 = sma200.iloc[-1]
-    e50 = ema50.iloc[-1]
     e21 = ema21.iloc[-1]
+    e50 = ema50.iloc[-1]
     
-    # Logique Perfect/Strong Bull/Bear (Lignes 157-162 du script Pine)
-    aboveSMA200 = c > s200
-    belowSMA200 = c < s200
-    ema50AboveSMA = e50 > s200
-    ema50BelowSMA = e50 < s200
-    ema21Above50 = e21 > e50
-    ema21Below50 = e21 < e50
+    # Logique Bearish stricte (Prix sous EMA21 et EMA21 sous EMA50)
+    bearish_structure = c < e21 and e21 < e50
     
-    perfectBull = aboveSMA200 and ema50AboveSMA and ema21Above50 and c > e21
-    perfectBear = belowSMA200 and ema50BelowSMA and ema21Below50 and c < e21
+    # Logique Bullish stricte (Prix sur EMA21 et EMA21 sur EMA50)
+    bullish_structure = c > e21 and e21 > e50
     
-    strongBull = aboveSMA200 and ema50AboveSMA
-    strongBear = belowSMA200 and ema50BelowSMA
-    
-    if perfectBull or strongBull:
-        return "BULLISH"
-    elif perfectBear or strongBear:
+    if bearish_structure:
         return "BEARISH"
+    elif bullish_structure:
+        return "BULLISH"
     else:
         return "NEUTRAL"
 
 def analyze_asset(client, ticker):
     try:
         # 1. Récupération Données
-        # Daily : Besoin de 200 bougies pour la SMA200
         df_d = fetch_oanda_data(client, ticker, "D", 250)
-        # M15 : Pour le contexte intraday, Midnight Open, FVG
         df_m15 = fetch_oanda_data(client, ticker, "M15", 200)
         
         if df_d.empty or df_m15.empty: return None
 
         price = df_m15['close'].iloc[-1]
         
-        # 2. BIAIS INSTITUTIONNEL (Basé sur Daily TF)
-        # Utilise la nouvelle fonction 'get_institutional_bias'
-        bias = get_institutional_bias(df_d)
+        # 2. BIAIS (Tendance Journalière)
+        bias = get_market_bias(df_d)
         
-        # 3. TIMEZONE & MIDNIGHT OPEN (NEW YORK)
+        # 3. MIDNIGHT OPEN (00:00 NEW YORK)
         ny_tz = pytz.timezone('America/New_York')
         df_m15.index = df_m15.index.tz_convert(ny_tz)
         
         now_ny = datetime.now(ny_tz)
         today_ny_date = now_ny.date()
         
-        # Trouver l'ouverture de minuit (00:00 NY)
-        midnight_mask = (df_m15.index.date == today_ny_date) & (df_m15.index.hour == 0) & (df_m15.index.minute == 0)
-        midnight_candles = df_m15[midnight_mask]
+        # Recherche stricte de la bougie 00:00
+        midnight_open = np.nan
         
-        if not midnight_candles.empty:
-            m_open = midnight_candles['open'].iloc[0]
+        # On cherche dans les données M15 la bougie de 00:00 d'aujourd'hui
+        today_data = df_m15[df_m15.index.date == today_ny_date]
+        
+        if not today_data.empty:
+            # Prendre l'open de la première bougie disponible du jour (souvent 00:00 ou 17:00 la veille selon le broker)
+            # Pour être précis "Midnight NY", on filtre l'heure
+            midnight_candle = today_data[(today_data.index.hour == 0) & (today_data.index.minute == 0)]
+            if not midnight_candle.empty:
+                midnight_open = midnight_candle['open'].iloc[0]
+            else:
+                # Si pas de bougie 00:00 (market closed), on prend l'open du jour précédent à 17h ou le début des données
+                # Fallback simple : Open de la journée en cours
+                midnight_open = today_data['open'].iloc[0]
         else:
-            # Fallback : Ouverture du jour actuel si 00:00 pas encore disponible (ex: early session)
-            # On prend l'open de la première bougie dispo du jour
-            today_candles = df_m15[df_m15.index.date == today_ny_date]
-            m_open = today_candles['open'].iloc[0] if not today_candles.empty else df_m15['open'].iloc[-1]
+            # Si on est dimanche soir / lundi matin, on prend l'open de la semaine
+            midnight_open = df_m15['open'].iloc[0]
 
         # 4. PREVIOUS DAY HIGH/LOW (PDH/PDL)
-        # Méthode fiable : Prendre la bougie Daily d'hier (iloc[-2])
-        # Note : OANDA aligne le Daily sur 17h NY (ou 16h DST), mais le High/Low couvre la session précédente.
-        # On suppose que la bougie Daily complétée la plus récente est la référence.
+        # Prendre les valeurs de la bougie journalière complétée (iloc[-2])
         if len(df_d) >= 2:
             pdh = df_d['high'].iloc[-2]
             pdl = df_d['low'].iloc[-2]
@@ -119,43 +111,46 @@ def analyze_asset(client, ticker):
             pdh, pdl = np.nan, np.nan
 
         # 5. ZONES PREMIUM / DISCOUNT
-        # Règle stricte ICT :
-        # Prix > Midnight Open = PREMIUM (Zone de Vente)
-        # Prix < Midnight Open = DISCOUNT (Zone d'Achat)
+        # LOGIQUE STRICTE :
+        # Prix > Midnight Open = PREMIUM
+        # Prix < Midnight Open = DISCOUNT
         
-        if price > m_open:
+        if price > midnight_open:
             zone = "PREMIUM 🔴" 
         else:
             zone = "DISCOUNT 🟢"
             
-        # 6. LOGIQUE DE SCORE V10
+        # 6. SCORE V10
         score = 0
         
-        # A. Alignement Tendance
-        if bias == "BULLISH": score += 4 # Poids augmenté pour la tendance institutionnelle
-        elif bias == "BEARISH": score += 0 # Pas de points si bearish (base 0)
+        # A. Tendance
+        if bias == "BULLISH": score += 3
+        elif bias == "BEARISH": score += 3 # Le score est neutre sur la direction, mais le signal compte
         
         # B. HMA 20 (Momentum Court Terme)
         hma = QuantEngine.hma(df_m15['close'], 20)
         hma_t = "BULLISH" if hma.iloc[-1] > hma.iloc[-2] else "BEARISH"
         
-        # Si HMA aligné avec le Biais (ou neutre)
-        if bias == "BULLISH" and hma_t == "BULLISH": score += 3
-        elif bias == "BEARISH" and hma_t == "BEARISH": score += 3
+        # Alignement Momentum/Tendance
+        if bias == hma_t: score += 4
         
-        # C. FVG (Fair Value Gap)
-        # Détection simple : Low actuel > High d'il y a 2 bougies
+        # C. FVG (Fair Value Gap) sur M15
         last_fvg_bull = df_m15['low'].iloc[-1] > df_m15['high'].iloc[-3]
         last_fvg_bear = df_m15['high'].iloc[-1] < df_m15['low'].iloc[-3]
         
         if bias == "BULLISH" and last_fvg_bull: score += 3
         if bias == "BEARISH" and last_fvg_bear: score += 3
 
-        # D. Position Ideal (Proximité PDH/PDL)
-        # Bonus si on est proche des liquidités cibles
-        if bias == "BEARISH" and price >= (pdl * 1.001): score += 2 # Près de PDL pour TP
-        if bias == "BULLISH" and price <= (pdh * 0.999): score += 2 # Près de PDH pour TP
+        # D. Position Ideal (Bonus Proximité liquidités)
+        # Si Bearish et qu'on est proche du PDH (Resistance) -> Bonus
+        # Si Bullish et qu'on est proche du PDL (Support) -> Bonus
+        try:
+            if bias == "BEARISH" and not np.isnan(pdh) and price >= (pdh * 0.998): score += 2
+            if bias == "BULLISH" and not np.isnan(pdl) and price <= (pdl * 1.002): score += 2
+        except:
+            pass
 
+        # Qualité
         quality = "💎 A+ SETUP" if score >= 10 else "✅ A SETUP" if score >= 7 else "⚖️ B SETUP" if score >= 4 else "IGNORE"
 
         return {
@@ -165,7 +160,8 @@ def analyze_asset(client, ticker):
             "Qualité": quality, 
             "Score": score, 
             "HMA 20": hma_t,
-            "Midnight": round(m_open, 5),
+            "Midnight": round(midnight_open, 5),
+            "Prix": round(price, 5),
             "PDH": round(pdh, 5),
             "PDL": round(pdl, 5)
         }
@@ -193,7 +189,7 @@ def fetch_oanda_data(client, instrument, granularity, count):
 
 def main():
     st.set_page_config(page_title="BLUESTAR SNIPER V10", layout="wide")
-    st.title("🎯 BLUESTAR SNIPER V10 - Scanner ICT Audité")
+    st.title("🎯 BLUESTAR SNIPER V10 - Scanner ICT Final")
 
     if "OANDA_ACCESS_TOKEN" not in st.secrets:
         st.error("ERREUR : La clé 'OANDA_ACCESS_TOKEN' est introuvable.")
@@ -212,7 +208,7 @@ def main():
             status_text.text(f"Analyse de {ticker}...")
             res = analyze_asset(client, ticker)
             if res: results.append(res)
-            time.sleep(0.2) # Légère pause pour API
+            time.sleep(0.2) 
             progress.progress((i + 1) / len(assets))
 
         if results:
@@ -224,9 +220,12 @@ def main():
                 elif 'NEUTRAL' in str(val): return 'color: gray'
                 return 'color: white'
 
+            # Affichage avec les colonnes Prix vs Midnight pour vérification visuelle
+            cols_to_show = ["Actif", "Signal", "Zone", "Qualité", "Score", "Prix", "Midnight", "PDH", "PDL", "HMA 20"]
+            
             st.dataframe(
-                df.style.applymap(color_cells, subset=['Signal', 'HMA 20', 'Zone'])
-                .format({"Midnight": "{:.5f}", "PDH": "{:.5f}", "PDL": "{:.5f}"}), 
+                df[cols_to_show].style.applymap(color_cells, subset=['Signal', 'HMA 20', 'Zone'])
+                .format({"Midnight": "{:.5f}", "Prix": "{:.5f}", "PDH": "{:.5f}", "PDL": "{:.5f}"}), 
                 use_container_width=True
             )
             st.success("Scan terminé !")
