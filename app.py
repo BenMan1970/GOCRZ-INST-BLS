@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import time
 
 # ===============================
-# ENGINE ICT (FVG, PD ARRAYS, HMA)
+# ENGINE ICT & MOMENTUM
 # ===============================
 class ICTEngine:
     @staticmethod
@@ -21,9 +21,7 @@ class ICTEngine:
     @staticmethod
     def detect_fvg(df):
         if len(df) < 3: return None
-        # Bullish FVG (Gap entre High i-2 et Low i)
         if df['low'].iloc[-1] > df['high'].iloc[-3]: return "BULLISH"
-        # Bearish FVG (Gap entre Low i-2 et High i)
         if df['high'].iloc[-1] < df['low'].iloc[-3]: return "BEARISH"
         return None
 
@@ -39,10 +37,9 @@ class ICTEngine:
         return adx.iloc[-1]
 
 # ===============================
-# LOGIQUE DE SCANNER (14 POINTS)
+# ANALYSE PAR ACTIF (14 POINTS)
 # ===============================
 def analyze_asset(client, ticker):
-    # Récupération des données (D, H4, H1, M15)
     df_d = fetch_oanda(client, ticker, "D", 5)
     df_h4 = fetch_oanda(client, ticker, "H4", 20)
     df_h1 = fetch_oanda(client, ticker, "H1", 20)
@@ -51,68 +48,72 @@ def analyze_asset(client, ticker):
     if df_d.empty or df_h4.empty or df_h1.empty or df_m15.empty: return None
 
     price = df_m15['close'].iloc[-1]
+    last_candle_time = df_m15.index[-1]
     score = 0
-    confluences = []
-
-    # 1. DAILY BIAS (Filtre Principal)
-    ema_d = df_d['close'].rolling(5).mean().iloc[-1]
-    bias = "BULLISH" if price > ema_d else "BEARISH"
+    
+    # 1. DAILY BIAS
+    bias = "BULLISH" if price > df_d['close'].iloc[-1] else "BEARISH"
     score += 3
-    confluences.append(f"Bias {bias}")
 
-    # 2. MIDNIGHT OPEN & PD ARRAY (Premium/Discount)
-    # On simule le Midnight Open avec la première bougie de la journée
-    midnight_open = df_m15.between_time('00:00', '01:00')['open'].iloc[0] if not df_m15.between_time('00:00', '01:00').empty else price
-    pdh, pdl = df_d['high'].iloc[-2], df_d['low'].iloc[-2]
+    # 2. MIDNIGHT OPEN (PREMIUM / DISCOUNT)
+    # Récupération de l'ouverture de la première bougie M15 de la journée UTC
+    today = datetime.now(timezone.utc).date()
+    midnight_candles = df_m15[df_m15.index.date == today]
+    midnight_open = midnight_candles['open'].iloc[0] if not midnight_candles.empty else df_m15['open'].iloc[0]
     
     zone = "NEUTRAL"
-    if bias == "BULLISH" and price < midnight_open: zone = "DISCOUNT 🟢"
-    elif bias == "BEARISH" and price > midnight_open: zone = "PREMIUM 🔴"
+    if bias == "BULLISH" and price < midnight_open: zone = "DISCOUNT (BUY)"
+    elif bias == "BEARISH" and price > midnight_open: zone = "PREMIUM (SELL)"
 
-    # 3. MTF ALIGNMENT (Daily/H4/H1)
-    align_count = 0
-    if (bias == "BULLISH" and price > df_h4['close'].iloc[-1]): align_count += 1
-    if (bias == "BULLISH" and price > df_h1['close'].iloc[-1]): align_count += 1
-    if (bias == "BEARISH" and price < df_h4['close'].iloc[-1]): align_count += 1
-    if (bias == "BEARISH" and price < df_h1['close'].iloc[-1]): align_count += 1
-    
-    if align_count >= 2: 
-        score += 2
-        confluences.append("MTF Aligné")
+    # 3. MTF ALIGNMENT
+    align = 0
+    if bias == "BULLISH":
+        if price > df_h4['close'].iloc[-1]: align += 1
+        if price > df_h1['close'].iloc[-1]: align += 1
+    else:
+        if price < df_h4['close'].iloc[-1]: align += 1
+        if price < df_h1['close'].iloc[-1]: align += 1
+    if align >= 2: score += 2
 
-    # 4. FVG DETECTION (H4/H1)
-    fvg_h4 = ICTEngine.detect_fvg(df_h4)
-    fvg_h1 = ICTEngine.detect_fvg(df_h1)
-    if fvg_h4 == bias: score += 3; confluences.append("FVG H4")
-    if fvg_h1 == bias: score += 2; confluences.append("FVG H1")
+    # 4. FVG (H4/H1)
+    if ICTEngine.detect_fvg(df_h4) == bias: score += 3
+    if ICTEngine.detect_fvg(df_h1) == bias: score += 2
 
-    # 5. MOMENTUM (HMA 20 & ADX)
+    # 5. HMA 20 (Momentum M15)
     hma20 = ICTEngine.get_hma(df_m15['close'], 20)
-    hma_color = "GREEN" if hma20.iloc[-1] > hma20.iloc[-2] else "RED"
-    if (bias == "BULLISH" and hma_color == "GREEN") or (bias == "BEARISH" and hma_color == "RED"):
-        score += 1; confluences.append("HMA OK")
-    
+    hma_trend = "BULLISH" if hma20.iloc[-1] > hma20.iloc[-2] else "BEARISH"
+    if hma_trend == bias: score += 1
+
+    # 6. ADX & M15 REBOND
     adx_v = ICTEngine.get_adx(df_h1)
-    if adx_v > 20: score += 1; confluences.append("ADX > 20")
+    if adx_v > 20: score += 1
+    if (bias == "BULLISH" and df_m15['close'].iloc[-1] > df_m15['open'].iloc[-1]) or \
+       (bias == "BEARISH" and df_m15['close'].iloc[-1] < df_m15['open'].iloc[-1]):
+        score += 2
 
-    # 6. M15 REBOND
-    if (bias == "BULLISH" and df_m15['close'].iloc[-1] > df_m15['open'].iloc[-1]):
-        score += 2; confluences.append("Rebond M15")
-
-    # Classification
+    # 7. QUALITÉ & FRAÎCHEUR
     quality = "IGNORE"
     if score >= 12: quality = "💎 A+ SETUP"
     elif score >= 9: quality = "✅ A SETUP"
     elif score >= 7: quality = "⚖️ B SETUP"
 
+    diff = datetime.now(timezone.utc) - last_candle_time
+    hours, remainder = divmod(int(diff.total_seconds()), 3600)
+    minutes, _ = divmod(remainder, 60)
+    freshness = f"{hours}h {minutes}m"
+
     return {
-        "Actif": ticker, "Biais": bias, "Zone": zone, 
-        "Qualité": quality, "Score": score, "ADX": round(adx_v, 1),
-        "Confluences": ", ".join(confluences)
+        "Actif": ticker,
+        "Signal": bias,
+        "Zone": zone,
+        "Qualité": quality,
+        "Score": score,
+        "HMA 20": hma_trend,
+        "Fraîcheur": freshness
     }
 
 # ===============================
-# FONCTIONS TECHNIQUES OANDA
+# UTILITAIRES OANDA
 # ===============================
 def fetch_oanda(client, ticker, granularity, count):
     try:
@@ -127,26 +128,31 @@ def fetch_oanda(client, ticker, granularity, count):
     except: return pd.DataFrame()
 
 # ===============================
-# INTERFACE STREAMLIT
+# STREAMLIT UI
 # ===============================
 def main():
     st.set_page_config(page_title="BLUESTAR SNIPER V10", layout="wide")
     st.title("🎯 BLUESTAR SNIPER V10 - Scanner Manuel")
-    
-    # Secrets
+
     try:
-        client = oandapyV20.API(access_token=st.secrets["OANDA_ACCESS_TOKEN"], environment="practice")
+        token = st.secrets["OANDA_ACCESS_TOKEN"]
+        client = oandapyV20.API(access_token=token, environment="practice")
     except:
         st.error("Configurez OANDA_ACCESS_TOKEN dans les Secrets.")
         st.stop()
 
+    # Liste des 33 actifs
     assets = [
         "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "NZD_USD", "USD_CHF",
-        "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_CAD", "GBP_JPY", "XAU_USD", "US30_USD", 
-        "NAS100_USD", "SPX500_USD", "DE30_EUR"
+        "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_CAD", "EUR_NZD", "EUR_CHF",
+        "GBP_JPY", "GBP_AUD", "GBP_CAD", "GBP_NZD", "GBP_CHF",
+        "AUD_JPY", "AUD_CAD", "AUD_NZD", "AUD_CHF",
+        "NZD_JPY", "NZD_CAD", "NZD_CHF",
+        "CAD_JPY", "CAD_CHF", "CHF_JPY",
+        "XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR"
     ]
 
-    if st.button("LANCER LE SCAN GLOBAL 🚀", use_container_width=True):
+    if st.button("LANCER LE SCANNER 🚀", use_container_width=True):
         results = []
         bar = st.progress(0)
         for i, ticker in enumerate(assets):
@@ -157,18 +163,26 @@ def main():
 
         if results:
             df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
-            
-            # Affichage des alertes A+
-            top = df[df["Score"] >= 12]
-            if not top.empty:
-                st.subheader("🔥 Alertes Institutionnelles (A+)")
-                for _, row in top.iterrows():
-                    st.info(f"**{row['Actif']}** : {row['Zone']} | Score: {row['Score']}/14 | {row['Confluences']}")
 
-            st.subheader("📊 Tableau de Bord")
-            st.dataframe(df.style.background_gradient(cmap='RdYlGn', subset=['Score']), use_container_width=True)
-        else:
-            st.warning("Aucune donnée. Vérifiez l'API.")
+            # Styling des couleurs
+            def color_logic(val):
+                if val == "BULLISH": return 'color: #00ff00; font-weight: bold'
+                if val == "BEARISH": return 'color: #ff4b4b; font-weight: bold'
+                return ''
+
+            def highlight_quality(row):
+                if "A+" in row["Qualité"]: return ['background-color: #004d00'] * len(row)
+                return [''] * len(row)
+
+            st.subheader("📊 Résultats du Scanner")
+            st.dataframe(
+                df.style.applymap(color_logic, subset=['Signal', 'HMA 20'])
+                        .apply(highlight_quality, axis=1)
+                        .background_gradient(cmap='RdYlGn', subset=['Score'], vmin=0, vmax=14),
+                use_container_width=True,
+                height=1000
+            )
+            st.success(f"Scan terminé à {datetime.now().strftime('%H:%M:%S')} (UTC)")
 
 if __name__ == "__main__":
     main()
