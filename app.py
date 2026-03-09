@@ -423,6 +423,14 @@ def detect_fvg(df, price, lookback=80):
 
 # ----------------------------------------------------------------
 #  ANALYSE PRINCIPALE
+#
+#  ORDRE DES OPÉRATIONS :
+#  1. Fetch données
+#  2. Biais daily → éliminatoire immédiat si NEUTRAL
+#  3. HMA flip M15 → éliminatoire si pas de flip ou contre biais
+#  4. Prix vs HMA  → éliminatoire si mauvais côté
+#  5. FVG          → éliminatoire si absent dans le bon sens
+#  6. Score & grade sur les actifs qui passent tous les filtres
 # ----------------------------------------------------------------
 def analyze_asset(client, ticker, freshness_limit_min=30):
     try:
@@ -435,81 +443,105 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
 
         price = df_m15['close'].iloc[-1]
 
-        # ── BIAIS DAILY (multi-facteurs institutionnel) ─────────
-        bias, bias_detail = get_daily_bias(df_d)
-
-        # Règle stricte : HMA flip DOIT être dans le sens du biais daily
-        # NEUTRAL = biais non tranché = pas de trade autorisé
+        # ══ GATE 1 — BIAIS DAILY ═════════════════════════════════
+        # Éliminatoire immédiat : NEUTRAL = pas de trade
+        bias, _ = get_daily_bias(df_d)
         bias_bull  = bias in ("BULLISH", "STRONG BULLISH")
         bias_bear  = bias in ("BEARISH", "STRONG BEARISH")
-        bias_valid = bias_bull or bias_bear
+        if not bias_bull and not bias_bear:
+            return None
 
-        # ── PDH / PDL ─────────────────────────────────────────────
-        pdh = df_d['high'].iloc[-2]
-        pdl = df_d['low'].iloc[-2]
-
-        # ── MIDNIGHT OPEN NY ──────────────────────────────────────
-        ny_tz    = pytz.timezone('America/New_York')
-        df_m15.index = df_m15.index.tz_convert(ny_tz)
-        today_ny = datetime.now(ny_tz).date()
-
-        mask   = ((df_m15.index.date == today_ny) &
-                  (df_m15.index.hour == 0) & (df_m15.index.minute == 0))
-        mid_c  = df_m15[mask]
-        m_open = mid_c['open'].iloc[0] if not mid_c.empty else df_m15['open'].iloc[0]
-
-        # ── ZONE ──────────────────────────────────────────────────
-        atr_d     = QuantEngine.atr(df_d, 14).iloc[-1]
-        below_mid = price < m_open
-        above_mid = price > m_open
-        near_pdl  = price <= (pdl + atr_d)
-        near_pdh  = price >= (pdh - atr_d)
-        zone_discount = below_mid and near_pdl
-        zone_premium  = above_mid and near_pdh
-
-        zone_label = (
-            "📉 DISCOUNT" if zone_discount else
-            "📈 PREMIUM"  if zone_premium  else
-            "〰️ NEUTRE"
-        )
-
-        # ── FVG M15 ───────────────────────────────────────────────
-        atr_m15  = QuantEngine.atr(df_m15, 14)
-        atr_val  = atr_m15.iloc[-1]
-        atr_mean = atr_m15.iloc[-50:].mean()
-
-        in_bull_fvg, in_bear_fvg, nb_fvg, nr_fvg = detect_fvg(df_m15, price, lookback=80)
-
-        # FVG "proche" = gap le plus proche à moins de 1 ATR M15
-        fvg_near_bull = nb_fvg is not None and abs(price - (nb_fvg[0] + nb_fvg[1]) / 2) < atr_val
-        fvg_near_bear = nr_fvg is not None and abs(price - (nr_fvg[0] + nr_fvg[1]) / 2) < atr_val
-
-        # ── HMA FLIP ──────────────────────────────────────────────
+        # ══ GATE 2 — HMA 20 FLIP M15 ════════════════════════════
+        # Le flip DOIT exister et concorder avec le biais
         hma = QuantEngine.hma(df_m15['close'], 20)
         if hma.isna().iloc[-5:].any():
             return None
 
         flip_type, candles_ago = find_last_hma_flip(hma, max_lookback=10)
 
-        mins_ago      = (candles_ago * 15) if candles_ago is not None else 999
-        signal_fresh  = flip_type is not None and mins_ago <= freshness_limit_min
-        freshness_str = (f"⚡ {mins_ago} min" if signal_fresh
-                         else f"⏳ {mins_ago} min" if flip_type else "—")
+        if flip_type is None:
+            return None
+        if flip_type == "BULL" and not bias_bull:
+            return None
+        if flip_type == "BEAR" and not bias_bear:
+            return None
 
-        hma_color = "🟢 VERT" if (hma.iloc[-1] > hma.iloc[-2]) else "🔴 ROUGE"
+        # Fraîcheur du signal (0 min = flip sur bougie en cours → affiché "< 15 min")
+        mins_ago = candles_ago * 15
+        if mins_ago == 0:
+            freshness_str = "⚡ < 15 min"
+        elif mins_ago <= freshness_limit_min:
+            freshness_str = f"⚡ {mins_ago} min"
+        else:
+            freshness_str = f"⏳ {mins_ago} min"
 
-        # ── ADX H1 (valeur seule ≥ 20) ───────────────────────────
-        # Fallback sur M15 si H1 indisponible pour cet instrument
-        df_adx_src = df_h1 if not df_h1.empty and len(df_h1) >= 20 else df_m15
+        signal_fresh = mins_ago <= freshness_limit_min
+
+        # ══ GATE 3 — PRIX DU BON CÔTÉ DE LA HMA ════════════════
+        # LONG  → prix au-dessus de la HMA
+        # SHORT → prix en-dessous de la HMA
+        hma_now = hma.iloc[-1]
+        if flip_type == "BULL" and price <= hma_now:
+            return None
+        if flip_type == "BEAR" and price >= hma_now:
+            return None
+
+        # ══ GATE 4 — FVG DANS LE BON SENS ══════════════════════
+        # Un FVG dans la direction du signal doit exister (dans ou proche)
+        atr_m15  = QuantEngine.atr(df_m15, 14)
+        atr_val  = atr_m15.iloc[-1]
+        atr_mean = atr_m15.iloc[-50:].mean()
+
+        in_bull_fvg, in_bear_fvg, nb_fvg, nr_fvg = detect_fvg(df_m15, price, lookback=80)
+
+        # "Proche" = FVG le plus récent à moins de 2 ATR (plus permissif que 1)
+        fvg_near_bull = (nb_fvg is not None
+                         and abs(price - (nb_fvg[0] + nb_fvg[1]) / 2) < atr_val * 2)
+        fvg_near_bear = (nr_fvg is not None
+                         and abs(price - (nr_fvg[0] + nr_fvg[1]) / 2) < atr_val * 2)
+
+        if flip_type == "BULL" and not (in_bull_fvg or fvg_near_bull):
+            return None
+        if flip_type == "BEAR" and not (in_bear_fvg or fvg_near_bear):
+            return None
+
+        # ══ TOUS LES GATES PASSÉS — CALCUL SCORE ════════════════
+
+        # PDH / PDL et zone d'intérêt
+        pdh = df_d['high'].iloc[-2]
+        pdl = df_d['low'].iloc[-2]
+
+        ny_tz    = pytz.timezone('America/New_York')
+        df_m15.index = df_m15.index.tz_convert(ny_tz)
+        today_ny = datetime.now(ny_tz).date()
+        mask     = ((df_m15.index.date == today_ny) &
+                    (df_m15.index.hour == 0) & (df_m15.index.minute == 0))
+        mid_c    = df_m15[mask]
+        m_open   = mid_c['open'].iloc[0] if not mid_c.empty else df_m15['open'].iloc[0]
+
+        atr_d         = QuantEngine.atr(df_d, 14).iloc[-1]
+        below_mid     = price < m_open
+        above_mid     = price > m_open
+        near_pdl      = price <= (pdl + atr_d)
+        near_pdh      = price >= (pdh - atr_d)
+        zone_discount = below_mid and near_pdl
+        zone_premium  = above_mid and near_pdh
+        zone_label    = (
+            "DISCOUNT" if zone_discount else
+            "PREMIUM"  if zone_premium  else
+            "NEUTRE"
+        )
+
+        # ADX H1 (fallback M15 si H1 vide)
+        df_adx_src      = df_h1 if not df_h1.empty and len(df_h1) >= 20 else df_m15
         adx_s, pdi_s, mdi_s = QuantEngine.adx(df_adx_src, 14)
         adx_val = round(adx_s.iloc[-1], 1)
-        pdi_val = round(pdi_s.iloc[-1], 1)   # gardé pour compute_score interne
-        mdi_val = round(mdi_s.iloc[-1], 1)   # gardé pour compute_score interne
+        pdi_val = round(pdi_s.iloc[-1], 1)
+        mdi_val = round(mdi_s.iloc[-1], 1)
 
-        # ── SCORE & GRADE ─────────────────────────────────────────
-        score, grade, score_detail = compute_score(
-            flip_type, candles_ago,
-            bias,
+        # Score
+        score, grade, _ = compute_score(
+            flip_type, candles_ago, bias,
             zone_discount, zone_premium,
             near_pdl, near_pdh,
             below_mid, above_mid,
@@ -519,94 +551,21 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
             atr_val, atr_mean
         )
 
-        badge = grade_badge(grade, score)
-
-        # ── RÈGLE STRICTE : HMA flip DOIT concorder avec le biais ──
-        # C'est la condition bloquante principale.
-        # Un flip BULL avec biais BEARISH ou NEUTRAL → signal rejeté.
-        # Un flip BEAR avec biais BULLISH ou NEUTRAL → signal rejeté.
-        hma_matches_bias = (
-            (flip_type == "BULL" and bias_bull) or
-            (flip_type == "BEAR" and bias_bear)
-        )
-
-        # ── CONDITIONS ÉLIMINATOIRES (toutes strictes) ────────────
-        #
-        # 1. Biais daily concordant avec le flip HMA
-        if not bias_valid or not hma_matches_bias:
-            return None
-
-        # 2. Prix du bon côté de la HMA
-        #    LONG  → prix AU-DESSUS de la HMA (tendance confirmée)
-        #    SHORT → prix EN-DESSOUS de la HMA (tendance confirmée)
-        hma_current = hma.iloc[-1]
-        price_above_hma = price > hma_current
-        price_below_hma = price < hma_current
-
-        if flip_type == "BULL" and not price_above_hma:
-            return None
-        if flip_type == "BEAR" and not price_below_hma:
-            return None
-
-        # 3. FVG dans le bon sens obligatoire
-        #    (dans le FVG ou proche — sinon pas de zone d'intérêt valide)
-        fvg_long_ok  = in_bull_fvg or fvg_near_bull
-        fvg_short_ok = in_bear_fvg or fvg_near_bear
-
-        if flip_type == "BULL" and not fvg_long_ok:
-            return None
-        if flip_type == "BEAR" and not fvg_short_ok:
-            return None
-
-        # Signal frais ET dans le sens du biais
-        signal_active = signal_fresh
-
-        # ── SIGNAL FINAL ──────────────────────────────────────────
+        # Signal texte
         if signal_fresh:
             sig = "▲ LONG"  if flip_type == "BULL" else "▼ SHORT"
-        elif flip_type == "BULL":
-            sig = "LONG (expiré)"
-        elif flip_type == "BEAR":
-            sig = "SHORT (expiré)"
         else:
-            sig = "—"
-
-        quality = (
-            "A+ SETUP"   if grade == "A+"  and signal_active else
-            "A SETUP"    if grade == "A"   and signal_active else
-            "SURVEILLER" if grade in ("B+","B") and signal_active else
-            "IGNORE"
-        )
-
-
-        # Résumé détail score
-        detail_str = (
-            f"Trig:{score_detail['Trigger']} "
-            f"Biais:{score_detail['Biais']} "
-            f"Zone:{score_detail['Zone']} "
-            f"FVG:{score_detail['FVG']} "
-            f"ADX:{score_detail['ADX']} "
-            f"ATR:{score_detail['ATR']}"
-        )
+            sig = "LONG (expiré)" if flip_type == "BULL" else "SHORT (expiré)"
 
         return {
-            "Actif + Note":  f"{ticker}  {badge}",
-            "Signal":        sig,
-            "Fraîcheur":     freshness_str,
-            "Score /100":    score,
-            "Grade":         grade,
-            "Biais Daily":   bias,
-            "Zone":          zone_label,
-            "FVG M15":       ("✅ Dans FVG 🟢" if in_bull_fvg else
-                              "✅ Dans FVG 🔴" if in_bear_fvg else
-                              "〰️ proche 🟢"   if fvg_near_bull else
-                              "〰️ proche 🔴"   if fvg_near_bear else
-                              "❌ Pas de FVG"),
-            "HMA":           hma_color,
-            "ADX":           adx_val,
-            "Détail score":  detail_str,
-            "Qualité":       quality,
-            "Prix":          round(price, 5),
+            "Actif + Note": ticker,   # ticker brut, badge construit dans HTML
+            "Signal":       sig,
+            "Fraîcheur":    freshness_str,
+            "Score /100":   score,
+            "Grade":        grade,
+            "Biais Daily":  bias,
+            "Zone":         zone_label,
+            "ADX":          adx_val,
         }
 
     except Exception as e:
@@ -932,7 +891,7 @@ def main():
   <td style="{fresh_style(fresh_str)};font-size:15px;text-align:center">{fresh_str}</td>
   <td style="white-space:nowrap">
     <span class="ticker">{ticker}</span>
-    <span class="bias-tag" style="color:{'#3dba7e' if 'BULLISH' in bias else '#c0392b'}">&nbsp;{'▲' if 'BULLISH' in bias else '▼'} {bias}</span>
+    <span class="bias-tag" style="color:{'#3dba7e' if 'BULLISH' in bias else '#c0392b'}">&nbsp;{'▲' if 'BULLISH' in bias else '▼'} {'BULL' if bias == 'BULLISH' else 'STRONG BULL' if bias == 'STRONG BULLISH' else 'BEAR' if bias == 'BEARISH' else 'STRONG BEAR'}</span>
     <span class="grade-pill" style="color:{gs['color']};border-color:{gs['color']}">{gs['label']}</span>
     <span class="score-val" style="color:{gs['color']}">{score}</span>
   </td>
