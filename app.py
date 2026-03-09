@@ -10,16 +10,19 @@ import time
 # ================================================================
 #  BLUESTAR SNIPER V10  —  ICT SIGNAL ENGINE
 #
-#  Signal LONG  → Biais Daily BULLISH
-#                + Zone DISCOUNT (prix < Midnight Open ET proche PDL)
-#                + Prix dans un FVG Bullish M15
-#                + HMA 20 M15 flip au VERT  ← TRIGGER
-#                + ATR actif + ADX haussier
+#  LOGIQUE :
+#  1. Le SIGNAL est donné par le FLIP de couleur de la HMA 20 M15
+#     → Flip VERT  = signal potentiel LONG
+#     → Flip ROUGE = signal potentiel SHORT
+#     → Fraîcheur : signal valide seulement dans les 30 dernières min (2 bougies M15)
 #
-#  Signal SHORT → Biais Daily BEARISH
-#                + Zone PREMIUM (prix > Midnight Open ET proche PDH)
-#                + Prix dans un FVG Bearish M15
-#                + HMA 20 M15 flip au ROUGE ← TRIGGER
+#  2. CONFIRMATION (les 3 doivent concorder avec le signal HMA) :
+#     → Biais Daily BULLISH (si flip vert) / BEARISH (si flip rouge)
+#     → Zone DISCOUNT + proche PDL (si flip vert) / PREMIUM + proche PDH (si flip rouge)
+#     → Prix dans un FVG M15 dans le même sens
+#
+#  3. BONUS MOMENTUM (LONG uniquement) :
+#     → ATR M15 actif + ADX > 20 avec +DI > -DI
 # ================================================================
 
 
@@ -47,7 +50,7 @@ class QuantEngine:
 
     @staticmethod
     def atr(df, period=14):
-        c = df['close'].shift(1)
+        c  = df['close'].shift(1)
         tr = pd.concat([
             df['high'] - df['low'],
             (df['high'] - c).abs(),
@@ -84,34 +87,67 @@ def get_daily_bias(df_d):
 
 
 # ----------------------------------------------------------------
+#  FRAÎCHEUR DU FLIP HMA
+#
+#  On remonte l'historique HMA pour trouver le dernier flip
+#  et on retourne :
+#   - flip_type   : "BULL" | "BEAR" | None
+#   - candles_ago : combien de bougies M15 depuis le flip
+#   - minutes_ago : candles_ago × 15
+#
+#  Signal frais = flip il y a ≤ 2 bougies (≤ 30 min)
+# ----------------------------------------------------------------
+def find_last_hma_flip(hma_series, max_lookback=10):
+    """
+    Parcourt les dernières bougies pour trouver le flip le plus récent.
+    Retourne (flip_type, candles_ago) ou (None, None) si pas de flip récent.
+    """
+    colors = []
+    for i in range(len(hma_series) - 1, max(len(hma_series) - max_lookback - 2, 0), -1):
+        v_curr = hma_series.iloc[i]
+        v_prev = hma_series.iloc[i - 1]
+        if pd.isna(v_curr) or pd.isna(v_prev):
+            continue
+        color = "GREEN" if v_curr > v_prev else "RED"
+        colors.append((i, color))
+
+    # Cherche le premier changement de couleur en remontant
+    for j in range(len(colors) - 1):
+        idx_curr, col_curr = colors[j]
+        idx_prev, col_prev = colors[j + 1]
+
+        if col_curr != col_prev:
+            # flip trouvé à la bougie idx_curr
+            candles_ago = (len(hma_series) - 1) - idx_curr
+            flip_type   = "BULL" if col_curr == "GREEN" else "BEAR"
+            return flip_type, candles_ago
+
+    return None, None
+
+
+# ----------------------------------------------------------------
 #  DETECTION FVG M15
-#
-#  FVG Bullish : high[i-2] < low[i]   → gap vert entre bougie i-2 et i
-#  FVG Bearish : low[i-2]  > high[i]  → gap rouge entre bougie i-2 et i
-#
-#  On scanne les 80 dernières bougies.
-#  On retourne si le prix actuel est à l'intérieur d'un FVG.
+#  FVG Bullish : low[i] > high[i-2]  → gap vert
+#  FVG Bearish : high[i] < low[i-2]  → gap rouge
+#  Retourne si le prix est dans un FVG du bon sens
 # ----------------------------------------------------------------
 def detect_fvg(df, price, lookback=80):
-    sub = df.iloc[-(lookback + 3):-1]   # on exclut la bougie en cours
+    sub = df.iloc[-(lookback + 3):-1]
 
     bull_fvgs = []
     bear_fvgs = []
 
     for i in range(2, len(sub)):
-        # Bullish FVG : low[i] > high[i-2]
         lo = sub['high'].iloc[i - 2]
         hi = sub['low'].iloc[i]
         if hi > lo:
             bull_fvgs.append((lo, hi))
 
-        # Bearish FVG : high[i] < low[i-2]
         lo2 = sub['high'].iloc[i]
         hi2 = sub['low'].iloc[i - 2]
         if hi2 > lo2:
             bear_fvgs.append((lo2, hi2))
 
-    # Tri par proximité du prix
     bull_fvgs.sort(key=lambda x: abs(price - (x[0] + x[1]) / 2))
     bear_fvgs.sort(key=lambda x: abs(price - (x[0] + x[1]) / 2))
 
@@ -126,28 +162,27 @@ def detect_fvg(df, price, lookback=80):
 # ----------------------------------------------------------------
 def analyze_asset(client, ticker):
     try:
-        # Données
-        df_d   = fetch_oanda_data(client, ticker, "D",   100)   # biais daily
-        df_m15 = fetch_oanda_data(client, ticker, "M15", 400)   # signal M15
+        df_d   = fetch_oanda_data(client, ticker, "D",   100)
+        df_m15 = fetch_oanda_data(client, ticker, "M15", 400)
 
         if df_d.empty or df_m15.empty:
             return None
 
         price = df_m15['close'].iloc[-1]
 
-        # 1. BIAIS DAILY ──────────────────────────────────────────
+        # ── BIAIS DAILY ───────────────────────────────────────────
         bias = get_daily_bias(df_d)
 
-        # 2. PDH / PDL (jour précédent) ───────────────────────────
+        # ── PDH / PDL (jour précédent) ────────────────────────────
         pdh = df_d['high'].iloc[-2]
         pdl = df_d['low'].iloc[-2]
 
-        # 3. MIDNIGHT OPEN (00:00 NY) ─────────────────────────────
+        # ── MIDNIGHT OPEN (00:00 NY) ──────────────────────────────
         ny_tz = pytz.timezone('America/New_York')
         df_m15.index = df_m15.index.tz_convert(ny_tz)
         today_ny = datetime.now(ny_tz).date()
 
-        mask = (
+        mask   = (
             (df_m15.index.date   == today_ny) &
             (df_m15.index.hour   == 0) &
             (df_m15.index.minute == 0)
@@ -155,23 +190,13 @@ def analyze_asset(client, ticker):
         mid_c  = df_m15[mask]
         m_open = mid_c['open'].iloc[0] if not mid_c.empty else df_m15['open'].iloc[0]
 
+        # ── ZONE D'INTÉRÊT ────────────────────────────────────────
+        atr_d     = QuantEngine.atr(df_d, 14).iloc[-1]
         below_mid = price < m_open
         above_mid = price > m_open
+        near_pdl  = price <= (pdl + atr_d)
+        near_pdh  = price >= (pdh - atr_d)
 
-        # 4. ZONE D'INTÉRÊT ───────────────────────────────────────
-        #
-        #  DISCOUNT (LONG) :
-        #    → prix sous le Midnight Open  (moitié basse de la journée)
-        #    → prix dans 1 ATR Daily au-dessus du PDL  (zone de liquidité)
-        #
-        #  PREMIUM (SHORT) :
-        #    → prix au-dessus du Midnight Open
-        #    → prix dans 1 ATR Daily en-dessous du PDH
-        #
-        atr_d = QuantEngine.atr(df_d, 14).iloc[-1]
-
-        near_pdl      = price <= (pdl + atr_d)
-        near_pdh      = price >= (pdh - atr_d)
         zone_discount = below_mid and near_pdl
         zone_premium  = above_mid and near_pdh
 
@@ -181,85 +206,124 @@ def analyze_asset(client, ticker):
             "〰️ NEUTRE"
         )
 
-        # 5. FVG M15 ──────────────────────────────────────────────
+        # ── FVG M15 ───────────────────────────────────────────────
         in_bull_fvg, in_bear_fvg, nb_fvg, nr_fvg = detect_fvg(df_m15, price, lookback=80)
 
-        fvg_label = (
-            "✅ Dans FVG 🟢" if in_bull_fvg else
-            "✅ Dans FVG 🔴" if in_bear_fvg else
-            "〰️ FVG 🟢 proche" if nb_fvg else
-            "〰️ FVG 🔴 proche" if nr_fvg else
-            "❌ Pas de FVG"
-        )
-
-        # 6. HMA 20 M15 — FLIP DE COULEUR ─────────────────────────
+        # ── HMA 20 — TROUVER LE DERNIER FLIP ─────────────────────
         hma = QuantEngine.hma(df_m15['close'], 20)
-        if hma.isna().iloc[-3:].any():
+
+        if hma.isna().iloc[-5:].any():
             return None
 
-        h1, h2, h3 = hma.iloc[-1], hma.iloc[-2], hma.iloc[-3]
-        color_now  = "GREEN" if h1 > h2 else "RED"
-        color_prev = "GREEN" if h2 > h3 else "RED"
+        flip_type, candles_ago = find_last_hma_flip(hma, max_lookback=10)
 
-        flip_bull = (color_now == "GREEN") and (color_prev == "RED")
-        flip_bear = (color_now == "RED")   and (color_prev == "GREEN")
+        # Signal frais = flip dans les 2 dernières bougies (≤ 30 min)
+        FRESHNESS_LIMIT = 2
+        signal_fresh    = (flip_type is not None) and (candles_ago <= FRESHNESS_LIMIT)
 
-        # 7. ATR + ADX M15 ────────────────────────────────────────
+        if candles_ago is not None:
+            minutes_ago   = candles_ago * 15
+            freshness_str = f"⚡ {minutes_ago} min" if signal_fresh else f"⏳ {minutes_ago} min"
+        else:
+            freshness_str = "—"
+
+        hma_signal = flip_type   # "BULL" | "BEAR" | None
+        hma_color  = "🟢 VERT"  if (hma.iloc[-1] > hma.iloc[-2]) else "🔴 ROUGE"
+
+        # ── ATR + ADX M15 ─────────────────────────────────────────
         atr_m15    = QuantEngine.atr(df_m15, 14)
         atr_val    = round(atr_m15.iloc[-1], 5)
         atr_active = atr_val >= atr_m15.iloc[-50:].mean() * 0.5
 
         adx_s, pdi_s, mdi_s = QuantEngine.adx(df_m15, 14)
-        adx_val = round(adx_s.iloc[-1], 1)
-        pdi_val = round(pdi_s.iloc[-1], 1)
-        mdi_val = round(mdi_s.iloc[-1], 1)
+        adx_val  = round(adx_s.iloc[-1], 1)
+        pdi_val  = round(pdi_s.iloc[-1], 1)
+        mdi_val  = round(mdi_s.iloc[-1], 1)
         adx_bull = adx_val > 20 and pdi_val > mdi_val
         adx_bear = adx_val > 20 and mdi_val > pdi_val
 
-        # 8. VALIDATION A+ SETUP ──────────────────────────────────
-        setup_valid = False
-        signal_type = bias
-        trigger_ok  = False
-        fvg_ok      = False
+        # ── VALIDATION A+ SETUP ───────────────────────────────────
+        #
+        #  Le SIGNAL = HMA flip frais (≤ 30 min)
+        #  Les CONFIRMATIONS doivent concorder avec ce signal :
+        #
+        #  LONG  : flip BULL + biais BULLISH + zone DISCOUNT + FVG vert + momentum
+        #  SHORT : flip BEAR + biais BEARISH + zone PREMIUM  + FVG rouge
+        #
+        setup_valid   = False
+        signal_type   = "—"
+        confirmations = []
+        missing       = []
 
-        # LONG : biais Daily BULLISH + DISCOUNT + dans FVG vert + HMA flip vert + momentum
-        if (bias == "BULLISH"
-                and zone_discount
-                and in_bull_fvg
-                and flip_bull
-                and atr_active
-                and adx_bull):
-            setup_valid = True
-            signal_type = "BULLISH"
-            trigger_ok  = True
-            fvg_ok      = True
+        if signal_fresh and hma_signal == "BULL":
+            signal_type = "🟢 LONG"
+            # Vérif confirmations
+            ok_bias = bias == "BULLISH"
+            ok_zone = zone_discount
+            ok_fvg  = in_bull_fvg
+            ok_atr  = atr_active
+            ok_adx  = adx_bull
 
-        # SHORT : biais Daily BEARISH + PREMIUM + dans FVG rouge + HMA flip rouge
-        elif (bias == "BEARISH"
-                and zone_premium
-                and in_bear_fvg
-                and flip_bear):
-            setup_valid = True
-            signal_type = "BEARISH"
-            trigger_ok  = True
-            fvg_ok      = True
+            if ok_bias:  confirmations.append("Biais ✅")
+            else:        missing.append("Biais ❌")
+            if ok_zone:  confirmations.append("Zone ✅")
+            else:        missing.append("Zone ❌")
+            if ok_fvg:   confirmations.append("FVG ✅")
+            else:        missing.append("FVG ❌")
+            if ok_atr:   confirmations.append("ATR ✅")
+            else:        missing.append("ATR ❌")
+            if ok_adx:   confirmations.append("ADX ✅")
+            else:        missing.append("ADX ❌")
+
+            if ok_bias and ok_zone and ok_fvg and ok_atr and ok_adx:
+                setup_valid = True
+
+        elif signal_fresh and hma_signal == "BEAR":
+            signal_type = "🔴 SHORT"
+            ok_bias = bias == "BEARISH"
+            ok_zone = zone_premium
+            ok_fvg  = in_bear_fvg
+
+            if ok_bias:  confirmations.append("Biais ✅")
+            else:        missing.append("Biais ❌")
+            if ok_zone:  confirmations.append("Zone ✅")
+            else:        missing.append("Zone ❌")
+            if ok_fvg:   confirmations.append("FVG ✅")
+            else:        missing.append("FVG ❌")
+
+            if ok_bias and ok_zone and ok_fvg:
+                setup_valid = True
+
+        elif not signal_fresh and flip_type == "BULL":
+            signal_type = "🟢 LONG (expiré)"
+        elif not signal_fresh and flip_type == "BEAR":
+            signal_type = "🔴 SHORT (expiré)"
 
         quality = "💎 A+ SETUP" if setup_valid else "IGNORE"
 
+        # Résumé confirmations
+        confirm_str = " | ".join(confirmations) if confirmations else "—"
+        missing_str = " | ".join(missing)        if missing       else "—"
+
         return {
-            "Actif":        ticker,
-            "Biais Daily":  bias,
-            "Zone":         zone_label,
-            "Midnight":     round(m_open, 5),
-            "PDL / PDH":    f"{round(pdl,5)} / {round(pdh,5)}",
-            "FVG M15":      fvg_label,
-            "HMA Couleur":  "🟢 VERT" if color_now == "GREEN" else "🔴 ROUGE",
-            "HMA Flip":     "✅ FLIP !" if trigger_ok else f"〰️ {color_now}",
-            "ATR M15":      atr_val,
-            "ADX":          adx_val,
-            "+DI / -DI":    f"{pdi_val} / {mdi_val}",
-            "Qualité":      quality,
-            "Prix":         round(price, 5),
+            "Actif":         ticker,
+            "Signal HMA":    signal_type,
+            "Fraîcheur":     freshness_str,
+            "Biais Daily":   bias,
+            "Zone":          zone_label,
+            "FVG M15":       ("✅ Dans FVG 🟢" if in_bull_fvg else
+                              "✅ Dans FVG 🔴" if in_bear_fvg else
+                              "〰️ proche 🟢"   if nb_fvg      else
+                              "〰️ proche 🔴"   if nr_fvg      else
+                              "❌ Pas de FVG"),
+            "HMA Couleur":   hma_color,
+            "ATR M15":       atr_val,
+            "ADX":           adx_val,
+            "+DI / -DI":     f"{pdi_val} / {mdi_val}",
+            "Confirmations": confirm_str,
+            "Manque":        missing_str,
+            "Qualité":       quality,
+            "Prix":          round(price, 5),
         }
 
     except Exception as e:
@@ -305,8 +369,7 @@ def main():
     st.set_page_config(page_title="BLUESTAR SNIPER V10", layout="wide")
     st.title("🎯 BLUESTAR SNIPER V10 — ICT Signal Scanner")
     st.caption(
-        "Biais Daily → Zone d'intérêt (Discount/PDL · Premium/PDH) "
-        "→ FVG M15 → HMA 20 M15 flip couleur"
+        "Signal = HMA 20 flip couleur (≤ 30 min) → confirmé par Biais Daily + Zone + FVG M15"
     )
 
     if "OANDA_ACCESS_TOKEN" not in st.secrets:
@@ -323,28 +386,33 @@ def main():
         "AUD_USD", "XAU_USD", "NAS100_USD", "GBP_CHF", "CAD_CHF"
     ]
 
-    with st.expander("📘 Logique du signal — comment ça marche"):
+    with st.expander("📘 Logique du signal"):
         st.markdown("""
-        ### 🟢 Signal LONG — 6 conditions requises
-        | # | Condition | Détail |
-        |---|---|---|
-        | 1 | **Biais Daily BULLISH** | Prix > EMA21 > EMA50 sur Daily |
-        | 2 | **Zone DISCOUNT** | Prix **sous** Midnight Open **ET** à moins de 1 ATR Daily au-dessus du PDL |
-        | 3 | **FVG Bullish M15** | Prix actuellement **dans** une imbalance verte M15 |
-        | 4 | **HMA 20 flip VERT** ← TRIGGER | HMA vient de changer : rouge → vert sur M15 |
-        | 5 | **ATR actif** | ATR M15 ≥ 50% de sa moyenne (marché en mouvement) |
-        | 6 | **ADX > 20 + +DI > -DI** | Tendance haussière confirmée sur M15 |
+        ### 🔑 Le signal vient de la HMA — pas du biais
 
-        ### 🔴 Signal SHORT — 4 conditions requises
-        | # | Condition | Détail |
+        | Étape | Rôle | Détail |
         |---|---|---|
-        | 1 | **Biais Daily BEARISH** | Prix < EMA21 < EMA50 sur Daily |
-        | 2 | **Zone PREMIUM** | Prix **au-dessus** Midnight Open **ET** à moins de 1 ATR Daily en-dessous du PDH |
-        | 3 | **FVG Bearish M15** | Prix actuellement **dans** une imbalance rouge M15 |
-        | 4 | **HMA 20 flip ROUGE** ← TRIGGER | HMA vient de changer : vert → rouge sur M15 |
+        | **1 — TRIGGER** | HMA 20 M15 flip couleur | Rouge → Vert = signal LONG possible / Vert → Rouge = signal SHORT possible |
+        | **2 — FRAÎCHEUR** | Signal ≤ 30 min | Flip détecté sur les 2 dernières bougies M15 maximum |
+        | **3 — BIAIS** | Confirmation Daily | BULLISH si LONG, BEARISH si SHORT (EMA21 > EMA50) |
+        | **4 — ZONE** | Confirmation structurelle | DISCOUNT + proche PDL (LONG) / PREMIUM + proche PDH (SHORT) |
+        | **5 — FVG M15** | Confirmation imbalance | Prix dans un FVG vert (LONG) / rouge (SHORT) |
+        | **6 — MOMENTUM** | Bonus LONG uniquement | ATR actif + ADX > 20 avec +DI > -DI |
+
+        > ⚡ La colonne **Confirmations** montre ce qui valide le signal.
+        > La colonne **Manque** montre ce qui bloque le A+.
         """)
 
-    if st.button("🚀 LANCER LE SCANNER", use_container_width=True):
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        run = st.button("🚀 LANCER LE SCANNER", use_container_width=True)
+    with col2:
+        freshness = st.selectbox("Fraîcheur max", [15, 30, 45, 60], index=1, key="fresh")
+
+    if run:
+        # Mise à jour dynamique de la limite de fraîcheur
+        fresh_candles = freshness // 15
+
         results  = []
         progress = st.progress(0)
         status   = st.empty()
@@ -353,8 +421,24 @@ def main():
             for i, ticker in enumerate(assets):
                 status.caption(f"⏳ Analyse {ticker}...")
                 res = analyze_asset(client, ticker)
+
+                # Re-appliquer la limite de fraîcheur choisie par l'utilisateur
                 if res:
+                    # Recalculer fraîcheur avec seuil choisi
+                    min_ago_str = res["Fraîcheur"].replace("⚡ ", "").replace("⏳ ", "").replace(" min", "").strip()
+                    try:
+                        min_ago = int(min_ago_str)
+                        if min_ago <= freshness:
+                            res["Fraîcheur"] = f"⚡ {min_ago} min"
+                        else:
+                            res["Fraîcheur"] = f"⏳ {min_ago} min"
+                            # Signal expiré → pas A+
+                            if "A+" in res["Qualité"]:
+                                res["Qualité"] = "IGNORE"
+                    except:
+                        pass
                     results.append(res)
+
                 time.sleep(0.2)
                 progress.progress((i + 1) / len(assets))
 
@@ -363,7 +447,13 @@ def main():
         if results:
             df = pd.DataFrame(results)
 
-            df["_s"] = df["Qualité"].apply(lambda x: 0 if "A+" in x else 1)
+            # A+ en tête, puis signaux frais, puis le reste
+            def sort_key(row):
+                if "A+" in row["Qualité"]:         return 0
+                if "⚡" in str(row["Fraîcheur"]):  return 1
+                return 2
+
+            df["_s"] = df.apply(sort_key, axis=1)
             df = df.sort_values("_s").drop(columns=["_s"]).reset_index(drop=True)
 
             def style_row(row):
@@ -371,21 +461,40 @@ def main():
                 idx = row.index.tolist()
                 def si(col): return idx.index(col)
 
+                # Qualité
                 if "A+" in str(row["Qualité"]):
                     s[si("Qualité")] = "background-color:#004d00;color:#00ff88;font-weight:bold"
                 else:
                     s[si("Qualité")] = "color:#444"
 
-                if "BULLISH" in str(row["Biais Daily"]):
-                    s[si("Biais Daily")] = "color:#00ff88;font-weight:bold"
-                elif "BEARISH" in str(row["Biais Daily"]):
-                    s[si("Biais Daily")] = "color:#ff4b4b;font-weight:bold"
+                # Signal HMA
+                sig = str(row["Signal HMA"])
+                if "LONG" in sig and "expiré" not in sig:
+                    s[si("Signal HMA")] = "color:#00ff88;font-weight:bold"
+                elif "SHORT" in sig and "expiré" not in sig:
+                    s[si("Signal HMA")] = "color:#ff4b4b;font-weight:bold"
+                else:
+                    s[si("Signal HMA")] = "color:#555"
 
+                # Fraîcheur
+                if "⚡" in str(row["Fraîcheur"]):
+                    s[si("Fraîcheur")] = "color:#ffd700;font-weight:bold"
+                else:
+                    s[si("Fraîcheur")] = "color:#555"
+
+                # Biais Daily
+                if "BULLISH" in str(row["Biais Daily"]):
+                    s[si("Biais Daily")] = "color:#00ff88"
+                elif "BEARISH" in str(row["Biais Daily"]):
+                    s[si("Biais Daily")] = "color:#ff4b4b"
+
+                # Zone
                 if "DISCOUNT" in str(row["Zone"]):
                     s[si("Zone")] = "color:#00ccff"
                 elif "PREMIUM" in str(row["Zone"]):
                     s[si("Zone")] = "color:#ff9900"
 
+                # FVG
                 if "Dans FVG" in str(row["FVG M15"]):
                     s[si("FVG M15")] = "color:#00ff88;font-weight:bold"
                 elif "proche" in str(row["FVG M15"]):
@@ -393,11 +502,11 @@ def main():
                 else:
                     s[si("FVG M15")] = "color:#555"
 
-                if "✅" in str(row["HMA Flip"]):
-                    s[si("HMA Flip")] = "color:#00ff88;font-weight:bold"
-                else:
-                    s[si("HMA Flip")] = "color:#666"
+                # Confirmations
+                s[si("Confirmations")] = "color:#00ff88;font-size:0.85em"
+                s[si("Manque")]        = "color:#ff6666;font-size:0.85em"
 
+                # ADX
                 try:
                     v = float(row["ADX"])
                     s[si("ADX")] = (
@@ -413,14 +522,18 @@ def main():
             st.dataframe(df.style.apply(style_row, axis=1), use_container_width=True)
 
             valid = len(df[df["Qualité"] == "💎 A+ SETUP"])
-            if valid:
-                st.success(f"🎯 {valid} Setup(s) A+ détecté(s) !")
-            else:
-                st.info(
-                    "Aucun setup A+ pour l'instant — "
-                    "attendre que le prix soit en zone d'intérêt (FVG + PDL/PDH) "
-                    "avec flip HMA dans le bon biais."
-                )
+            fresh = len(df[df["Fraîcheur"].str.contains("⚡", na=False)])
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if valid:
+                    st.success(f"🎯 {valid} Setup(s) A+ détecté(s) !")
+                else:
+                    st.info("Aucun setup A+ pour l'instant.")
+            with col_b:
+                if fresh:
+                    st.warning(f"⚡ {fresh} signal(s) HMA frais (< {freshness} min) — confirmations incomplètes.")
+
         else:
             st.warning("Aucun résultat — vérifie la connexion OANDA.")
 
