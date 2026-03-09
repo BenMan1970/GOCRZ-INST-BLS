@@ -566,22 +566,16 @@ def main():
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;600;700&display=swap');
 
     html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
-    .stApp { background: #080812; }
-
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background: #0d0d1f !important;
-        border-right: 1px solid #1e1e3a;
-    }
+    .stApp { background: #0e0e14; }
 
     /* Titres */
     h1 { font-family: 'IBM Plex Mono', monospace !important; letter-spacing: .04em; }
 
     /* Boutons */
     .stButton > button {
-        background: linear-gradient(135deg, #1a3a6b 0%, #0f2548 100%) !important;
-        color: #7ab8f5 !important;
-        border: 1px solid #2a5299 !important;
+        background: #141420 !important;
+        color: #a0b4cc !important;
+        border: 1px solid #2a3448 !important;
         font-family: 'IBM Plex Mono', monospace !important;
         font-weight: 700 !important;
         letter-spacing: .06em !important;
@@ -589,41 +583,41 @@ def main():
         transition: all .2s ease !important;
     }
     .stButton > button:hover {
-        background: linear-gradient(135deg, #2a5299 0%, #1a3a6b 100%) !important;
-        border-color: #4a82c9 !important;
-        box-shadow: 0 0 16px rgba(74,130,201,.25) !important;
+        background: #1c2030 !important;
+        border-color: #3a4a68 !important;
+        color: #c8d8e8 !important;
     }
 
     /* Selectbox */
-    .stSelectbox label { color: #7a7aaa !important; font-size: 12px !important; text-transform: uppercase !important; letter-spacing: .08em !important; }
+    .stSelectbox label { color: #606080 !important; font-size: 12px !important; text-transform: uppercase !important; letter-spacing: .08em !important; }
 
     /* Metric cards */
     [data-testid="stMetric"] {
-        background: #0d0d1f;
-        border: 1px solid #1e1e3a;
+        background: #121218;
+        border: 1px solid #1e1e2e;
         border-radius: 6px;
         padding: 12px 16px !important;
     }
     [data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace !important; }
 
     /* Progress bar */
-    .stProgress > div > div { background: linear-gradient(90deg, #1a6b4a, #3dba7e) !important; }
+    .stProgress > div > div { background: #3a7a58 !important; }
 
     /* Expander */
-    .streamlit-expanderHeader { color: #7a7aaa !important; font-size: 12px !important; text-transform: uppercase !important; }
+    .streamlit-expanderHeader { color: #606080 !important; font-size: 12px !important; text-transform: uppercase !important; }
 
     /* Divider */
-    hr { border-color: #1e1e3a !important; }
+    hr { border-color: #1a1a28 !important; }
 
-    /* Toast-like debug */
+    /* Debug box */
     .debug-box {
-        background: #0d0d1f;
-        border: 1px solid #2a2a4a;
+        background: #121218;
+        border: 1px solid #1e1e2e;
         border-radius: 6px;
         padding: 12px 16px;
         font-family: 'IBM Plex Mono', monospace;
         font-size: 11px;
-        color: #6a6a9a;
+        color: #505070;
         margin-top: 8px;
     }
     </style>
@@ -833,41 +827,41 @@ Plus de 50 % des actifs échouent au fetch.
 
     # ── TABLE HTML ────────────────────────────────────────────────
     GRADE_STYLE = {
-        "A+": {"color": "#3dba7e", "bg": "rgba(61,186,126,0.06)", "label": "A+"},
-        "A":  {"color": "#5aab8a", "bg": "rgba(90,171,138,0.04)", "label": "A"},
-        "B+": {"color": "#c8960c", "bg": "transparent",           "label": "B+"},
-        "B":  {"color": "#6a7a9a", "bg": "transparent",           "label": "B"},
-        "C":  {"color": "#3a3a55", "bg": "transparent",           "label": "C"},
+        "A+": {"color": "#5a9e7a", "bg": "rgba(90,158,122,0.07)", "label": "A+"},
+        "A":  {"color": "#4e8a6c", "bg": "rgba(78,138,108,0.05)", "label": "A"},
+        "B+": {"color": "#9a7820", "bg": "transparent",           "label": "B+"},
+        "B":  {"color": "#5a6880", "bg": "transparent",           "label": "B"},
+        "C":  {"color": "#383848", "bg": "transparent",           "label": "C"},
     }
 
     def sig_style(s):
         if "LONG"  in s and "expiré" not in s:
-            return "color:#3dba7e;font-weight:700;font-size:15px;letter-spacing:.03em"
+            return "color:#5a9e7a;font-weight:700;font-size:15px;letter-spacing:.03em"
         if "SHORT" in s and "expiré" not in s:
-            return "color:#c0392b;font-weight:700;font-size:15px;letter-spacing:.03em"
-        return "color:#3a3a55;font-size:12px"
+            return "color:#9e4a3a;font-weight:700;font-size:15px;letter-spacing:.03em"
+        return "color:#303040;font-size:12px"
 
     def adx_style(v):
         try:
             f = float(v)
-            if f >= 25: return "color:#3dba7e;font-weight:700"
-            if f >= 20: return "color:#c8960c;font-weight:700"
-            return "color:#4a4a6a"
+            if f >= 25: return "color:#5a9e7a;font-weight:700"
+            if f >= 20: return "color:#9a7820;font-weight:700"
+            return "color:#404055"
         except: return "color:#333"
 
     def zone_style(z):
-        if "DISCOUNT" in z: return "color:#4a8fc0;font-weight:600"
-        if "PREMIUM"  in z: return "color:#b07030;font-weight:600"
-        return "color:#4a4a6a"
+        if "DISCOUNT" in z: return "color:#4a7898;font-weight:600"
+        if "PREMIUM"  in z: return "color:#8a6028;font-weight:600"
+        return "color:#404055"
 
     def fresh_style(f):
-        return "color:#c8960c;font-weight:700" if "⚡" in f else "color:#3a3a5a"
+        return "color:#9a7820;font-weight:700" if "⚡" in f else "color:#303040"
 
     def score_bar(score):
-        color = "#3dba7e" if score >= 70 else "#c8960c" if score >= 40 else "#c0392b"
+        color = "#5a9e7a" if score >= 70 else "#9a7820" if score >= 40 else "#9e4a3a"
         width = max(4, score)
         return f"""<div style="display:flex;align-items:center;gap:8px">
-          <div style="width:60px;height:4px;background:#1a1a2e;border-radius:2px;overflow:hidden">
+          <div style="width:60px;height:4px;background:#1a1a22;border-radius:2px;overflow:hidden">
             <div style="width:{width}%;height:100%;background:{color};border-radius:2px"></div>
           </div>
           <span style="color:{color};font-weight:700;font-size:13px">{score}</span>
@@ -883,8 +877,8 @@ Plus de 50 % des actifs échouent au fetch.
   font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:600;white-space:nowrap
 }
 .sc-tbl td{padding:13px 16px;border-bottom:1px solid #0f0f1e;vertical-align:middle}
-.sc-tbl tr:hover td{background:#0c0c1a !important}
-.ticker{font-size:20px;font-weight:800;color:#d8d8f0;letter-spacing:.04em;white-space:nowrap;font-family:'IBM Plex Mono',monospace}
+.sc-tbl tr:hover td{background:#111118 !important}
+.ticker{font-size:20px;font-weight:800;color:#c8c8d8;letter-spacing:.04em;white-space:nowrap;font-family:'IBM Plex Mono',monospace}
 .bias-tag{font-size:11px;font-weight:700;letter-spacing:.07em;vertical-align:middle;margin-left:8px;text-transform:uppercase;opacity:.85}
 .grade-pill{
   display:inline-block;padding:2px 8px;border-radius:2px;
@@ -921,7 +915,7 @@ Plus de 50 % des actifs échouent au fetch.
                      else "BULL"       if bias == "BULLISH"
                      else "STRONG BEAR" if bias == "STRONG BEARISH"
                      else "BEAR")
-        bias_color = "#3dba7e" if bull_bias else "#c0392b"
+        bias_color = "#5a9e7a" if bull_bias else "#9e4a3a"
 
         row_bg = gs["bg"] if fresh and grade in ("A+","A") else "transparent"
 
