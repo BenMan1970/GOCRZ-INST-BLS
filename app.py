@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import oandapyV20
 import oandapyV20.endpoints.instruments as instruments
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 import pytz
 import time
 
@@ -27,106 +27,136 @@ class QuantEngine:
         hma = QuantEngine.wma(raw_hma, sqrt)
         return hma.ewm(span=5, adjust=False).mean()
 
-    @staticmethod
-    def adx_wilder(df, period=14):
-        high, low, close = df['high'], df['low'], df['close']
-        tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
-        atr = tr.ewm(alpha=1/period, adjust=False).mean()
-        up, down = high.diff(), -low.diff()
-        plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0), index=df.index).ewm(alpha=1/period, adjust=False).mean()
-        minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0), index=df.index).ewm(alpha=1/period, adjust=False).mean()
-        di_plus = plus_dm / atr
-        di_minus = minus_dm / atr
-        dx = (abs(di_plus - di_minus) / (di_plus + di_minus)) * 100
-        return dx.ewm(alpha=1/period, adjust=False).mean().iloc[-1]
+# ===============================
+# ANALYSE & ICT LOGIC (AUDITED)
+# ===============================
 
-# ===============================
-# ANALYSE & ICT LOGIC (CORRIGÉ)
-# ===============================
+def get_institutional_bias(df_daily):
+    """
+    Réplique exacte de la logique 'getInstitutionalTrend' du script TradingView pour le Timeframe Daily.
+    Retourne: "BULLISH", "BEARISH" ou "NEUTRAL"
+    """
+    if len(df_daily) < 200: 
+        return "NEUTRAL"
+    
+    close = df_daily['close']
+    
+    # Calcul des moyennes (TradingView Script Lignes 151-153)
+    sma200 = close.rolling(200).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    
+    # Dernières valeurs
+    c = close.iloc[-1]
+    s200 = sma200.iloc[-1]
+    e50 = ema50.iloc[-1]
+    e21 = ema21.iloc[-1]
+    
+    # Logique Perfect/Strong Bull/Bear (Lignes 157-162 du script Pine)
+    aboveSMA200 = c > s200
+    belowSMA200 = c < s200
+    ema50AboveSMA = e50 > s200
+    ema50BelowSMA = e50 < s200
+    ema21Above50 = e21 > e50
+    ema21Below50 = e21 < e50
+    
+    perfectBull = aboveSMA200 and ema50AboveSMA and ema21Above50 and c > e21
+    perfectBear = belowSMA200 and ema50BelowSMA and ema21Below50 and c < e21
+    
+    strongBull = aboveSMA200 and ema50AboveSMA
+    strongBear = belowSMA200 and ema50BelowSMA
+    
+    if perfectBull or strongBull:
+        return "BULLISH"
+    elif perfectBear or strongBear:
+        return "BEARISH"
+    else:
+        return "NEUTRAL"
 
 def analyze_asset(client, ticker):
     try:
-        # 1. Récupération des données
-        # Augmenter le count M15 pour bien trouver la bougie de minuit et les PDH/PDL
-        df_d = fetch_oanda_data(client, ticker, "D", 10)
-        df_m15 = fetch_oanda_data(client, ticker, "M15", 200) 
+        # 1. Récupération Données
+        # Daily : Besoin de 200 bougies pour la SMA200
+        df_d = fetch_oanda_data(client, ticker, "D", 250)
+        # M15 : Pour le contexte intraday, Midnight Open, FVG
+        df_m15 = fetch_oanda_data(client, ticker, "M15", 200)
         
         if df_d.empty or df_m15.empty: return None
 
         price = df_m15['close'].iloc[-1]
         
-        # 2. TIMEZONE SETUP (NEW YORK)
+        # 2. BIAIS INSTITUTIONNEL (Basé sur Daily TF)
+        # Utilise la nouvelle fonction 'get_institutional_bias'
+        bias = get_institutional_bias(df_d)
+        
+        # 3. TIMEZONE & MIDNIGHT OPEN (NEW YORK)
         ny_tz = pytz.timezone('America/New_York')
         df_m15.index = df_m15.index.tz_convert(ny_tz)
         
         now_ny = datetime.now(ny_tz)
         today_ny_date = now_ny.date()
         
-        # 3. MIDNIGHT OPEN (00:00 NEW YORK)
-        # Recherche de la bougie M15 qui débute à 00:00 NY aujourd'hui
-        midnight_candle = df_m15[(df_m15.index.date == today_ny_date) & (df_m15.index.hour == 0) & (df_m15.index.minute == 0)]
+        # Trouver l'ouverture de minuit (00:00 NY)
+        midnight_mask = (df_m15.index.date == today_ny_date) & (df_m15.index.hour == 0) & (df_m15.index.minute == 0)
+        midnight_candles = df_m15[midnight_mask]
         
-        if midnight_candle.empty:
-            # Fallback si minuit n'est pas encore là (ex: dimanche soir ou early monday)
-            m_open = df_m15['open'].iloc[0] 
+        if not midnight_candles.empty:
+            m_open = midnight_candles['open'].iloc[0]
         else:
-            m_open = midnight_candle['open'].iloc[0]
+            # Fallback : Ouverture du jour actuel si 00:00 pas encore disponible (ex: early session)
+            # On prend l'open de la première bougie dispo du jour
+            today_candles = df_m15[df_m15.index.date == today_ny_date]
+            m_open = today_candles['open'].iloc[0] if not today_candles.empty else df_m15['open'].iloc[-1]
 
-        # 4. PDH & PDL (Previous Day High/Low)
-        # On prend la journée précédente (hier) par rapport à aujourd'hui en NY time
-        yesterday_ny_date = today_ny_date - timedelta(days=1)
-        
-        # Filtre sur les données d'hier
-        df_yesterday = df_m15[df_m15.index.date == yesterday_ny_date]
-        
-        # Gestion des weekends (si hier est dimanche, on prend vendredi etc...)
-        # On recule jusqu'à trouver des données
-        while df_yesterday.empty and yesterday_ny_date > today_ny_date - timedelta(days=5):
-            yesterday_ny_date -= timedelta(days=1)
-            df_yesterday = df_m15[df_m15.index.date == yesterday_ny_date]
-
-        if df_yesterday.empty:
+        # 4. PREVIOUS DAY HIGH/LOW (PDH/PDL)
+        # Méthode fiable : Prendre la bougie Daily d'hier (iloc[-2])
+        # Note : OANDA aligne le Daily sur 17h NY (ou 16h DST), mais le High/Low couvre la session précédente.
+        # On suppose que la bougie Daily complétée la plus récente est la référence.
+        if len(df_d) >= 2:
+            pdh = df_d['high'].iloc[-2]
+            pdl = df_d['low'].iloc[-2]
+        else:
             pdh, pdl = np.nan, np.nan
-        else:
-            pdh = df_yesterday['high'].max()
-            pdl = df_yesterday['low'].min()
 
-        # 5. BIAIS (Tendance Journalière)
-        # Calcul EMA 5 sur le Daily (Simple Momentum)
-        ema5 = df_d['close'].ewm(span=5, adjust=False).mean().iloc[-1]
-        bias = "BULLISH" if price > ema5 else "BEARISH"
-
-        # 6. ZONES PREMIUM / DISCOUNT (LOGIQUE STRICTE ICT)
-        # Si Prix > Midnight Open -> PREMIUM (Chercher VENTE)
-        # Si Prix < Midnight Open -> DISCOUNT (Chercher ACHAT)
+        # 5. ZONES PREMIUM / DISCOUNT
+        # Règle stricte ICT :
+        # Prix > Midnight Open = PREMIUM (Zone de Vente)
+        # Prix < Midnight Open = DISCOUNT (Zone d'Achat)
         
         if price > m_open:
             zone = "PREMIUM 🔴" 
         else:
             zone = "DISCOUNT 🟢"
             
-        # 7. LOGIQUE DE SCORE V10
+        # 6. LOGIQUE DE SCORE V10
         score = 0
         
-        # Points pour le Biais
-        if bias == "BULLISH": score += 3
+        # A. Alignement Tendance
+        if bias == "BULLISH": score += 4 # Poids augmenté pour la tendance institutionnelle
+        elif bias == "BEARISH": score += 0 # Pas de points si bearish (base 0)
         
-        # Points pour HMA 20
+        # B. HMA 20 (Momentum Court Terme)
         hma = QuantEngine.hma(df_m15['close'], 20)
         hma_t = "BULLISH" if hma.iloc[-1] > hma.iloc[-2] else "BEARISH"
-        if hma_t == bias: score += 4
         
-        # Points Momentum Bougie
-        if price > df_m15['open'].iloc[-1]: score += 3 
+        # Si HMA aligné avec le Biais (ou neutre)
+        if bias == "BULLISH" and hma_t == "BULLISH": score += 3
+        elif bias == "BEARISH" and hma_t == "BEARISH": score += 3
         
-        # Points FVG (Détection simple)
-        if df_m15['low'].iloc[-1] > df_m15['high'].iloc[-3]: score += 4
+        # C. FVG (Fair Value Gap)
+        # Détection simple : Low actuel > High d'il y a 2 bougies
+        last_fvg_bull = df_m15['low'].iloc[-1] > df_m15['high'].iloc[-3]
+        last_fvg_bear = df_m15['high'].iloc[-1] < df_m15['low'].iloc[-3]
+        
+        if bias == "BULLISH" and last_fvg_bull: score += 3
+        if bias == "BEARISH" and last_fvg_bear: score += 3
 
-        # Qualité du Setup
-        quality = "💎 A+ SETUP" if score >= 12 else "✅ A SETUP" if score >= 9 else "⚖️ B SETUP" if score >= 7 else "IGNORE"
+        # D. Position Ideal (Proximité PDH/PDL)
+        # Bonus si on est proche des liquidités cibles
+        if bias == "BEARISH" and price >= (pdl * 1.001): score += 2 # Près de PDL pour TP
+        if bias == "BULLISH" and price <= (pdh * 0.999): score += 2 # Près de PDH pour TP
 
-        # Calcul distance PDH (optionnel pour affichage)
-        dist_pdh = ((pdh - price) / price) * 100 if not np.isnan(pdh) else 0
+        quality = "💎 A+ SETUP" if score >= 10 else "✅ A SETUP" if score >= 7 else "⚖️ B SETUP" if score >= 4 else "IGNORE"
 
         return {
             "Actif": ticker, 
@@ -136,12 +166,12 @@ def analyze_asset(client, ticker):
             "Score": score, 
             "HMA 20": hma_t,
             "Midnight": round(m_open, 5),
-            "PDH": round(pdh, 5) if not np.isnan(pdh) else 0,
-            "PDL": round(pdl, 5) if not np.isnan(pdl) else 0
+            "PDH": round(pdh, 5),
+            "PDL": round(pdl, 5)
         }
 
     except Exception as e:
-        print(f"Erreur analyse {ticker}: {e}")
+        print(f"Erreur critique analyse {ticker}: {e}")
         return None
 
 def fetch_oanda_data(client, instrument, granularity, count):
@@ -153,7 +183,8 @@ def fetch_oanda_data(client, instrument, granularity, count):
             df.set_index("time", inplace=True)
             df.index = df.index.tz_localize('UTC') if df.index.tz is None else df.index
         return df
-    except:
+    except Exception as e:
+        print(f"Erreur fetch {instrument}: {e}")
         return pd.DataFrame()
 
 # ===============================
@@ -162,7 +193,7 @@ def fetch_oanda_data(client, instrument, granularity, count):
 
 def main():
     st.set_page_config(page_title="BLUESTAR SNIPER V10", layout="wide")
-    st.title("🎯 BLUESTAR SNIPER V10 - Scanner ICT")
+    st.title("🎯 BLUESTAR SNIPER V10 - Scanner ICT Audité")
 
     if "OANDA_ACCESS_TOKEN" not in st.secrets:
         st.error("ERREUR : La clé 'OANDA_ACCESS_TOKEN' est introuvable.")
@@ -181,7 +212,7 @@ def main():
             status_text.text(f"Analyse de {ticker}...")
             res = analyze_asset(client, ticker)
             if res: results.append(res)
-            time.sleep(0.1) 
+            time.sleep(0.2) # Légère pause pour API
             progress.progress((i + 1) / len(assets))
 
         if results:
@@ -190,9 +221,9 @@ def main():
             def color_cells(val):
                 if 'BULLISH' in str(val) or '🟢' in str(val): return 'color: #00ff00'
                 elif 'BEARISH' in str(val) or '🔴' in str(val): return 'color: #ff4b4b'
+                elif 'NEUTRAL' in str(val): return 'color: gray'
                 return 'color: white'
 
-            # Affichage amélioré avec les nouvelles colonnes
             st.dataframe(
                 df.style.applymap(color_cells, subset=['Signal', 'HMA 20', 'Zone'])
                 .format({"Midnight": "{:.5f}", "PDH": "{:.5f}", "PDL": "{:.5f}"}), 
