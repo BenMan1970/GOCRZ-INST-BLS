@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import oandapyV20
+import oandapyV20.endpoints.instruments as instruments
 
 # ===============================
 # BLUESTAR SNIPER V10 ENGINE
@@ -42,9 +43,8 @@ class QuantEngine:
         close = df['close']
 
         up_move = high.diff()
-        down_move = -low.diff() # Équivalent à low.shift() - low
+        down_move = -low.diff() 
 
-        # Conditions exactes de Wilder
         plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
         minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
 
@@ -67,7 +67,7 @@ class QuantEngine:
         return adx.iloc[-1], plus_di.iloc[-1], minus_di.iloc[-1]
 
     # ===============================
-    # HULL MOVING AVERAGE (Corrigé avec WMA)
+    # HULL MOVING AVERAGE
     # ===============================
     @staticmethod
     def hma(series, period=55):
@@ -81,6 +81,7 @@ class QuantEngine:
         hma = QuantEngine.wma(raw_hma, sqrt)
 
         return hma
+
 
 # ===============================
 # ICT PD ARRAYS
@@ -101,18 +102,17 @@ def pd_arrays_location(price, pdh, pdl):
     else:
         return "DEEP_PREMIUM"
 
+
 # ===============================
-# SIGNAL ENGINE V10 (Logique de score améliorée)
+# SIGNAL ENGINE V10
 # ===============================
 
 def calculate_signal_v10(df_m5, df_d):
     reasons =[]
-    base_score = 0 # Positif = BUY, Négatif = SELL
+    base_score = 0 
     price = df_m5['close'].iloc[-1]
 
-    # ===============================
     # 1. PD ARRAYS (Tendance long terme)
-    # ===============================
     pdh = df_d['high'].iloc[-2]
     pdl = df_d['low'].iloc[-2]
     location = pd_arrays_location(price, pdh, pdl)
@@ -130,9 +130,7 @@ def calculate_signal_v10(df_m5, df_d):
         base_score -= 30
         reasons.append("🔴 Deep Premium Daily (-30 Baissier)")
 
-    # ===============================
     # 2. TREND (HMA Court terme)
-    # ===============================
     hma = QuantEngine.hma(df_m5['close'], 55)
     
     if price > hma.iloc[-1]:
@@ -142,22 +140,17 @@ def calculate_signal_v10(df_m5, df_d):
         base_score -= 20
         reasons.append("🔴 Trend M5 Down (Price < HMA) (-20 Baissier)")
 
-    # ---> DÉDUCTION DE LA DIRECTION PRINCIPALE <---
     direction = "BUY" if base_score > 0 else "SELL" if base_score < 0 else "NEUTRAL"
-    score = abs(base_score) # On passe en force absolue (0 à 100+)
+    score = abs(base_score) 
 
-    # ===============================
     # 3. ATR (Volatilité)
-    # ===============================
     atr = QuantEngine.calculate_atr_wilder(df_m5)
     atr_mean = (df_m5['high'] - df_m5['low']).rolling(20).mean().iloc[-1]
     if atr > atr_mean:
         score += 10
         reasons.append("⚡ ATR Expansion détectée (+10 Force)")
 
-    # ===============================
     # 4. ADX (Force de la tendance)
-    # ===============================
     adx, plus_di, minus_di = QuantEngine.adx_wilder(df_m5)
     if adx > 25:
         score += 20
@@ -169,9 +162,7 @@ def calculate_signal_v10(df_m5, df_d):
         score -= 10
         reasons.append(f"⚠️ Weak Trend ADX {adx:.1f} (-10 Force)")
 
-    # ===============================
     # 5. QUALITY CLASSIFICATION
-    # ===============================
     if direction == "NEUTRAL" or score < 40:
         quality = "IGNORE"
     elif score >= 70:
@@ -193,42 +184,80 @@ def calculate_signal_v10(df_m5, df_d):
 
 
 # ===============================
+# GESTIONNAIRE OANDA
+# ===============================
+
+def fetch_oanda_data(client, instrument, granularity, count=500):
+    """
+    Récupère les bougies OANDA et les convertit en DataFrame pandas lisible par QuantEngine.
+    """
+    params = {"count": count, "granularity": granularity}
+    r = instruments.InstrumentsCandles(instrument=instrument, params=params)
+    client.request(r)
+    
+    candles = r.response.get("candles", [])
+    data = []
+    
+    for c in candles:
+        if c["complete"]:  # On garde uniquement les bougies fermées pour éviter les faux signaux
+            data.append({
+                "time": pd.to_datetime(c["time"]),
+                "open": float(c["mid"]["o"]),
+                "high": float(c["mid"]["h"]),
+                "low": float(c["mid"]["l"]),
+                "close": float(c["mid"]["c"]),
+                "volume": float(c["volume"])
+            })
+            
+    df = pd.DataFrame(data)
+    df.set_index("time", inplace=True)
+    return df
+
+
+# ===============================
 # INTERFACE STREAMLIT
 # ===============================
 
 def main():
     st.set_page_config(page_title="BLUESTAR SNIPER V10", layout="wide")
     
-    st.title("🎯 BLUESTAR SNIPER V10 - QUANT ENGINE")
-    st.markdown("Scanner institutionnel basé sur ICT (PD Arrays) + Hull Moving Average + ADX/ATR.")
+    st.title("🎯 BLUESTAR SNIPER V10 - OANDA ENGINE")
+    st.markdown("Scanner institutionnel basé sur ICT (PD Arrays) + Hull Moving Average + ADX/ATR via API OANDA.")
+
+    # Vérification des secrets Streamlit
+    try:
+        OANDA_TOKEN = st.secrets["OANDA_TOKEN"]
+        # Par défaut "practice" (démo), remplace par "live" si tu as un compte réel
+        OANDA_ENV = st.secrets.get("OANDA_ENV", "practice") 
+    except KeyError:
+        st.error("⚠️ **ERREUR** : La clé `OANDA_TOKEN` est introuvable dans les secrets Streamlit.")
+        st.info("Va dans les paramètres de ton app sur Streamlit Cloud -> Secrets, et ajoute `OANDA_TOKEN = 'ton_token'`")
+        st.stop()
+
+    # Initialisation du client OANDA
+    client = oandapyV20.API(access_token=OANDA_TOKEN, environment=OANDA_ENV)
 
     col1, col2 = st.columns([1, 3])
+    
     with col1:
         st.subheader("Configuration")
-        ticker = st.text_input("Symbole Yahoo Finance", "BTC-USD")
-        st.caption("Exemples : EURUSD=X (Forex), BTC-USD (Crypto), AAPL (Actions)")
+        ticker = st.text_input("Symbole OANDA", "EUR_USD")
+        st.caption("Exemples : EUR_USD, XAU_USD, SPX500_USD, WTICO_USD")
         run_scan = st.button("Lancer le Scan 🚀", use_container_width=True)
 
     if run_scan:
-        with st.spinner(f"Récupération des données pour {ticker}..."):
+        with st.spinner(f"Récupération des données OANDA pour {ticker}..."):
             try:
-                # Récupération des données via yfinance
-                t = yf.Ticker(ticker)
+                # Récupère 15 jours de données en Daily (suffisant pour le High/Low d'hier)
+                df_d = fetch_oanda_data(client, ticker, granularity="D", count=15)
+                # Récupère 500 bougies en 5 minutes (suffisant pour calculer le HMA 55 et ATR 14)
+                df_m5 = fetch_oanda_data(client, ticker, granularity="M5", count=500)
                 
-                # Récupère l'historique sur 5 jours
-                df_d = t.history(period="10d", interval="1d")
-                df_m5 = t.history(period="5d", interval="5m")
-                
-                # Vérifie si le ticker existe
                 if df_d.empty or df_m5.empty:
-                    st.error(f"Aucune donnée trouvée pour {ticker}. Vérifiez le symbole.")
+                    st.error(f"Aucune donnée trouvée pour {ticker}. Vérifiez le format (ex: EUR_USD).")
                     return
 
-                # Normaliser les noms de colonnes en minuscules
-                df_d.columns = [c.lower() for c in df_d.columns]
-                df_m5.columns = [c.lower() for c in df_m5.columns]
-
-                # Calcul du signal
+                # Calcul du signal avec V10 Engine
                 signal = calculate_signal_v10(df_m5, df_d)
 
                 # ===============================
@@ -259,7 +288,7 @@ def main():
                         st.write(f"- {r}")
                         
             except Exception as e:
-                st.error(f"Une erreur s'est produite lors du calcul : {e}")
+                st.error(f"Erreur API OANDA ou Calcul : {e}")
 
 if __name__ == "__main__":
     main()
