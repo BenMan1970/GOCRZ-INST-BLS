@@ -459,8 +459,28 @@ def main():
     )
 
     assets = [
-        "EUR_USD", "GBP_USD", "USD_JPY", "USD_CAD",
-        "AUD_USD", "XAU_USD", "NAS100_USD", "GBP_CHF", "CAD_CHF"
+        # ── 28 paires Forex ──────────────────────────────────────
+        # Majeurs (7)
+        "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF",
+        "AUD_USD", "USD_CAD", "NZD_USD",
+        # Croisés EUR (6)
+        "EUR_GBP", "EUR_JPY", "EUR_CHF",
+        "EUR_AUD", "EUR_CAD", "EUR_NZD",
+        # Croisés GBP (5)
+        "GBP_JPY", "GBP_CHF", "GBP_AUD",
+        "GBP_CAD", "GBP_NZD",
+        # Croisés JPY (4)
+        "AUD_JPY", "CAD_JPY", "CHF_JPY", "NZD_JPY",
+        # Croisés mineurs (6)
+        "AUD_CAD", "AUD_CHF", "AUD_NZD",
+        "CAD_CHF", "NZD_CAD", "NZD_CHF",
+        # ── Métaux (2) ───────────────────────────────────────────
+        "XAU_USD",   # Gold
+        "XAG_USD",   # Silver
+        # ── Indices (3) ──────────────────────────────────────────
+        "US30_USD",  # Dow Jones
+        "NAS100_USD",# Nasdaq 100
+        "DE30_EUR",  # DAX
     ]
 
     with st.expander("📘 Grille de notation — comment le score est calculé"):
