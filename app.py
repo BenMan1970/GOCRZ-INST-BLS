@@ -7,189 +7,168 @@ from datetime import datetime, timezone
 import time
 
 # ===============================
-# BLUESTAR SNIPER V10 ENGINE
+# ENGINE ICT (FVG, PD ARRAYS, HMA)
 # ===============================
-
-class QuantEngine:
+class ICTEngine:
     @staticmethod
-    def wma(series, period):
-        weights = np.arange(1, period + 1)
-        return series.rolling(period).apply(lambda prices: np.dot(prices, weights) / weights.sum(), raw=True)
-
-    @staticmethod
-    def calculate_atr_wilder(df, period=14):
-        tr = pd.concat([df['high'] - df['low'], 
-                        abs(df['high'] - df['close'].shift()), 
-                        abs(df['low'] - df['close'].shift())], axis=1).max(axis=1)
-        return tr.ewm(alpha=1/period, adjust=False).mean().iloc[-1]
+    def get_hma(series, period=20):
+        half, sqrt = int(period / 2), int(np.sqrt(period))
+        def wma(s, p):
+            weights = np.arange(1, p + 1)
+            return s.rolling(p).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+        return wma(2 * wma(series, half) - wma(series, period), sqrt)
 
     @staticmethod
-    def adx_wilder(df, period=14):
+    def detect_fvg(df):
+        if len(df) < 3: return None
+        # Bullish FVG (Gap entre High i-2 et Low i)
+        if df['low'].iloc[-1] > df['high'].iloc[-3]: return "BULLISH"
+        # Bearish FVG (Gap entre Low i-2 et High i)
+        if df['high'].iloc[-1] < df['low'].iloc[-3]: return "BEARISH"
+        return None
+
+    @staticmethod
+    def get_adx(df, period=14):
         high, low, close = df['high'], df['low'], df['close']
-        up_move, down_move = high.diff(), -low.diff()
-        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0), index=df.index)
-        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0), index=df.index)
         tr = pd.concat([high - low, abs(high - close.shift()), abs(low - close.shift())], axis=1).max(axis=1)
         atr = tr.ewm(alpha=1/period, adjust=False).mean()
-        plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
-        minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
-        adx = (abs(plus_di - minus_di) / (plus_di + minus_di) * 100).ewm(alpha=1/period, adjust=False).mean()
+        up, down = high.diff(), -low.diff()
+        pdm = pd.Series(np.where((up > down) & (up > 0), up, 0), index=df.index).ewm(alpha=1/period, adjust=False).mean()
+        mdm = pd.Series(np.where((down > up) & (down > 0), down, 0), index=df.index).ewm(alpha=1/period, adjust=False).mean()
+        adx = (abs((pdm/atr) - (mdm/atr)) / ((pdm/atr) + (mdm/atr)) * 100).ewm(alpha=1/period, adjust=False).mean()
         return adx.iloc[-1]
 
-    @staticmethod
-    def hma(series, period=55):
-        half, sqrt = int(period / 2), int(np.sqrt(period))
-        wma1, wma2 = QuantEngine.wma(series, half), QuantEngine.wma(series, period)
-        return QuantEngine.wma(2 * wma1 - wma2, sqrt)
-
 # ===============================
-# LOGIQUE DE SIGNAL
+# LOGIQUE DE SCANNER (14 POINTS)
 # ===============================
+def analyze_asset(client, ticker):
+    # Récupération des données (D, H4, H1, M15)
+    df_d = fetch_oanda(client, ticker, "D", 5)
+    df_h4 = fetch_oanda(client, ticker, "H4", 20)
+    df_h1 = fetch_oanda(client, ticker, "H1", 20)
+    df_m15 = fetch_oanda(client, ticker, "M15", 50)
 
-def get_signal(df_m5, df_d):
+    if df_d.empty or df_h4.empty or df_h1.empty or df_m15.empty: return None
+
+    price = df_m15['close'].iloc[-1]
     score = 0
-    price = df_m5['close'].iloc[-1]
-    
-    # 1. PD ARRAYS (Daily Context)
+    confluences = []
+
+    # 1. DAILY BIAS (Filtre Principal)
+    ema_d = df_d['close'].rolling(5).mean().iloc[-1]
+    bias = "BULLISH" if price > ema_d else "BEARISH"
+    score += 3
+    confluences.append(f"Bias {bias}")
+
+    # 2. MIDNIGHT OPEN & PD ARRAY (Premium/Discount)
+    # On simule le Midnight Open avec la première bougie de la journée
+    midnight_open = df_m15.between_time('00:00', '01:00')['open'].iloc[0] if not df_m15.between_time('00:00', '01:00').empty else price
     pdh, pdl = df_d['high'].iloc[-2], df_d['low'].iloc[-2]
-    range_size = pdh - pdl
-    if price < pdl + range_size * 0.25: score += 30 # Deep Discount
-    elif price < pdl + range_size * 0.5: score += 15 # Discount
-    elif price < pdl + range_size * 0.75: score -= 15 # Premium
-    else: score -= 30 # Deep Premium
-
-    # 2. HMA TREND
-    hma_val = QuantEngine.hma(df_m5['close'], 55).iloc[-1]
-    score += 20 if price > hma_val else -20
-
-    # 3. VOLATILITY & ADX
-    adx = QuantEngine.adx_wilder(df_m5)
-    final_score = abs(score)
-    final_score += 20 if adx > 25 else 10 if adx > 20 else -10
     
-    direction = "BUY 🔵" if score > 0 else "SELL 🔴"
-    
-    # Quality Mapping
-    if final_score >= 70: quality = "💎 A+ SETUP"
-    elif final_score >= 55: quality = "✅ A SETUP"
-    elif final_score >= 40: quality = "⚖️ B SETUP"
-    else: quality = "❌ IGNORE"
+    zone = "NEUTRAL"
+    if bias == "BULLISH" and price < midnight_open: zone = "DISCOUNT 🟢"
+    elif bias == "BEARISH" and price > midnight_open: zone = "PREMIUM 🔴"
 
-    last_time = df_m5.index[-1]
-    freshness = int((datetime.now(timezone.utc) - last_time).total_seconds() / 60)
+    # 3. MTF ALIGNMENT (Daily/H4/H1)
+    align_count = 0
+    if (bias == "BULLISH" and price > df_h4['close'].iloc[-1]): align_count += 1
+    if (bias == "BULLISH" and price > df_h1['close'].iloc[-1]): align_count += 1
+    if (bias == "BEARISH" and price < df_h4['close'].iloc[-1]): align_count += 1
+    if (bias == "BEARISH" and price < df_h1['close'].iloc[-1]): align_count += 1
+    
+    if align_count >= 2: 
+        score += 2
+        confluences.append("MTF Aligné")
+
+    # 4. FVG DETECTION (H4/H1)
+    fvg_h4 = ICTEngine.detect_fvg(df_h4)
+    fvg_h1 = ICTEngine.detect_fvg(df_h1)
+    if fvg_h4 == bias: score += 3; confluences.append("FVG H4")
+    if fvg_h1 == bias: score += 2; confluences.append("FVG H1")
+
+    # 5. MOMENTUM (HMA 20 & ADX)
+    hma20 = ICTEngine.get_hma(df_m15['close'], 20)
+    hma_color = "GREEN" if hma20.iloc[-1] > hma20.iloc[-2] else "RED"
+    if (bias == "BULLISH" and hma_color == "GREEN") or (bias == "BEARISH" and hma_color == "RED"):
+        score += 1; confluences.append("HMA OK")
+    
+    adx_v = ICTEngine.get_adx(df_h1)
+    if adx_v > 20: score += 1; confluences.append("ADX > 20")
+
+    # 6. M15 REBOND
+    if (bias == "BULLISH" and df_m15['close'].iloc[-1] > df_m15['open'].iloc[-1]):
+        score += 2; confluences.append("Rebond M15")
+
+    # Classification
+    quality = "IGNORE"
+    if score >= 12: quality = "💎 A+ SETUP"
+    elif score >= 9: quality = "✅ A SETUP"
+    elif score >= 7: quality = "⚖️ B SETUP"
 
     return {
-        "Direction": direction,
-        "Score": min(final_score, 100),
-        "Qualité": quality,
-        "ADX": round(adx, 1),
-        "Fraîcheur": f"{freshness} min"
+        "Actif": ticker, "Biais": bias, "Zone": zone, 
+        "Qualité": quality, "Score": score, "ADX": round(adx_v, 1),
+        "Confluences": ", ".join(confluences)
     }
 
 # ===============================
-# DATA FETCHING
+# FONCTIONS TECHNIQUES OANDA
 # ===============================
-
-def fetch_oanda_data(client, ticker, granularity, count):
+def fetch_oanda(client, ticker, granularity, count):
     try:
         r = instruments.InstrumentsCandles(instrument=ticker, params={"count": count, "granularity": granularity})
         client.request(r)
-        data = [{"time": pd.to_datetime(c["time"]), "high": float(c["mid"]["h"]), 
-                 "low": float(c["mid"]["l"]), "close": float(c["mid"]["c"])} 
-                for c in r.response.get("candles", []) if c["complete"]]
-        df = pd.DataFrame(data)
-        if not df.empty: df.set_index("time", inplace=True)
+        df = pd.DataFrame([{"time": c["time"], "open": float(c["mid"]["o"]), "high": float(c["mid"]["h"]), 
+                            "low": float(c["mid"]["l"]), "close": float(c["mid"]["c"])} for c in r.response.get("candles", []) if c["complete"]])
+        if not df.empty:
+            df['time'] = pd.to_datetime(df['time'])
+            df.set_index('time', inplace=True)
         return df
     except: return pd.DataFrame()
 
 # ===============================
-# STREAMLIT UI
+# INTERFACE STREAMLIT
 # ===============================
-
 def main():
     st.set_page_config(page_title="BLUESTAR SNIPER V10", layout="wide")
+    st.title("🎯 BLUESTAR SNIPER V10 - Scanner Manuel")
     
-    st.title("🎯 BLUESTAR SNIPER V10 - GLOBAL SCANNER")
-    st.markdown("### Scanner Institutionnel ICT & Momentum")
-
-    # Configuration API via Secrets
+    # Secrets
     try:
-        token = st.secrets["OANDA_ACCESS_TOKEN"]
-        env = st.secrets.get("OANDA_ENV", "practice")
-        client = oandapyV20.API(access_token=token, environment=env)
+        client = oandapyV20.API(access_token=st.secrets["OANDA_ACCESS_TOKEN"], environment="practice")
     except:
-        st.error("⚠️ Configurer `OANDA_ACCESS_TOKEN` dans les Secrets Streamlit.")
+        st.error("Configurez OANDA_ACCESS_TOKEN dans les Secrets.")
         st.stop()
 
-    # Liste exhaustive : 28 Forex + Gold + Indices
-    forex_28 = [
+    assets = [
         "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "NZD_USD", "USD_CHF",
-        "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_CAD", "EUR_NZD", "EUR_CHF",
-        "GBP_JPY", "GBP_AUD", "GBP_CAD", "GBP_NZD", "GBP_CHF",
-        "AUD_JPY", "AUD_CAD", "AUD_NZD", "AUD_CHF",
-        "NZD_JPY", "NZD_CAD", "NZD_CHF",
-        "CAD_JPY", "CAD_CHF", "CHF_JPY"
+        "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_CAD", "GBP_JPY", "XAU_USD", "US30_USD", 
+        "NAS100_USD", "SPX500_USD", "DE30_EUR"
     ]
-    indices_commods = ["XAU_USD", "US30_USD", "NAS100_USD", "SPX500_USD", "DE30_EUR"] # DE30_EUR est le DAX sur Oanda
-    
-    assets = forex_28 + indices_commods
 
-    if st.button("LANCER LE SCAN SUR TOUS LES ACTIFS 🚀", use_container_width=True):
+    if st.button("LANCER LE SCAN GLOBAL 🚀", use_container_width=True):
         results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for idx, ticker in enumerate(assets):
-            status_text.text(f"Analyse en cours : {ticker}...")
-            progress_bar.progress((idx + 1) / len(assets))
-            
-            df_d = fetch_oanda_data(client, ticker, "D", 15)
-            df_m5 = fetch_oanda_data(client, ticker, "M5", 500)
-            
-            if not df_d.empty and not df_m5.empty:
-                res = get_signal(df_m5, df_d)
-                res["Actif"] = ticker
-                results.append(res)
-            time.sleep(0.05) # Petit délai pour la stabilité
-
-        status_text.empty()
+        bar = st.progress(0)
+        for i, ticker in enumerate(assets):
+            bar.progress((i+1)/len(assets))
+            res = analyze_asset(client, ticker)
+            if res: results.append(res)
+            time.sleep(0.05)
 
         if results:
-            df_final = pd.DataFrame(results)
-            df_final = df_final[["Actif", "Direction", "Qualité", "Score", "ADX", "Fraîcheur"]]
+            df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
             
-            # Tri par Score décroissant pour voir les meilleurs setups en haut
-            df_final = df_final.sort_values(by="Score", ascending=False)
+            # Affichage des alertes A+
+            top = df[df["Score"] >= 12]
+            if not top.empty:
+                st.subheader("🔥 Alertes Institutionnelles (A+)")
+                for _, row in top.iterrows():
+                    st.info(f"**{row['Actif']}** : {row['Zone']} | Score: {row['Score']}/14 | {row['Confluences']}")
 
-            # TOP ALERTS A+
-            best_setups = df_final[df_final["Qualité"].str.contains("A\+")]
-            if not best_setups.empty:
-                st.subheader("💎 ALERTS : TOP SETUPS DÉTECTÉS")
-                cols = st.columns(min(len(best_setups), 4))
-                for i, (_, row) in enumerate(best_setups.head(4).iterrows()):
-                    cols[i % 4].metric(row["Actif"], row["Direction"], f"Score: {row['Score']}")
-            
-            st.subheader("📊 Tableau Récapitulatif")
-            
-            # Styling
-            def style_rows(row):
-                if "A+" in row["Qualité"]:
-                    return ['background-color: #1e3d24'] * len(row) # Vert foncé pour A+
-                elif "IGNORE" in row["Qualité"]:
-                    return ['color: #555555'] * len(row) # Gris pour Ignore
-                return [''] * len(row)
-
-            st.dataframe(
-                df_final.style.apply(style_rows, axis=1)
-                .background_gradient(cmap='RdYlGn', subset=['Score'], vmin=0, vmax=100),
-                use_container_width=True,
-                height=800
-            )
-            
-            st.success(f"Analyse terminée avec succès à {datetime.now().strftime('%H:%M')}")
+            st.subheader("📊 Tableau de Bord")
+            st.dataframe(df.style.background_gradient(cmap='RdYlGn', subset=['Score']), use_container_width=True)
         else:
-            st.error("Erreur : Impossible de récupérer les données. Vérifiez votre Token OANDA.")
+            st.warning("Aucune donnée. Vérifiez l'API.")
 
 if __name__ == "__main__":
     main()
-
