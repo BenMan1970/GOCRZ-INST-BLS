@@ -835,7 +835,7 @@ def main():
                 return "color:#c0392b;font-weight:700;font-size:15px;letter-spacing:.03em"
             if "🚫" in s or "⚠️" in s:
                 return "color:#a05010;font-weight:600"
-            return "color:#3a3a4a;font-size:13px"
+            return "color:#55556a;font-size:13px"
 
         def adx_style(v):
             try:
@@ -853,12 +853,12 @@ def main():
         def zone_style(z):
             if "DISCOUNT" in z: return "color:#4a8fc0;font-weight:600"
             if "PREMIUM"  in z: return "color:#b07030;font-weight:600"
-            return "color:#444455"
+            return "color:#60607a"
 
         def fvg_style(f):
             if "Dans FVG" in f: return "color:#3dba7e;font-weight:600"
             if "proche"   in f: return "color:#c8960c"
-            return "color:#3a3a4a"
+            return "color:#55556a"
 
         def fresh_style(f):
             return "color:#c8960c;font-weight:700" if "⚡" in f else "color:#3a3a4a"
@@ -867,14 +867,14 @@ def main():
 <style>
 .sc-wrap{overflow-x:auto;margin-top:8px}
 .sc-tbl{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono','Courier New',monospace;font-size:13px}
-.sc-tbl thead tr{border-bottom:1px solid #1e1e2e}
+.sc-tbl thead tr{border-bottom:1px solid #2a2a3e}
 .sc-tbl th{
-  padding:10px 16px;text-align:left;color:#3a3a5a;
-  font-size:10px;text-transform:uppercase;letter-spacing:.1em;font-weight:500;white-space:nowrap
+  padding:10px 16px;text-align:left;color:#7a7aaa;
+  font-size:11px;text-transform:uppercase;letter-spacing:.1em;font-weight:600;white-space:nowrap
 }
-.sc-tbl td{padding:11px 16px;border-bottom:1px solid #111118;vertical-align:middle}
-.sc-tbl tr:hover td{background:#0c0c16}
-.ticker{font-size:20px;font-weight:800;color:#d0d0e0;letter-spacing:.05em}
+.sc-tbl td{padding:12px 16px;border-bottom:1px solid #161622;vertical-align:middle}
+.sc-tbl tr:hover td{background:#0e0e1a}
+.ticker{font-size:22px;font-weight:800;color:#e8e8f0;letter-spacing:.04em;white-space:nowrap}
 .grade-pill{
   display:inline-block;padding:3px 9px;border-radius:3px;
   font-size:12px;font-weight:700;letter-spacing:.06em;
@@ -886,9 +886,9 @@ def main():
 </style>
 <div class="sc-wrap"><table class="sc-tbl">
 <thead><tr>
+  <th>⚡</th>
   <th>Actif</th>
   <th>Signal</th>
-  <th>⚡ Fraîcheur</th>
   <th>Biais Daily</th>
   <th>Zone</th>
   <th>ADX H1</th>
@@ -912,13 +912,13 @@ def main():
             row_bg  = gs["bg"] if fresh and grade in ("A+","A") else "transparent"
 
             html += f"""<tr style="background:{row_bg}">
-  <td>
+  <td style="{fresh_style(fresh_str)};font-size:15px;text-align:center">{fresh_str}</td>
+  <td style="white-space:nowrap">
     <span class="ticker">{ticker}</span>
     <span class="grade-pill" style="color:{gs['color']};border-color:{gs['color']}">{gs['label']}</span>
     <span class="score-val" style="color:{gs['color']}">{score}</span>
   </td>
   <td style="{sig_style(sig)}">{sig}</td>
-  <td style="{fresh_style(fresh_str)}">{fresh_str}</td>
   <td style="{bias_style(bias)}">{bias}</td>
   <td style="{zone_style(zone)}">{zone}</td>
   <td style="{adx_style(adx_v)}">{adx_v}</td>
