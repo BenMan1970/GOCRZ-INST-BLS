@@ -576,30 +576,65 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
 # ----------------------------------------------------------------
 #  FETCH OANDA
 # ----------------------------------------------------------------
+MAX_RETRIES = 3
+RETRY_DELAY = 1.5   # secondes entre tentatives
+
 def fetch_oanda_data(client, instrument, granularity, count):
-    try:
-        r = instruments.InstrumentsCandles(
-            instrument=instrument,
-            params={"count": count, "granularity": granularity}
-        )
-        client.request(r)
-        rows = [
-            {"time":  pd.to_datetime(c["time"]),
-             "open":  float(c["mid"]["o"]),
-             "high":  float(c["mid"]["h"]),
-             "low":   float(c["mid"]["l"]),
-             "close": float(c["mid"]["c"])}
-            for c in r.response.get("candles", []) if c["complete"]
-        ]
-        if not rows:
+    """
+    Fetch avec 3 tentatives et délai exponentiel.
+    Gère les erreurs OANDA (500, HTML inattendu, timeout, rate-limit).
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = instruments.InstrumentsCandles(
+                instrument=instrument,
+                params={"count": count, "granularity": granularity}
+            )
+            client.request(r)
+
+            # Vérification que la réponse est bien un dict OANDA (pas une page HTML)
+            if not isinstance(r.response, dict) or "candles" not in r.response:
+                print(f"[OANDA] {instrument} {granularity} : réponse inattendue (tentative {attempt})")
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY * attempt)
+                    continue
+                return pd.DataFrame()
+
+            rows = [
+                {"time":  pd.to_datetime(c["time"]),
+                 "open":  float(c["mid"]["o"]),
+                 "high":  float(c["mid"]["h"]),
+                 "low":   float(c["mid"]["l"]),
+                 "close": float(c["mid"]["c"])}
+                for c in r.response["candles"] if c.get("complete")
+            ]
+
+            if not rows:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(rows).set_index("time")
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            return df
+
+        except Exception as e:
+            err_str = str(e)
+            # Rate limit OANDA (429) → attendre plus longtemps
+            if "429" in err_str:
+                wait = RETRY_DELAY * attempt * 3
+                print(f"[OANDA] Rate limit {instrument} {granularity} — attente {wait}s")
+                time.sleep(wait)
+            # Erreur serveur OANDA (500) → retry rapide
+            elif "500" in err_str or "503" in err_str:
+                print(f"[OANDA] Erreur serveur {instrument} {granularity} (tentative {attempt})")
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY * attempt)
+                    continue
+            else:
+                print(f"[OANDA] {instrument} {granularity} : {e}")
             return pd.DataFrame()
-        df = pd.DataFrame(rows).set_index("time")
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        return df
-    except Exception as e:
-        print(f"[OANDA] {instrument} {granularity} : {e}")
-        return pd.DataFrame()
+
+    return pd.DataFrame()
 
 
 # ----------------------------------------------------------------
@@ -666,7 +701,7 @@ def main():
 
     col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
-        run = st.button("🚀 LANCER LE SCANNER", use_container_width=True)
+        run = st.button("🚀 LANCER LE SCANNER", use_container_width=True)  # noqa
     with col2:
         freshness = st.selectbox("Fraîcheur max", [15, 30, 45, 60], index=1)
     with col3:
@@ -711,80 +746,6 @@ def main():
         df = df.sort_values("_sk").drop(columns=["_sk"]).reset_index(drop=True)
 
         # ── STYLE ─────────────────────────────────────────────────
-        def style_row(row):
-            s   = [""] * len(row)
-            idx = row.index.tolist()
-            def si(col):
-                return idx.index(col) if col in idx else -1
-
-            grade = row["Grade"]
-            fresh = "⚡" in str(row["Fraîcheur"])
-
-            # Actif + Note
-            i = si("Actif + Note")
-            if   grade == "A+" and fresh: s[i] = "background-color:#004d00;color:#00ff88;font-weight:bold;font-size:1.05em"
-            elif grade == "A"  and fresh: s[i] = "background-color:#003322;color:#66ffaa;font-weight:bold"
-            elif grade in ("B+","B") and fresh: s[i] = "background-color:#1a1a2e;color:#aaccff"
-            else:                          s[i] = "color:#555"
-
-            # Score /100
-            i = si("Score /100")
-            sc = row["Score /100"]
-            if   sc >= 85: s[i] = "color:#00ff88;font-weight:bold"
-            elif sc >= 70: s[i] = "color:#66ffaa"
-            elif sc >= 55: s[i] = "color:#ffd700"
-            elif sc >= 40: s[i] = "color:#ff9944"
-            else:          s[i] = "color:#555"
-
-            # Signal
-            i = si("Signal")
-            sig = str(row["Signal"])
-            if "LONG" in sig and "expiré" not in sig:   s[i] = "color:#00ff88;font-weight:bold"
-            elif "SHORT" in sig and "expiré" not in sig: s[i] = "color:#ff4b4b;font-weight:bold"
-            else:                                         s[i] = "color:#555"
-
-            # Fraîcheur
-            i = si("Fraîcheur")
-            s[i] = "color:#ffd700;font-weight:bold" if "⚡" in str(row["Fraîcheur"]) else "color:#555"
-
-            # Biais
-            i = si("Biais Daily")
-            if "BULLISH" in str(row["Biais Daily"]):  s[i] = "color:#00ff88"
-            elif "BEARISH" in str(row["Biais Daily"]): s[i] = "color:#ff4b4b"
-
-            # Zone
-            i = si("Zone")
-            if "DISCOUNT" in str(row["Zone"]):  s[i] = "color:#00ccff"
-            elif "PREMIUM" in str(row["Zone"]): s[i] = "color:#ff9900"
-
-            # FVG
-            i = si("FVG M15")
-            if "Dans FVG" in str(row["FVG M15"]):  s[i] = "color:#00ff88;font-weight:bold"
-            elif "proche"  in str(row["FVG M15"]):  s[i] = "color:#ffd700"
-            else:                                    s[i] = "color:#555"
-
-            # ADX
-            i = si("ADX")
-            try:
-                v = float(row["ADX"])
-                s[i] = ("color:#00ff88" if v > 25 else
-                         "color:#ffd700" if v > 20 else
-                         "color:#ff4b4b")
-            except: pass
-
-            # Qualité
-            i = si("Qualité")
-            if "A+ SETUP"    in str(row["Qualité"]): s[i] = "background-color:#004d00;color:#00ff88;font-weight:bold"
-            elif "A SETUP"   in str(row["Qualité"]): s[i] = "color:#66ffaa;font-weight:bold"
-            elif "SURVEILLER" in str(row["Qualité"]): s[i] = "color:#ffd700"
-            else:                                      s[i] = "color:#444"
-
-
-            # Détail score (petit, discret)
-            i = si("Détail score")
-            s[i] = "color:#444;font-size:0.78em"
-
-            return s
 
         # ── RENAME ADX column ─────────────────────────────────────
         if "ADX" in df.columns:
