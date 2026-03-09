@@ -428,6 +428,7 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
     try:
         df_d   = fetch_oanda_data(client, ticker, "D",   100)
         df_m15 = fetch_oanda_data(client, ticker, "M15", 400)
+        df_h1  = fetch_oanda_data(client, ticker, "H1",  100)
 
         if df_d.empty or df_m15.empty:
             return None
@@ -497,11 +498,11 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
 
         hma_color = "🟢 VERT" if (hma.iloc[-1] > hma.iloc[-2]) else "🔴 ROUGE"
 
-        # ── ADX ───────────────────────────────────────────────────
-        adx_s, pdi_s, mdi_s = QuantEngine.adx(df_m15, 14)
+        # ── ADX H1 (valeur seule ≥ 20) ───────────────────────────
+        adx_s, pdi_s, mdi_s = QuantEngine.adx(df_h1, 14)
         adx_val = round(adx_s.iloc[-1], 1)
-        pdi_val = round(pdi_s.iloc[-1], 1)
-        mdi_val = round(mdi_s.iloc[-1], 1)
+        pdi_val = round(pdi_s.iloc[-1], 1)   # gardé pour compute_score interne
+        mdi_val = round(mdi_s.iloc[-1], 1)   # gardé pour compute_score interne
 
         # ── SCORE & GRADE ─────────────────────────────────────────
         score, grade, score_detail = compute_score(
@@ -586,7 +587,6 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
                               "❌ Pas de FVG"),
             "HMA":           hma_color,
             "ADX":           adx_val,
-            "+DI/-DI":       f"{pdi_val}/{mdi_val}",
             "Détail score":  detail_str,
             "Qualité":       quality,
             "Prix":          round(price, 5),
@@ -810,7 +810,103 @@ def main():
 
             return s
 
-        st.dataframe(df.style.apply(style_row, axis=1), use_container_width=True)
+        # ── RENAME ADX column ─────────────────────────────────────
+        if "ADX" in df.columns:
+            df = df.rename(columns={"ADX": "ADX H1"})
+
+        # ── TABLE HTML CUSTOM ─────────────────────────────────────
+        def grade_color(grade, fresh):
+            if grade == "A+" and fresh: return "#00ff88", "rgba(0,255,136,0.12)"
+            if grade == "A"  and fresh: return "#66ffaa", "rgba(0,255,136,0.06)"
+            if grade == "B+" and fresh: return "#ffd700", "rgba(255,215,0,0.07)"
+            if grade == "B"  and fresh: return "#aaccff", "rgba(100,150,255,0.05)"
+            return "#444444", "transparent"
+
+        def sig_color(s):
+            if "LONG" in s and "expiré" not in s and "🚫" not in s: return "#00ff88"
+            if "SHORT" in s and "expiré" not in s and "🚫" not in s: return "#ff4b4b"
+            if "🚫" in s or "⚠️" in s: return "#ff6600"
+            return "#555"
+
+        def adx_color(v):
+            try:
+                f = float(v)
+                return "#00ff88" if f >= 25 else "#ffd700" if f >= 20 else "#ff4b4b"
+            except: return "#888"
+
+        badge_map = {"A+": ("💎", "A+", "#00ff88"), "A": ("🥇", "A", "#66ffaa"),
+                     "B+": ("🥈", "B+", "#ffd700"), "B": ("🔵", "B", "#aaccff"),
+                     "C":  ("⚪", "C",  "#444444")}
+
+        html = """
+<style>
+.sn-wrap { overflow-x: auto; }
+.sn-tbl { width:100%; border-collapse:collapse; font-family:'Courier New',monospace; }
+.sn-tbl th {
+    background:#070712; color:#3366cc; padding:9px 14px;
+    text-align:left; border-bottom:2px solid #1a1a3a;
+    font-size:10px; text-transform:uppercase; letter-spacing:.08em; white-space:nowrap;
+}
+.sn-tbl td { padding:10px 14px; border-bottom:1px solid #0e0e1e; vertical-align:middle; }
+.sn-tbl tr:hover td { background:#0a0a18; }
+.ticker { font-size:17px; font-weight:900; color:#fff; letter-spacing:.04em; }
+.badge  { display:inline-flex; align-items:center; gap:4px;
+          padding:4px 10px; border-radius:5px; font-size:14px;
+          font-weight:900; border-width:2px; border-style:solid; white-space:nowrap; }
+.sbar-wrap { display:flex; align-items:center; gap:7px; }
+.sbar { height:7px; border-radius:4px; }
+.score-num { font-size:14px; font-weight:800; }
+.qual { font-size:13px; font-weight:800; }
+</style>
+<div class="sn-wrap"><table class="sn-tbl">
+<thead><tr>
+  <th>Actif</th><th>Note &amp; Score</th><th>Signal</th><th>Fraîcheur</th>
+  <th>Biais Daily</th><th>Zone</th><th>FVG M15</th><th>HMA</th>
+  <th>ADX H1</th><th>Qualité</th><th>Prix</th>
+</tr></thead><tbody>
+"""
+        for _, row in df.iterrows():
+            grade  = str(row.get("Grade","C"))
+            fresh  = "⚡" in str(row.get("Fraîcheur",""))
+            fc, bg = grade_color(grade, fresh)
+            score  = int(row.get("Score /100", 0))
+            emoji, glabel, gc = badge_map.get(grade, ("⚪","C","#444"))
+            ticker_raw = str(row.get("Actif + Note","")).split("  ")[0].strip()
+            sig   = str(row.get("Signal","—"))
+            adx_v = row.get("ADX H1","—")
+            bias  = str(row.get("Biais Daily","—"))
+            zone  = str(row.get("Zone","—"))
+            fvg   = str(row.get("FVG M15","—"))
+            hma   = str(row.get("HMA","—"))
+            qual  = str(row.get("Qualité","—"))
+            prix  = str(row.get("Prix","—"))
+            fresh_str = str(row.get("Fraîcheur","—"))
+
+            bar_w = max(4, int(score * 0.55))
+            bar_c = "#00ff88" if score>=85 else "#ffd700" if score>=55 else "#ff4b4b"
+            bias_c = "#00ff88" if "BULLISH" in bias else "#ff4b4b" if "BEARISH" in bias else "#888"
+            zone_c = "#00ccff" if "DISCOUNT" in zone else "#ff9900" if "PREMIUM" in zone else "#666"
+            fvg_c  = "#00ff88" if "Dans FVG" in fvg else "#ffd700" if "proche" in fvg else "#555"
+            qual_c = "#00ff88" if "A+ SETUP" in qual else "#66ffaa" if "A SETUP" in qual else "#ffd700" if "SURVEILLER" in qual else "#ff4444" if "HMA" in qual else "#444"
+            row_bg = bg if fresh and grade in ("A+","A") else "transparent"
+
+            html += f"""<tr style="background:{row_bg}">
+  <td><span class="ticker">{ticker_raw}</span></td>
+  <td><span class="badge" style="color:{gc};border-color:{gc};background:rgba(128,128,128,0.05)">{emoji} {glabel} &nbsp;<span style="font-size:15px">{score}</span></span></td>
+  <td style="color:{sig_color(sig)};font-weight:800;font-size:14px">{sig}</td>
+  <td style="color:{'#ffd700' if fresh else '#555'};font-weight:{'800' if fresh else '400'}">{fresh_str}</td>
+  <td style="color:{bias_c};font-weight:700">{bias}</td>
+  <td style="color:{zone_c};font-weight:600">{zone}</td>
+  <td style="color:{fvg_c};font-weight:600">{fvg}</td>
+  <td>{hma}</td>
+  <td style="color:{adx_color(adx_v)};font-weight:800;font-size:15px">{adx_v}</td>
+  <td class="qual" style="color:{qual_c}">{qual}</td>
+  <td style="color:#777;font-size:12px">{prix}</td>
+</tr>"""
+
+        html += "</tbody></table></div>"
+        st.markdown(html, unsafe_allow_html=True)
+        st.markdown("---")
 
         # ── RÉSUMÉ ────────────────────────────────────────────────
         a_plus  = len(df[(df["Grade"] == "A+") & df["Fraîcheur"].str.contains("⚡", na=False)])
@@ -825,6 +921,7 @@ def main():
             if a_grade: st.success(f"🥇 {a_grade} setup(s) A actif(s)")
         with cols[2]:
             if watch:   st.warning(f"👀 {watch} setup(s) B/B+ à surveiller")
+
 
 
 if __name__ == "__main__":
