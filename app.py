@@ -499,7 +499,9 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
         hma_color = "🟢 VERT" if (hma.iloc[-1] > hma.iloc[-2]) else "🔴 ROUGE"
 
         # ── ADX H1 (valeur seule ≥ 20) ───────────────────────────
-        adx_s, pdi_s, mdi_s = QuantEngine.adx(df_h1, 14)
+        # Fallback sur M15 si H1 indisponible pour cet instrument
+        df_adx_src = df_h1 if not df_h1.empty and len(df_h1) >= 20 else df_m15
+        adx_s, pdi_s, mdi_s = QuantEngine.adx(df_adx_src, 14)
         adx_val = round(adx_s.iloc[-1], 1)
         pdi_val = round(pdi_s.iloc[-1], 1)   # gardé pour compute_score interne
         mdi_val = round(mdi_s.iloc[-1], 1)   # gardé pour compute_score interne
