@@ -87,7 +87,7 @@ def compute_score(flip_type, candles_ago, bias, zone_discount, zone_premium,
     signal_is_bear = (flip_type == "BEAR")
 
     # ── BIAIS DAILY ──────────────────────────────────────────────
-    bias_ok = (signal_is_bull and bias == "BULLISH") or (signal_is_bear and bias == "BEARISH")
+    bias_ok = (signal_is_bull and bias in ("BULLISH","STRONG BULLISH")) or (signal_is_bear and bias in ("BEARISH","STRONG BEARISH"))
     pts = 20 if bias_ok else 0
     score += pts
     score_detail["Biais"] = pts
@@ -205,19 +205,171 @@ class QuantEngine:
         return dx.ewm(alpha=1/period, adjust=False).mean(), pdi, mdi
 
 
-# ----------------------------------------------------------------
-#  BIAIS DAILY
-# ----------------------------------------------------------------
+# ================================================================
+#  BIAIS DAILY  —  MÉTHODE INSTITUTIONNELLE MULTI-FACTEURS
+#
+#  4 facteurs indépendants votent BULLISH / BEARISH / NEUTRAL.
+#  Règle stricte : 3 votes minimum dans le même sens pour un biais
+#  valide. En dessous → NEUTRAL (marché sans conviction = pas de trade).
+#
+#  FACTEUR 1 — MARKET STRUCTURE (poids : 2 votes)
+#  ─────────────────────────────────────────────────────────────
+#  Méthode utilisée par les traders ICT / Smart Money :
+#  on identifie les derniers swing highs et swing lows sur le Daily
+#  (pivot détecté si la bougie est entourée de 2 bougies plus basses/hautes).
+#
+#  HH + HL (Higher High + Higher Low) → structure haussière  → BULLISH
+#  LH + LL (Lower High  + Lower Low)  → structure baissière  → BEARISH
+#  Mélange                            → structure cassée      → NEUTRAL
+#
+#  C'est le facteur le plus important (2 votes au lieu d'1).
+#  Un institutionnel ne trade JAMAIS contre la structure.
+#
+#  FACTEUR 2 — EMA STACK 21 / 50 DAILY (poids : 1 vote)
+#  ─────────────────────────────────────────────────────────────
+#  Filtre de tendance classique adopté par les desks macro et les
+#  fonds systématiques (CTA, trend-following).
+#  Prix > EMA21 > EMA50 → BULLISH
+#  Prix < EMA21 < EMA50 → BEARISH
+#
+#  FACTEUR 3 — WEEKLY OPEN (poids : 1 vote)
+#  ─────────────────────────────────────────────────────────────
+#  Le niveau d'ouverture de la semaine est la référence numéro 1
+#  des market makers et des banques centrales (ICT "Weekly Open").
+#  Prix au-dessus du Weekly Open → biais acheteur cette semaine
+#  Prix en dessous               → biais vendeur
+#
+#  FACTEUR 4 — CLOSE DU JOUR PRÉCÉDENT (poids : 1 vote)
+#  ─────────────────────────────────────────────────────────────
+#  Les institutionnels regardent où le marché a fermé par rapport
+#  au milieu de range de la veille (50% du range daily J-1).
+#  Close > 50% du range J-1 → journée fermée en force haussière
+#  Close < 50% du range J-1 → journée fermée en force baissière
+#
+#  RÉSULTAT :
+#  Total max = 5 votes (2 structure + 1 + 1 + 1)
+#  ≥ 4 votes concordants → STRONG BULLISH / STRONG BEARISH
+#  = 3 votes concordants → BULLISH / BEARISH
+#  ≤ 2 votes             → NEUTRAL  (condition non remplie, pas de trade)
+# ================================================================
+
+def _find_swing_points(series, wing=2):
+    """
+    Retourne les indices des swing highs et swing lows.
+    Un swing high[i] = series[i] > tous les wing voisins de chaque côté.
+    """
+    highs, lows = [], []
+    for i in range(wing, len(series) - wing):
+        window = series.iloc[i - wing: i + wing + 1]
+        if series.iloc[i] == window.max():
+            highs.append(i)
+        if series.iloc[i] == window.min():
+            lows.append(i)
+    return highs, lows
+
+
 def get_daily_bias(df_d):
-    if len(df_d) < 55:
-        return "NEUTRAL"
-    c   = df_d['close']
-    e21 = c.ewm(span=21, adjust=False).mean().iloc[-1]
-    e50 = c.ewm(span=50, adjust=False).mean().iloc[-1]
-    cur = c.iloc[-1]
-    if cur > e21 > e50:  return "BULLISH"
-    if cur < e21 < e50:  return "BEARISH"
-    return "NEUTRAL"
+    """
+    Retourne (bias_str, detail_dict).
+    bias_str  : "STRONG BULLISH" | "BULLISH" | "NEUTRAL" | "BEARISH" | "STRONG BEARISH"
+    detail    : dict avec le vote de chaque facteur pour affichage
+    """
+    if len(df_d) < 60:
+        return "NEUTRAL", {}
+
+    close = df_d['close']
+    high  = df_d['high']
+    low   = df_d['low']
+
+    votes_bull = 0
+    votes_bear = 0
+    detail     = {}
+
+    # ── FACTEUR 1 : MARKET STRUCTURE (2 votes) ───────────────────
+    sh_idx, sl_idx = _find_swing_points(high, wing=3)
+    _,      sl_idx_l = _find_swing_points(low,  wing=3)
+
+    struct_vote = "NEUTRAL"
+    if len(sh_idx) >= 2 and len(sl_idx_l) >= 2:
+        last_sh  = high.iloc[sh_idx[-1]]
+        prev_sh  = high.iloc[sh_idx[-2]]
+        last_sl  = low.iloc[sl_idx_l[-1]]
+        prev_sl  = low.iloc[sl_idx_l[-2]]
+
+        hh = last_sh > prev_sh   # Higher High
+        hl = last_sl > prev_sl   # Higher Low
+        lh = last_sh < prev_sh   # Lower High
+        ll = last_sl < prev_sl   # Lower Low
+
+        if hh and hl:
+            struct_vote = "BULLISH"
+            votes_bull += 2
+        elif lh and ll:
+            struct_vote = "BEARISH"
+            votes_bear += 2
+
+    detail["Structure"] = struct_vote
+
+    # ── FACTEUR 2 : EMA STACK 21/50 (1 vote) ────────────────────
+    ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+    ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+    cur   = close.iloc[-1]
+
+    if cur > ema21 > ema50:
+        ema_vote = "BULLISH";  votes_bull += 1
+    elif cur < ema21 < ema50:
+        ema_vote = "BEARISH";  votes_bear += 1
+    else:
+        ema_vote = "NEUTRAL"
+
+    detail["EMA 21/50"] = ema_vote
+
+    # ── FACTEUR 3 : WEEKLY OPEN (1 vote) ─────────────────────────
+    # Cherche la première bougie du lundi de la semaine en cours
+    df_d_copy = df_d.copy()
+    if df_d_copy.index.tz is not None:
+        df_d_copy.index = df_d_copy.index.tz_convert('UTC')
+
+    # Lundi = dayofweek 0
+    weekly_open_rows = df_d_copy[df_d_copy.index.dayofweek == 0]
+    if not weekly_open_rows.empty:
+        weekly_open = weekly_open_rows['open'].iloc[-1]
+        if cur > weekly_open:
+            wo_vote = "BULLISH";  votes_bull += 1
+        else:
+            wo_vote = "BEARISH";  votes_bear += 1
+    else:
+        wo_vote = "NEUTRAL"
+
+    detail["Weekly Open"] = wo_vote
+
+    # ── FACTEUR 4 : CLOSE J-1 vs RANGE J-1 (1 vote) ─────────────
+    # Milieu de range = (High J-1 + Low J-1) / 2
+    if len(df_d) >= 2:
+        prev_high  = high.iloc[-2]
+        prev_low   = low.iloc[-2]
+        prev_close = close.iloc[-2]
+        midpoint   = (prev_high + prev_low) / 2
+
+        if prev_close > midpoint:
+            pc_vote = "BULLISH";  votes_bull += 1
+        else:
+            pc_vote = "BEARISH";  votes_bear += 1
+    else:
+        pc_vote = "NEUTRAL"
+
+    detail["Close J-1"] = pc_vote
+
+    # ── CONSENSUS ─────────────────────────────────────────────────
+    detail["Votes"] = f"{votes_bull}B / {votes_bear}S"
+
+    if   votes_bull >= 4: bias = "STRONG BULLISH"
+    elif votes_bull == 3: bias = "BULLISH"
+    elif votes_bear >= 4: bias = "STRONG BEARISH"
+    elif votes_bear == 3: bias = "BEARISH"
+    else:                 bias = "NEUTRAL"
+
+    return bias, detail
 
 
 # ----------------------------------------------------------------
@@ -282,8 +434,14 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
 
         price = df_m15['close'].iloc[-1]
 
-        # ── BIAIS DAILY ───────────────────────────────────────────
-        bias = get_daily_bias(df_d)
+        # ── BIAIS DAILY (multi-facteurs institutionnel) ─────────
+        bias, bias_detail = get_daily_bias(df_d)
+
+        # Règle stricte : HMA flip DOIT être dans le sens du biais daily
+        # NEUTRAL = biais non tranché = pas de trade autorisé
+        bias_bull  = bias in ("BULLISH", "STRONG BULLISH")
+        bias_bear  = bias in ("BEARISH", "STRONG BEARISH")
+        bias_valid = bias_bull or bias_bear
 
         # ── PDH / PDL ─────────────────────────────────────────────
         pdh = df_d['high'].iloc[-2]
@@ -360,21 +518,48 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
 
         badge = grade_badge(grade, score)
 
-        # ── SIGNAL FINAL ──────────────────────────────────────────
-        setup_valid = grade in ("A+", "A") and signal_fresh
-        quality     = "💎 A+ SETUP" if grade == "A+" and signal_fresh else \
-                      "🥇 A SETUP"  if grade == "A"  and signal_fresh else \
-                      "👀 SURVEILLER" if grade in ("B+", "B") and signal_fresh else \
-                      "IGNORE"
+        # ── RÈGLE STRICTE : HMA flip DOIT concorder avec le biais ──
+        # C'est la condition bloquante principale.
+        # Un flip BULL avec biais BEARISH ou NEUTRAL → signal rejeté.
+        # Un flip BEAR avec biais BULLISH ou NEUTRAL → signal rejeté.
+        hma_matches_bias = (
+            (flip_type == "BULL" and bias_bull) or
+            (flip_type == "BEAR" and bias_bear)
+        )
 
-        if signal_fresh:
+        # Signal frais ET dans le sens du biais → signal actif
+        signal_active = signal_fresh and hma_matches_bias and bias_valid
+
+        # ── SIGNAL FINAL ──────────────────────────────────────────
+        if signal_active:
             sig = "🟢 LONG"  if flip_type == "BULL" else "🔴 SHORT"
+        elif signal_fresh and not hma_matches_bias:
+            # Flip frais mais contre le biais → bloqué explicitement
+            sig = "🚫 CONTRE BIAIS"
+        elif not bias_valid and signal_fresh:
+            sig = "⚠️ BIAIS NEUTRE"
         elif flip_type == "BULL":
             sig = "🟢 LONG (expiré)"
         elif flip_type == "BEAR":
             sig = "🔴 SHORT (expiré)"
         else:
             sig = "—"
+
+        # Grade final tient compte du blocage biais
+        if not hma_matches_bias or not bias_valid:
+            # Force le grade à C si la règle stricte n'est pas respectée
+            grade   = "C"
+            score   = min(score, 35)
+            badge   = grade_badge(grade, score)
+
+        quality = (
+            "💎 A+ SETUP"    if grade == "A+"  and signal_active else
+            "🥇 A SETUP"     if grade == "A"   and signal_active else
+            "👀 SURVEILLER"  if grade in ("B+","B") and signal_active else
+            "🚫 HMA≠BIAIS"   if signal_fresh and not hma_matches_bias else
+            "IGNORE"
+        )
+
 
         # Résumé détail score
         detail_str = (
@@ -617,6 +802,7 @@ def main():
             elif "A SETUP"   in str(row["Qualité"]): s[i] = "color:#66ffaa;font-weight:bold"
             elif "SURVEILLER" in str(row["Qualité"]): s[i] = "color:#ffd700"
             else:                                      s[i] = "color:#444"
+
 
             # Détail score (petit, discret)
             i = si("Détail score")
