@@ -528,11 +528,32 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
             (flip_type == "BEAR" and bias_bear)
         )
 
-        # ── RÈGLE ÉLIMINATOIRE — biais est une condition stricte ──
-        # Si le flip HMA ne concorde pas avec le biais daily → None
-        # Si le biais est NEUTRAL → None
-        # L'actif n'apparaît PAS dans le tableau.
+        # ── CONDITIONS ÉLIMINATOIRES (toutes strictes) ────────────
+        #
+        # 1. Biais daily concordant avec le flip HMA
         if not bias_valid or not hma_matches_bias:
+            return None
+
+        # 2. Prix du bon côté de la HMA
+        #    LONG  → prix AU-DESSUS de la HMA (tendance confirmée)
+        #    SHORT → prix EN-DESSOUS de la HMA (tendance confirmée)
+        hma_current = hma.iloc[-1]
+        price_above_hma = price > hma_current
+        price_below_hma = price < hma_current
+
+        if flip_type == "BULL" and not price_above_hma:
+            return None
+        if flip_type == "BEAR" and not price_below_hma:
+            return None
+
+        # 3. FVG dans le bon sens obligatoire
+        #    (dans le FVG ou proche — sinon pas de zone d'intérêt valide)
+        fvg_long_ok  = in_bull_fvg or fvg_near_bull
+        fvg_short_ok = in_bear_fvg or fvg_near_bear
+
+        if flip_type == "BULL" and not fvg_long_ok:
+            return None
+        if flip_type == "BEAR" and not fvg_short_ok:
             return None
 
         # Signal frais ET dans le sens du biais
