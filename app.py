@@ -34,7 +34,7 @@ class QuantEngine:
         return atr.iloc[-1]
 
     # ===============================
-    # ADX WILDER (Corrigé)
+    # ADX WILDER
     # ===============================
     @staticmethod
     def adx_wilder(df, period=14):
@@ -108,7 +108,7 @@ def pd_arrays_location(price, pdh, pdl):
 # ===============================
 
 def calculate_signal_v10(df_m5, df_d):
-    reasons =[]
+    reasons = []
     base_score = 0 
     price = df_m5['close'].iloc[-1]
 
@@ -199,7 +199,7 @@ def fetch_oanda_data(client, instrument, granularity, count=500):
     data = []
     
     for c in candles:
-        if c["complete"]:  # On garde uniquement les bougies fermées pour éviter les faux signaux
+        if c["complete"]:
             data.append({
                 "time": pd.to_datetime(c["time"]),
                 "open": float(c["mid"]["o"]),
@@ -210,7 +210,8 @@ def fetch_oanda_data(client, instrument, granularity, count=500):
             })
             
     df = pd.DataFrame(data)
-    df.set_index("time", inplace=True)
+    if not df.empty:
+        df.set_index("time", inplace=True)
     return df
 
 
@@ -226,12 +227,12 @@ def main():
 
     # Vérification des secrets Streamlit
     try:
-        OANDA_TOKEN = st.secrets["OANDA_TOKEN"]
-        # Par défaut "practice" (démo), remplace par "live" si tu as un compte réel
+        # Modification ici pour utiliser OANDA_ACCESS_TOKEN
+        OANDA_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
         OANDA_ENV = st.secrets.get("OANDA_ENV", "practice") 
     except KeyError:
-        st.error("⚠️ **ERREUR** : La clé `OANDA_TOKEN` est introuvable dans les secrets Streamlit.")
-        st.info("Va dans les paramètres de ton app sur Streamlit Cloud -> Secrets, et ajoute `OANDA_TOKEN = 'ton_token'`")
+        st.error("⚠️ **ERREUR** : La clé `OANDA_ACCESS_TOKEN` est introuvable dans les secrets Streamlit.")
+        st.info("Va dans les paramètres de ton app sur Streamlit Cloud -> Secrets, et ajoute `OANDA_ACCESS_TOKEN = 'ton_token'`")
         st.stop()
 
     # Initialisation du client OANDA
@@ -241,16 +242,19 @@ def main():
     
     with col1:
         st.subheader("Configuration")
-        ticker = st.text_input("Symbole OANDA", "EUR_USD")
+        ticker_input = st.text_input("Symbole OANDA", "EUR_USD")
+        # Nettoyage automatique du ticker (ex: eur/usd -> EUR_USD)
+        ticker = ticker_input.upper().replace("/", "_").replace("-", "_")
+        
         st.caption("Exemples : EUR_USD, XAU_USD, SPX500_USD, WTICO_USD")
         run_scan = st.button("Lancer le Scan 🚀", use_container_width=True)
 
     if run_scan:
         with st.spinner(f"Récupération des données OANDA pour {ticker}..."):
             try:
-                # Récupère 15 jours de données en Daily (suffisant pour le High/Low d'hier)
+                # Récupère 15 jours de données en Daily
                 df_d = fetch_oanda_data(client, ticker, granularity="D", count=15)
-                # Récupère 500 bougies en 5 minutes (suffisant pour calculer le HMA 55 et ATR 14)
+                # Récupère 500 bougies en 5 minutes
                 df_m5 = fetch_oanda_data(client, ticker, granularity="M5", count=500)
                 
                 if df_d.empty or df_m5.empty:
@@ -264,9 +268,8 @@ def main():
                 # AFFICHAGE DES RESULTATS
                 # ===============================
                 with col2:
-                    st.subheader(f"Résultats de l'analyse : {ticker.upper()}")
+                    st.subheader(f"Résultats de l'analyse : {ticker}")
                     
-                    # Indicateurs principaux
                     met1, met2, met3, met4 = st.columns(4)
                     
                     dir_color = "🟢" if signal["direction"] == "BUY" else "🔴" if signal["direction"] == "SELL" else "⚪"
@@ -275,7 +278,6 @@ def main():
                     met3.metric("Score de Force", f"{signal['score']} / 100")
                     met4.metric("ADX (Tendance)", signal['adx'])
 
-                    # Design conditionnel selon la qualité
                     if signal['quality'] == "A+ SETUP":
                         st.success("💎 **SETUP EXCELLENT DÉTECTÉ** - Confluences optimales.")
                     elif signal['quality'] == "IGNORE":
