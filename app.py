@@ -528,36 +528,30 @@ def analyze_asset(client, ticker, freshness_limit_min=30):
             (flip_type == "BEAR" and bias_bear)
         )
 
-        # Signal frais ET dans le sens du biais → signal actif
-        signal_active = signal_fresh and hma_matches_bias and bias_valid
+        # ── RÈGLE ÉLIMINATOIRE — biais est une condition stricte ──
+        # Si le flip HMA ne concorde pas avec le biais daily → None
+        # Si le biais est NEUTRAL → None
+        # L'actif n'apparaît PAS dans le tableau.
+        if not bias_valid or not hma_matches_bias:
+            return None
+
+        # Signal frais ET dans le sens du biais
+        signal_active = signal_fresh
 
         # ── SIGNAL FINAL ──────────────────────────────────────────
-        if signal_active:
-            sig = "🟢 LONG"  if flip_type == "BULL" else "🔴 SHORT"
-        elif signal_fresh and not hma_matches_bias:
-            # Flip frais mais contre le biais → bloqué explicitement
-            sig = "🚫 CONTRE BIAIS"
-        elif not bias_valid and signal_fresh:
-            sig = "⚠️ BIAIS NEUTRE"
+        if signal_fresh:
+            sig = "▲ LONG"  if flip_type == "BULL" else "▼ SHORT"
         elif flip_type == "BULL":
-            sig = "🟢 LONG (expiré)"
+            sig = "LONG (expiré)"
         elif flip_type == "BEAR":
-            sig = "🔴 SHORT (expiré)"
+            sig = "SHORT (expiré)"
         else:
             sig = "—"
 
-        # Grade final tient compte du blocage biais
-        if not hma_matches_bias or not bias_valid:
-            # Force le grade à C si la règle stricte n'est pas respectée
-            grade   = "C"
-            score   = min(score, 35)
-            badge   = grade_badge(grade, score)
-
         quality = (
-            "💎 A+ SETUP"    if grade == "A+"  and signal_active else
-            "🥇 A SETUP"     if grade == "A"   and signal_active else
-            "👀 SURVEILLER"  if grade in ("B+","B") and signal_active else
-            "🚫 HMA≠BIAIS"   if signal_fresh and not hma_matches_bias else
+            "A+ SETUP"   if grade == "A+"  and signal_active else
+            "A SETUP"    if grade == "A"   and signal_active else
+            "SURVEILLER" if grade in ("B+","B") and signal_active else
             "IGNORE"
         )
 
