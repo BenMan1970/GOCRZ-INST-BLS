@@ -1,290 +1,225 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import oandapyV20
-import oandapyV20.endpoints.instruments as instruments
-from concurrent.futures import ThreadPoolExecutor
-import warnings
+# ===============================
+# BLUESTAR SNIPER V10 ENGINE
+# ===============================
 
-warnings.filterwarnings("ignore")
+class QuantEngine:
 
-# -----------------------------
-# CONFIG
-# -----------------------------
+    # ===============================
+    # ATR WILDER
+    # ===============================
+    @staticmethod
+    def calculate_atr_wilder(df, period=14):
 
-st.set_page_config(page_title="GO-CRZ Institutional Scanner", layout="wide")
+        high = df['high']
+        low = df['low']
+        close = df['close']
 
-OANDA_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
-ACCOUNT_ID = st.secrets["OANDA_ACCOUNT_ID"]
-ENV = st.secrets.get("OANDA_ENVIRONMENT","practice")
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
 
-client = oandapyV20.API(access_token=OANDA_TOKEN, environment=ENV)
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-# Instruments à scanner
-INSTRUMENTS = [
-"EUR_USD","GBP_USD","USD_JPY","AUD_USD","USD_CAD",
-"NZD_USD","EUR_JPY","GBP_JPY","EUR_GBP","XAU_USD"
-]
+        atr = tr.ewm(alpha=1/period, adjust=False).mean()
 
-# -----------------------------
-# DATA DOWNLOAD
-# -----------------------------
+        return atr.iloc[-1]
 
-@st.cache_data(ttl=300)
-def get_candles(symbol, tf, count=500):
 
-    params = {
-        "granularity": tf,
-        "count": count,
-        "price": "M"
-    }
+    # ===============================
+    # ADX WILDER
+    # ===============================
+    @staticmethod
+    def adx_wilder(df, period=14):
 
-    r = instruments.InstrumentsCandles(
-        instrument=symbol,
-        params=params
-    )
+        high = df['high']
+        low = df['low']
+        close = df['close']
 
-    client.request(r)
+        plus_dm = high.diff()
+        minus_dm = low.diff().abs()
 
-    data=[]
+        plus_dm[plus_dm < minus_dm] = 0
+        minus_dm[minus_dm < plus_dm] = 0
 
-    for c in r.response["candles"]:
-        if c["complete"]:
-            data.append({
-                "time": c["time"],
-                "open": float(c["mid"]["o"]),
-                "high": float(c["mid"]["h"]),
-                "low": float(c["mid"]["l"]),
-                "close": float(c["mid"]["c"])
-            })
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
 
-    return pd.DataFrame(data)
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-# -----------------------------
-# INDICATORS
-# -----------------------------
+        atr = tr.ewm(alpha=1/period, adjust=False).mean()
 
-def EMA(series, period):
-    return series.ewm(span=period).mean()
+        plus_di = 100 * (plus_dm.ewm(alpha=1/period).mean() / atr)
+        minus_di = 100 * (minus_dm.ewm(alpha=1/period).mean() / atr)
 
-def ATR(df, period=14):
+        dx = abs(plus_di - minus_di) / (plus_di + minus_di) * 100
 
-    high_low = df.high - df.low
-    high_close = abs(df.high - df.close.shift())
-    low_close = abs(df.low - df.close.shift())
+        adx = dx.ewm(alpha=1/period).mean()
 
-    tr = pd.concat([high_low,high_close,low_close],axis=1).max(axis=1)
+        return adx.iloc[-1], plus_di.iloc[-1], minus_di.iloc[-1]
 
-    return tr.rolling(period).mean()
 
-def ADX(df, period=14):
+    # ===============================
+    # HULL MOVING AVERAGE
+    # ===============================
+    @staticmethod
+    def hma(series, period=55):
 
-    up = df.high.diff()
-    down = df.low.diff()
+        half = int(period / 2)
+        sqrt = int(np.sqrt(period))
 
-    plus_dm = np.where((up>down) & (up>0),up,0)
-    minus_dm = np.where((down>up) & (down>0),down,0)
+        wma1 = series.rolling(half).mean()
+        wma2 = series.rolling(period).mean()
 
-    tr = ATR(df)
+        raw_hma = 2 * wma1 - wma2
 
-    plus_di = 100*(pd.Series(plus_dm).rolling(period).mean()/tr)
-    minus_di = 100*(pd.Series(minus_dm).rolling(period).mean()/tr)
+        hma = raw_hma.rolling(sqrt).mean()
 
-    dx = abs(plus_di-minus_di)/(plus_di+minus_di)*100
+        return hma
 
-    return dx.rolling(period).mean()
 
-# -----------------------------
-# FAIR VALUE GAP
-# -----------------------------
+# ===============================
+# ICT PD ARRAYS
+# ===============================
 
-def detect_fvg(df):
+def pd_arrays_location(price, pdh, pdl):
 
-    bullish=[]
-    bearish=[]
+    dealing_range = pdh - pdl
 
-    for i in range(2,len(df)):
+    equilibrium = pdl + dealing_range * 0.5
+    discount_25 = pdl + dealing_range * 0.25
+    premium_75 = pdl + dealing_range * 0.75
 
-        if df.low.iloc[i] > df.high.iloc[i-2]:
-            bullish.append((df.high.iloc[i-2],df.low.iloc[i]))
+    if price < discount_25:
+        return "DEEP_DISCOUNT"
 
-        if df.high.iloc[i] < df.low.iloc[i-2]:
-            bearish.append((df.high.iloc[i],df.low.iloc[i-2]))
-
-    return bullish,bearish
-
-# -----------------------------
-# PREMIUM / DISCOUNT
-# -----------------------------
-
-def premium_discount(df):
-
-    prev_high=df.high.iloc[-2]
-    prev_low=df.low.iloc[-2]
-
-    midpoint=(prev_high+prev_low)/2
-    price=df.close.iloc[-1]
-
-    if price < midpoint:
+    elif price < equilibrium:
         return "DISCOUNT"
-    else:
+
+    elif price < premium_75:
         return "PREMIUM"
 
-# -----------------------------
-# TREND BIAS
-# -----------------------------
+    else:
+        return "DEEP_PREMIUM"
 
-def trend_bias(df):
 
-    ema21=EMA(df.close,21)
-    ema50=EMA(df.close,50)
-    ema200=EMA(df.close,200)
 
-    close=df.close.iloc[-1]
+# ===============================
+# SIGNAL ENGINE V10
+# ===============================
 
-    if close > ema200.iloc[-1] and ema21.iloc[-1] > ema50.iloc[-1]:
-        return "BULLISH"
+def calculate_signal_v10(df_m5, df_d):
 
-    if close < ema200.iloc[-1] and ema21.iloc[-1] < ema50.iloc[-1]:
-        return "BEARISH"
+    reasons = []
+    score = 0
 
-    return "NEUTRAL"
+    price = df_m5['close'].iloc[-1]
 
-# -----------------------------
-# ATR EXPANSION
-# -----------------------------
+    # ===============================
+    # PD ARRAYS
+    # ===============================
 
-def atr_expansion(df):
+    pdh = df_d['high'].iloc[-2]
+    pdl = df_d['low'].iloc[-2]
 
-    atr=ATR(df)
+    location = pd_arrays_location(price, pdh, pdl)
 
-    atr_mean=atr.rolling(20).mean()
+    if location == "DEEP_DISCOUNT":
+        score += 30
+        reasons.append("💎 Deep Discount")
 
-    return atr.iloc[-1] > atr_mean.iloc[-1]
+    elif location == "DISCOUNT":
+        score += 20
+        reasons.append("Discount Zone")
 
-# -----------------------------
-# ADR REMAINING RANGE
-# -----------------------------
+    elif location == "PREMIUM":
+        score -= 10
+        reasons.append("Premium Area")
 
-def adr_remaining(df):
+    elif location == "DEEP_PREMIUM":
+        score -= 30
+        reasons.append("Deep Premium")
 
-    daily_range = df.high - df.low
-    adr = daily_range.rolling(20).mean().iloc[-1]
 
-    today_range = daily_range.iloc[-1]
+    # ===============================
+    # TREND (HMA)
+    # ===============================
 
-    remaining = 1 - (today_range/adr)
+    hma = QuantEngine.hma(df_m5['close'], 55)
 
-    return round(remaining*100,1)
+    if price > hma.iloc[-1]:
 
-# -----------------------------
-# VOLATILITY SCORE
-# -----------------------------
+        score += 10
+        direction = "BUY"
+        reasons.append("Trend Up (HMA)")
 
-def volatility_filter(df):
+    else:
 
-    score=0
+        score += 10
+        direction = "SELL"
+        reasons.append("Trend Down (HMA)")
 
-    adx=ADX(df).iloc[-1]
 
-    if adx>20:
-        score+=1
+    # ===============================
+    # ATR
+    # ===============================
 
-    if atr_expansion(df):
-        score+=1
+    atr = QuantEngine.calculate_atr_wilder(df_m5)
 
-    return score, round(adx,1)
+    atr_mean = (df_m5['high'] - df_m5['low']).rolling(20).mean().iloc[-1]
 
-# -----------------------------
-# MAIN ANALYSIS
-# -----------------------------
+    if atr > atr_mean:
 
-def analyze(symbol):
+        score += 10
+        reasons.append("ATR Expansion")
 
-    d1=get_candles(symbol,"D")
-    h4=get_candles(symbol,"H4")
-    h1=get_candles(symbol,"H1")
 
-    if len(d1)<200:
-        return None
+    # ===============================
+    # ADX
+    # ===============================
 
-    bias=trend_bias(d1)
-    zone=premium_discount(d1)
+    adx, plus_di, minus_di = QuantEngine.adx_wilder(df_m5)
 
-    bull_fvg,bear_fvg=detect_fvg(h4)
+    if adx > 25:
 
-    fvg=False
-    if bull_fvg or bear_fvg:
-        fvg=True
+        score += 15
+        reasons.append(f"Strong Trend ADX {adx:.1f}")
 
-    vol_score,adx=volatility_filter(h1)
+    elif adx > 20:
 
-    adr=adr_remaining(d1)
+        score += 8
+        reasons.append(f"Moderate Trend ADX {adx:.1f}")
 
-    # SCORE
+    else:
 
-    score=0
+        score -= 5
+        reasons.append("Weak Trend")
 
-    if bias!="NEUTRAL":
-        score+=3
 
-    if fvg:
-        score+=3
+    # ===============================
+    # QUALITY CLASSIFICATION
+    # ===============================
 
-    if zone=="DISCOUNT" and bias=="BULLISH":
-        score+=2
+    if score >= 70:
+        quality = "A+ SETUP"
 
-    if zone=="PREMIUM" and bias=="BEARISH":
-        score+=2
+    elif score >= 55:
+        quality = "A SETUP"
 
-    if adx>20:
-        score+=1
+    elif score >= 40:
+        quality = "B SETUP"
 
-    score+=vol_score
+    else:
+        quality = "IGNORE"
+
 
     return {
 
-        "Symbol":symbol,
-        "Bias":bias,
-        "Location":zone,
-        "ADX":adx,
-        "ADR_Remaining_%":adr,
-        "Score":score
+        "direction": direction,
+        "score": score,
+        "quality": quality,
+        "location": location,
+        "adx": round(adx,2),
+        "atr": round(atr,5),
+        "reasons": reasons
     }
-
-# -----------------------------
-# SCAN
-# -----------------------------
-
-def run_scan():
-
-    results=[]
-
-    with ThreadPoolExecutor(max_workers=6) as exe:
-
-        tasks=[exe.submit(analyze,s) for s in INSTRUMENTS]
-
-        for t in tasks:
-
-            r=t.result()
-
-            if r:
-                results.append(r)
-
-    df=pd.DataFrame(results)
-
-    return df.sort_values("Score",ascending=False)
-
-# -----------------------------
-# UI
-# -----------------------------
-
-st.title("⭐ GO-CRZ Institutional Market Scanner")
-
-st.write("Scanner objectif basé sur volatilité, structure et location.")
-
-if st.button("Run Scan"):
-
-    df=run_scan()
-
-    st.dataframe(df,use_container_width=True)
