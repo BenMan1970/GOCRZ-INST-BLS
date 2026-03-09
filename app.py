@@ -874,7 +874,7 @@ def main():
 }
 .sc-tbl td{padding:11px 16px;border-bottom:1px solid #111118;vertical-align:middle}
 .sc-tbl tr:hover td{background:#0c0c16}
-.ticker{font-size:16px;font-weight:800;color:#d0d0e0;letter-spacing:.05em}
+.ticker{font-size:20px;font-weight:800;color:#d0d0e0;letter-spacing:.05em}
 .grade-pill{
   display:inline-block;padding:3px 9px;border-radius:3px;
   font-size:12px;font-weight:700;letter-spacing:.06em;
@@ -891,8 +891,6 @@ def main():
   <th>⚡ Fraîcheur</th>
   <th>Biais Daily</th>
   <th>Zone</th>
-  <th>FVG M15</th>
-  <th>HMA 20</th>
   <th>ADX H1</th>
 </tr></thead><tbody>
 """
@@ -923,8 +921,6 @@ def main():
   <td style="{fresh_style(fresh_str)}">{fresh_str}</td>
   <td style="{bias_style(bias)}">{bias}</td>
   <td style="{zone_style(zone)}">{zone}</td>
-  <td style="{fvg_style(fvg)}">{fvg}</td>
-  <td class="{hma_cls}">{hma}</td>
   <td style="{adx_style(adx_v)}">{adx_v}</td>
 </tr>"""
 
