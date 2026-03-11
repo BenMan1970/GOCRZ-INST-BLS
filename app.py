@@ -186,8 +186,9 @@ def get_daily_bias(df_d):
     detail     = {}
 
     # ── FACTEUR 1 : MARKET STRUCTURE (2 votes) ───────────────────
-    sh_idx, sl_idx = _find_swing_points(high, wing=3)
-    _,      sl_idx_l = _find_swing_points(low,  wing=3)
+    # wing=5 : 11 bougies D1 — swings plus fiables, moins de faux pivots
+    sh_idx, sl_idx = _find_swing_points(high, wing=5)
+    _,      sl_idx_l = _find_swing_points(low,  wing=5)
 
     struct_vote = "NEUTRAL"
     if len(sh_idx) >= 2 and len(sl_idx_l) >= 2:
@@ -225,11 +226,12 @@ def get_daily_bias(df_d):
     detail["EMA 21/50"] = ema_vote
 
     # ── FACTEUR 3 : WEEKLY OPEN (1 vote) ─────────────────────────
+    # dayofweek isin([0,6]) : couvre lundi ET dimanche soir (flux OANDA)
     df_d_copy = df_d.copy()
     if df_d_copy.index.tz is not None:
         df_d_copy.index = df_d_copy.index.tz_convert('UTC')
 
-    weekly_open_rows = df_d_copy[df_d_copy.index.dayofweek == 0]
+    weekly_open_rows = df_d_copy[df_d_copy.index.dayofweek.isin([0, 6])]
     if not weekly_open_rows.empty:
         weekly_open = weekly_open_rows['open'].iloc[-1]
         if cur > weekly_open:
@@ -430,11 +432,12 @@ def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
         price = df_m15['close'].iloc[-1]
 
         # ══ GATE 1 — BIAIS DAILY ═════════════════════════════════
+        # V13 : le biais est un contexte de confiance, plus un filtre dur.
+        # Un trade contre-biais est autorisé — il obtiendra simplement 0 pt
+        # sur le critère Biais dans compute_score, ce qui abaisse son grade.
         bias, bias_detail = get_daily_bias(df_d)
         bias_bull = bias in ("BULLISH", "STRONG BULLISH")
         bias_bear = bias in ("BEARISH", "STRONG BEARISH")
-        if not bias_bull and not bias_bear:
-            return _reject(f"NEUTRAL_BIAS ({bias_detail.get('Votes','?')})")
 
         # ══ GATE 2 — HMA 20 FLIP M15 ════════════════════════════
         hma = QuantEngine.hma(df_m15['close'], 20)
@@ -445,10 +448,14 @@ def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
 
         if flip_type is None:
             return _reject("NO_HMA_FLIP")
-        if flip_type == "BULL" and not bias_bull:
-            return _reject(f"FLIP_BULL_VS_BIAS_{bias}")
-        if flip_type == "BEAR" and not bias_bear:
-            return _reject(f"FLIP_BEAR_VS_BIAS_{bias}")
+
+        # Alignement biais / flip — info affichée, pas un rejet
+        if   (flip_type == "BULL" and bias_bull) or (flip_type == "BEAR" and bias_bear):
+            bias_alignment = "ALIGNED"
+        elif bias == "NEUTRAL":
+            bias_alignment = "NEUTRAL"
+        else:
+            bias_alignment = "COUNTER"
 
         mins_ago = candles_ago * 15
         if mins_ago == 0:
@@ -539,6 +546,7 @@ def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
             "Score /100":   score,
             "Grade":        grade,
             "Biais Daily":  bias,
+            "Alignement":   bias_alignment,
             "Zone":         zone_label,
             "ADX H1":       adx_val,
             "Score Detail": score_detail,
@@ -906,6 +914,7 @@ Plus de 50 % des actifs échouent au fetch.
         sig       = str(row.get("Signal","—"))
         adx_v     = str(row.get("ADX H1","—"))
         bias      = str(row.get("Biais Daily","—"))
+        alignment = str(row.get("Alignement","ALIGNED"))
         zone      = str(row.get("Zone","—"))
         fresh_str = str(row.get("Fraîcheur","—"))
 
@@ -914,8 +923,15 @@ Plus de 50 % des actifs échouent au fetch.
         bias_lbl  = ("STRONG BULL" if bias == "STRONG BULLISH"
                      else "BULL"       if bias == "BULLISH"
                      else "STRONG BEAR" if bias == "STRONG BEARISH"
-                     else "BEAR")
-        bias_color = "#5a9e7a" if bull_bias else "#9e4a3a"
+                     else "BEAR"        if bias in ("BEARISH","STRONG BEARISH")
+                     else "NEUTRAL")
+        bias_color = "#5a9e7a" if bull_bias else ("#9e4a3a" if "BEAR" in bias else "#606080")
+
+        align_tag = ""
+        if alignment == "COUNTER":
+            align_tag = "<span style=\"font-size:10px;color:#9e4a3a;font-weight:700;margin-left:6px;letter-spacing:.05em\">⚠ COUNTER</span>"
+        elif alignment == "NEUTRAL":
+            align_tag = "<span style=\"font-size:10px;color:#606080;font-weight:600;margin-left:6px;letter-spacing:.05em\">~ NEUTRAL</span>"
 
         row_bg = gs["bg"] if fresh and grade in ("A+","A") else "transparent"
 
@@ -925,6 +941,7 @@ Plus de 50 % des actifs échouent au fetch.
     <span class="ticker">{ticker}</span>
     <span class="bias-tag" style="color:{bias_color}">{bias_icon} {bias_lbl}</span>
     <span class="grade-pill" style="color:{gs['color']}">{gs['label']}</span>
+    {align_tag}
   </td>
   <td style="{sig_style(sig)}">{sig}</td>
   <td style="{zone_style(zone)}">{zone}</td>
