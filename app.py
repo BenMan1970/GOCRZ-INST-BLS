@@ -936,10 +936,10 @@ def main():
         except: return "color:#333"
 
     def bias_daily_style(b):
-        if "STRONG BULLISH" in b: return "color:#6dbf8a;font-weight:700;font-size:14px"
-        if "BULLISH"        in b: return "color:#4e8a6c;font-weight:700;font-size:14px"
-        if "STRONG BEARISH" in b: return "color:#c45c5c;font-weight:700;font-size:14px"
-        if "BEARISH"        in b: return "color:#8a4040;font-weight:700;font-size:14px"
+        if "STRONG BULLISH" in b: return "color:#4d9467;font-weight:700;font-size:14px"
+        if "BULLISH"        in b: return "color:#3d7055;font-weight:600;font-size:14px"
+        if "STRONG BEARISH" in b: return "color:#a04848;font-weight:700;font-size:14px"
+        if "BEARISH"        in b: return "color:#7a3535;font-weight:600;font-size:14px"
         return "color:#404055;font-size:14px"
 
     def bias_daily_label(b):
