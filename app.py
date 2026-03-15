@@ -769,15 +769,13 @@ def main():
     env          = "practice"
 
     # ── CONTRÔLES ─────────────────────────────────────────────────
-    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+    col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        freshness   = st.selectbox("Fraîcheur max du signal (min)", [15, 30, 45, 60], index=1)
+        freshness  = st.selectbox("Fraîcheur max du signal (min)", [15, 30, 45, 60], index=1)
     with col2:
-        min_grade   = st.selectbox("Grade minimum", ["Tous", "B", "B+", "A", "A+"], index=0)
+        min_grade  = st.selectbox("Grade minimum", ["Tous", "B", "B+", "A", "A+"], index=0)
     with col3:
-        min_mtf_pct = st.selectbox("MTF % minimum", [0, 50, 60, 70, 80], index=0)
-    with col4:
-        show_debug  = st.toggle("🐛 Debug", value=False)
+        show_debug = st.toggle("🐛 Debug", value=False)
 
     with st.expander("📘 Grille de notation V11"):
         st.markdown("""
@@ -876,10 +874,6 @@ def main():
 
     df = pd.DataFrame(results)
 
-    # ── FILTRE MTF % minimum ──────────────────────────────────────
-    if min_mtf_pct > 0:
-        df = df[df["MTF Pct"] >= min_mtf_pct]
-
     # ── FILTRE GRADE ──────────────────────────────────────────────
     grade_order = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1}
     min_map     = {"Tous": 0, "B": 2, "B+": 3, "A": 4, "A+": 5}
@@ -928,9 +922,9 @@ def main():
 
     def sig_style(s):
         if "LONG"  in s and "expiré" not in s:
-            return "color:#5a9e7a;font-weight:700;font-size:15px;letter-spacing:.03em"
+            return "color:#5a9e7a;font-weight:700;font-size:16px;letter-spacing:.03em"
         if "SHORT" in s and "expiré" not in s:
-            return "color:#9e4a3a;font-weight:700;font-size:15px;letter-spacing:.03em"
+            return "color:#9e4a3a;font-weight:700;font-size:16px;letter-spacing:.03em"
         return "color:#303040;font-size:12px"
 
     def adx_style(v):
@@ -967,7 +961,7 @@ def main():
           <div style="width:60px;height:4px;background:#1a1a22;border-radius:2px;overflow:hidden">
             <div style="width:{width}%;height:100%;background:{color};border-radius:2px"></div>
           </div>
-          <span style="color:{color};font-weight:700;font-size:13px">{score}</span>
+          <span style="color:{color};font-weight:700;font-size:15px">{score}</span>
         </div>"""
 
     def mtf_bar(pct, dominant):
@@ -985,19 +979,19 @@ def main():
     html = """
 <style>
 .sc-wrap{overflow-x:auto;margin-top:4px}
-.sc-tbl{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono','Courier New',monospace;font-size:13px}
+.sc-tbl{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono','Courier New',monospace;font-size:15px}
 .sc-tbl thead tr{border-bottom:2px solid #1e1e3a}
 .sc-tbl th{
   padding:10px 16px;text-align:left;color:#3a3a6a;
-  font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:600;white-space:nowrap
+  font-size:12px;text-transform:uppercase;letter-spacing:.12em;font-weight:600;white-space:nowrap
 }
 .sc-tbl td{padding:13px 16px;border-bottom:1px solid #0f0f1e;vertical-align:middle}
 .sc-tbl tr:hover td{background:#111118 !important}
-.ticker{font-size:20px;font-weight:800;color:#c8c8d8;letter-spacing:.04em;white-space:nowrap;font-family:'IBM Plex Mono',monospace}
-.bias-tag{font-size:11px;font-weight:700;letter-spacing:.07em;vertical-align:middle;margin-left:8px;text-transform:uppercase;opacity:.85}
+.ticker{font-size:22px;font-weight:800;color:#c8c8d8;letter-spacing:.04em;white-space:nowrap;font-family:'IBM Plex Mono',monospace}
+.bias-tag{font-size:12px;font-weight:700;letter-spacing:.07em;vertical-align:middle;margin-left:8px;text-transform:uppercase;opacity:.85}
 .grade-pill{
   display:inline-block;padding:2px 8px;border-radius:2px;
-  font-size:11px;font-weight:700;letter-spacing:.08em;
+  font-size:12px;font-weight:700;letter-spacing:.08em;
   border:1px solid currentColor;margin-left:10px;vertical-align:middle;font-family:'IBM Plex Mono',monospace
 }
 .kz-badge{
@@ -1011,10 +1005,9 @@ def main():
 </style>
 <div class="sc-wrap"><table class="sc-tbl">
 <thead><tr>
-  <th style="width:90px">Fraîcheur</th>
+  <th style="width:100px">Fraîcheur</th>
   <th>Actif</th>
   <th>Signal</th>
-  <th>MTF</th>
   <th>Zone</th>
   <th>Score /100</th>
   <th>ADX H1</th>
@@ -1034,11 +1027,6 @@ def main():
         alignment = str(row.get("Alignement","ALIGNED"))
         zone      = str(row.get("Zone","—"))
         fresh_str = str(row.get("Fraîcheur","—"))
-        mtf_lbl   = str(row.get("MTF %","—"))
-        mtf_pct   = int(row.get("MTF Pct", 0))
-        mtf_dom   = str(row.get("MTF Dom", "Neutral"))
-        mtf_det   = row.get("MTF Details", {})
-
         bull_bias  = "BULLISH" in bias
         bias_icon  = "▲" if bull_bias else "▼"
         bias_lbl   = ("STRONG BULL" if bias == "STRONG BULLISH"
@@ -1059,19 +1047,6 @@ def main():
 
         row_bg = gs["bg"] if fresh and grade in ("A+","A") else "transparent"
 
-        # Mini tableau MTF compact (W/D/4H/1H/15m)
-        tf_display = ["W", "D", "4H", "1H", "15m"]
-        tf_cells   = ""
-        for tf in tf_display:
-            td = mtf_det.get(tf, {})
-            t  = td.get("trend", 0)
-            lbl= td.get("label", "NEUT")
-            c  = "#5a9e7a" if t == 1 else ("#9e4a3a" if t == -1 else "#303048")
-            tf_cells += f'<span style="color:{c};font-size:10px;font-weight:700;margin-right:6px">{tf}:{lbl[:4]}</span>'
-
-        mtf_cell = f"""<div>{mtf_bar(mtf_pct, mtf_dom)}</div>
-<div style="margin-top:4px">{tf_cells}</div>"""
-
         html += f"""<tr style="background:{row_bg}">
   <td style="{fresh_style(fresh_str)}">{fresh_str}</td>
   <td style="white-space:nowrap">
@@ -1081,7 +1056,6 @@ def main():
     {align_tag}
   </td>
   <td style="{sig_style(sig)}">{sig}{kz_tag}</td>
-  <td>{mtf_cell}</td>
   <td style="{zone_style(zone)}">{zone}</td>
   <td>{score_bar(score)}</td>
   <td style="{adx_style(adx_v)}">{adx_v}</td>
