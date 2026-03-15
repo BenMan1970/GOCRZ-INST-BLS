@@ -935,6 +935,20 @@ def main():
             return "color:#404055"
         except: return "color:#333"
 
+    def bias_daily_style(b):
+        if "STRONG BULLISH" in b: return "color:#39FF14;font-weight:700;font-size:14px"
+        if "BULLISH"        in b: return "color:#5a9e7a;font-weight:700;font-size:14px"
+        if "STRONG BEARISH" in b: return "color:#FF003C;font-weight:700;font-size:14px"
+        if "BEARISH"        in b: return "color:#9e4a3a;font-weight:700;font-size:14px"
+        return "color:#404055;font-size:14px"
+
+    def bias_daily_label(b):
+        if b == "STRONG BULLISH": return "▲▲ STRONG BULL"
+        if b == "BULLISH":        return "▲ BULL"
+        if b == "STRONG BEARISH": return "▼▼ STRONG BEAR"
+        if b == "BEARISH":        return "▼ BEAR"
+        return "— NEUTRAL"
+
     def zone_style(z):
         if "DISCOUNT" in z: return "color:#4a7898;font-weight:600"
         if "PREMIUM"  in z: return "color:#8a6028;font-weight:600"
@@ -1008,6 +1022,7 @@ def main():
   <th style="width:100px">Fraîcheur</th>
   <th>Actif</th>
   <th>Signal</th>
+  <th>Biais Daily</th>
   <th>Zone</th>
   <th>Score /100</th>
   <th>ADX H1</th>
@@ -1056,6 +1071,7 @@ def main():
     {align_tag}
   </td>
   <td style="{sig_style(sig)}">{sig}{kz_tag}</td>
+  <td style="{bias_daily_style(bias)}">{bias_daily_label(bias)}</td>
   <td style="{zone_style(zone)}">{zone}</td>
   <td>{score_bar(score)}</td>
   <td style="{adx_style(adx_v)}">{adx_v}</td>
