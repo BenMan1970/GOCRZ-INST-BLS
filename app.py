@@ -758,13 +758,8 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         pdi_val = round(pdi_s.iloc[-1], 1)
         mdi_val = round(mdi_s.iloc[-1], 1)
 
-        # ATR H1 — affiché dans le tableau à la place de l'ADX H1
-        atr_h1_val = None
-        try:
-            if df_h1 is not None and not (hasattr(df_h1, 'empty') and df_h1.empty) and len(df_h1) >= 20:
-                atr_h1_val = round(float(QuantEngine.atr(df_h1, 14).iloc[-1]), 5)
-        except Exception:
-            pass
+        # ATR Daily — référence institutionnelle pour les SL (remplace ATR H1)
+        atr_d_display = round(float(atr_d), 5) if not pd.isna(atr_d) else None
 
         score, grade, score_detail = compute_score(
             flip_type, candles_ago, mtf_pct, mtf_dominant,
@@ -798,13 +793,13 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             "Zone":           zone_label,
             "Score /100":     score,
             "Grade":          grade,
-            "ADX H1":         adx_val,       # utilisé pour le score interne
-            "ATR H1":         atr_h1_val,    # affiché dans le tableau
+            "ADX H1":         adx_val,        # score interne uniquement
+            "ATR D":          atr_d_display,  # affiché dans le tableau
             "MTF Pct":        mtf_pct,
             "MTF Dom":        mtf_dominant,
             "MTF Details":    mtf_details,
-            "Strength Δ":     strength_delta,
-            "Momentum":       momentum,
+            "Strength Δ":     strength_delta,  # combiné dans colonne Force
+            "Momentum":       momentum,         # combiné dans colonne Force
             "signal_is_bull": signal_is_bull,
         }
 
@@ -868,7 +863,7 @@ def main():
           BLUESTAR SNIPER V14 {kz_html}
         </h1>
         <p style="margin:0;color:#4a4a7a;font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.1em">
-          HMA 20 M15 · MTF INSTITUTIONAL · STRENGTH Δ · FORCE H4·H1·M15 · LUXALGO FVG
+          HMA 20 M15 · MTF INSTITUTIONAL · ATR DAILY · FORCE H4·H1·M15 · LUXALGO FVG
         </p>
       </div>
     </div>
@@ -905,8 +900,8 @@ def main():
 
 | Colonne | Description |
 |---|---|
-| **Strength Δ** | Force relative base vs quote sur H1 · >0 = base forte · <0 = quote forte |
-| **🔥 Momentum** | ADX H4 ≥ 25 aligné (+1) · ADX H1 ≥ 25 aligné (+1) · ADX M15 ≥ 25 aligné (+1) · Barre 3 segments |
+| **ATR D** | ATR Daily 14 — référence institutionnelle pour calibrer les SL |
+| **Force** | ■■■ = ADX H4·H1·M15 ≥ 25 alignés (vert bull / rouge bear) · chiffre = Strength Δ base/quote |
         """)
 
     run = st.button("🚀  LANCER LE SCANNER", use_container_width=True)
@@ -1025,7 +1020,7 @@ def main():
     with mc[2]: st.metric("👀 Watch B/B+", b_watch)
     with mc[3]: st.metric("▲ LONG actifs", longs)
     with mc[4]: st.metric("▼ SHORT actifs", shorts)
-    with mc[5]: st.metric("🔥🔥🔥 Momentum max", max_mom)
+    with mc[5]: st.metric("■■■ Force max", max_mom)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1085,15 +1080,44 @@ def main():
           <span style="color:{color};font-weight:700;font-size:15px">{score}</span>
         </div>"""
 
-    def strength_cell(delta):
-        if delta is None:
+    def atr_d_cell(v):
+        """ATR Daily — format adapté selon la magnitude."""
+        if v is None:
             return '<span style="color:#303040">—</span>'
-        color = "#5a9e7a" if delta >= 1.5 else ("#9e4a3a" if delta <= -1.5 else "#9a7820")
-        sign  = "+" if delta > 0 else ""
-        return f'<span style="color:{color};font-weight:700;font-family:\'IBM Plex Mono\',monospace">{sign}{delta:.1f}</span>'
+        formatted = f"{v:.5f}" if v < 1.0 else f"{v:.2f}"
+        return (f'<span style="color:#5a6880;font-family:\'IBM Plex Mono\','
+                f'monospace;font-size:13px">{formatted}</span>')
 
-    def momentum_cell(score, is_bull):
-        return momentum_bar(score, is_bull)
+    def force_cell(momentum_score: int, delta, is_bull: bool) -> str:
+        """
+        Colonne Force unifiée :
+          • 3 segments ADX (H4 / H1 / M15) — vert bull / rouge bear
+          • Strength Δ en chiffre à droite
+        Lecture en un coup d'œil : ■■■ +7.1 = fort et aligné.
+        """
+        color    = "#5a9e7a" if is_bull else "#9e4a3a"
+        filled   = f'background:{color};border-radius:2px'
+        empty    = 'background:#1e1e2e;border-radius:2px'
+        segments = "".join(
+            f'<div style="width:14px;height:9px;{filled if i < momentum_score else empty}"></div>'
+            for i in range(3)
+        )
+        bars = (f'<div style="display:flex;gap:3px;align-items:center">'
+                f'{segments}</div>')
+
+        if delta is not None:
+            delta_color = ("#5a9e7a" if delta >= 1.5
+                           else "#9e4a3a" if delta <= -1.5
+                           else "#6a7888")
+            sign  = "+" if delta > 0 else ""
+            delta_html = (f'<span style="color:{delta_color};font-weight:700;'
+                          f'font-size:12px;font-family:\'IBM Plex Mono\','
+                          f'monospace;margin-left:7px">{sign}{delta:.1f}</span>')
+        else:
+            delta_html = '<span style="color:#303040;margin-left:7px;font-size:11px">n/a</span>'
+
+        return (f'<div style="display:flex;align-items:center">'
+                f'{bars}{delta_html}</div>')
 
     html = """
 <style>
@@ -1128,9 +1152,8 @@ def main():
   <th>Biais Daily</th>
   <th>Zone</th>
   <th>Score /100</th>
-  <th>ATR H1</th>
-  <th>Strength Δ</th>
-  <th>Force H4·H1·M15</th>
+  <th>ATR D</th>
+  <th>Force</th>
 </tr></thead><tbody>
 """
     active_kz = get_current_killzone()
@@ -1143,7 +1166,7 @@ def main():
         ticker    = str(row.get("Actif + Note", "")).split("  ")[0].strip()
         sig       = str(row.get("Signal", "—"))
         adx_v     = str(row.get("ADX H1", "—"))
-        atr_h1_v  = row.get("ATR H1")
+        atr_d_v   = row.get("ATR D")
         bias      = str(row.get("Biais Daily", "—"))
         alignment = str(row.get("Alignement", "ALIGNED"))
         zone      = str(row.get("Zone", "—"))
@@ -1181,9 +1204,8 @@ def main():
   <td style="{bias_daily_style(bias)}">{bias_daily_label(bias)}</td>
   <td style="{zone_style(zone)}">{zone}</td>
   <td>{score_bar(score)}</td>
-  <td>{atr_h1_cell(atr_h1_v)}</td>
-  <td style="text-align:center">{strength_cell(sdelta)}</td>
-  <td>{momentum_cell(momentum, is_bull)}</td>
+  <td>{atr_d_cell(atr_d_v)}</td>
+  <td>{force_cell(momentum, sdelta, is_bull)}</td>
 </tr>"""
 
     html += "</tbody></table></div>"
