@@ -733,24 +733,59 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         pdh = df_d['high'].iloc[-1]
         pdl = df_d['low'].iloc[-1]
 
-        ny_tz   = pytz.timezone('America/New_York')
-        df_ny   = df_m15.copy()
-        df_ny.index = df_ny.index.tz_convert(ny_tz)
-        today_ny = datetime.now(ny_tz).date()
-        mask     = ((df_ny.index.date == today_ny) &
-                    (df_ny.index.hour == 0) & (df_ny.index.minute == 0))
-        mid_c    = df_ny[mask]
-        m_open   = mid_c['open'].iloc[0] if not mid_c.empty else (pdh + pdl) / 2
+        # ── Midpoint D1 — référence ICT Discount/Premium ─────────
+        # Discount = prix sous le 50% du range D1 (identique SniperBot ICT)
+        d1_mid = (pdh + pdl) / 2.0
 
-        atr_d         = QuantEngine.atr(df_d, 14).iloc[-1]
-        below_mid     = price < m_open
-        above_mid     = price > m_open
-        near_pdl      = price <= (pdl + atr_d)
-        near_pdh      = price >= (pdh - atr_d)
-        zone_discount = below_mid and near_pdl
-        zone_premium  = above_mid and near_pdh
-        zone_label    = ("DISCOUNT" if zone_discount else
-                         "PREMIUM"  if zone_premium  else "NEUTRE")
+        # ── Midnight Open NY — bonus de confirmation ──────────────
+        # Pas la référence principale, mais renforce la zone si aligné
+        midnight_open = None
+        try:
+            ny_tz   = pytz.timezone('America/New_York')
+            df_ny   = df_m15.copy()
+            df_ny.index = df_ny.index.tz_convert(ny_tz)
+            today_ny = datetime.now(ny_tz).date()
+            mask     = ((df_ny.index.date == today_ny) &
+                        (df_ny.index.hour == 0) & (df_ny.index.minute == 0))
+            mid_c    = df_ny[mask]
+            if not mid_c.empty:
+                midnight_open = float(mid_c['open'].iloc[0])
+            else:
+                today_c = df_ny[(df_ny.index.date == today_ny)]
+                if not today_c.empty:
+                    midnight_open = float(today_c['open'].iloc[0])
+        except Exception:
+            pass
+
+        atr_d = QuantEngine.atr(df_d, 14).iloc[-1]
+
+        # Marge PDH/PDL : 25% du range D1 (identique SniperBot)
+        # Fallback ATR_D × 0.5 si range D1 trop petit
+        if pdh > pdl:
+            zone_margin = (pdh - pdl) * 0.25
+        else:
+            zone_margin = float(atr_d) * 0.5
+
+        # Discount : prix sous d1_mid ET proche PDL (définition ICT)
+        in_discount = price < d1_mid
+        in_premium  = price > d1_mid
+        near_pdl    = price <= (pdl + zone_margin)
+        near_pdh    = price >= (pdh - zone_margin)
+
+        # Midnight comme bonus : aligne avec la direction du move intraday
+        midnight_below = midnight_open is not None and price < midnight_open
+        midnight_above = midnight_open is not None and price > midnight_open
+
+        # Zone complète = midpoint ICT + PDL/PDH + midnight aligné (comme SniperBot)
+        zone_discount = in_discount and near_pdl and (midnight_below or midnight_open is None)
+        zone_premium  = in_premium  and near_pdh and (midnight_above or midnight_open is None)
+
+        # Zones partielles pour le score (sans midnight)
+        below_mid = in_discount
+        above_mid = in_premium
+
+        zone_label = ("DISCOUNT" if zone_discount else
+                      "PREMIUM"  if zone_premium  else "NEUTRE")
 
         df_adx_src           = df_h1 if not (df_h1 is None or (hasattr(df_h1, 'empty') and df_h1.empty)) and len(df_h1) >= 20 else df_m15
         adx_s, pdi_s, mdi_s = QuantEngine.adx(df_adx_src, 14)
@@ -1222,3 +1257,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
