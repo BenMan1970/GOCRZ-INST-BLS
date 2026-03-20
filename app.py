@@ -201,43 +201,129 @@ def compute_mtf_analysis(dfs: dict):
 # ----------------------------------------------------------------
 #  DAILY BIAS  (3 facteurs)
 # ----------------------------------------------------------------
-def get_daily_bias_v2(df_d: pd.DataFrame):
+def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
+    """
+    Biais Daily — 5 facteurs, max 6 votes.
+    Basé sur SniperBot _daily_bias() + facteur pente EMA50 (ajout quant).
+
+    Facteurs :
+      1. Structure swing D1 (wing=5)       → 2 votes si HH/HL ou LH/LL
+      2. EMA 21/50 stack vs prix intraday  → 1 vote
+      3. Weekly Open vs prix intraday      → 1 vote
+      4. Close J-1 vs midpoint J-1         → 1 vote
+      5. Pente EMA50 D1 / ATR D            → 1 vote  ← ajout quant
+         Mesure si la tendance accélère ou se fatigue.
+         Un biais bull avec EMA50 qui s'aplatit = signal de faiblesse.
+         Normalisé par ATR pour être indépendant de la magnitude du prix.
+
+    Résolution : ≥5 → STRONG · 3-4 → normal · ≤2 → NEUTRAL
+    """
     if df_d is None or len(df_d) < 60:
         return "NEUTRAL", {}
+
     close = df_d['close']
-    score = 0
+    high  = df_d['high']
+    low   = df_d['low']
+
+    cur = current_price if current_price is not None else float(close.iloc[-1])
+
+    votes_bull = 0
+    votes_bear = 0
     detail = {}
 
-    ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
-    cur   = close.iloc[-1]
-    f1    = "BULLISH" if cur > ema50 else "BEARISH"
-    score += 1 if cur > ema50 else -1
-    detail["EMA 50"] = f1
+    # ── Facteur 1 : Structure swing D1 (wing=5) ──────────────────
+    def _swing_pts(series, wing=5):
+        highs, lows = [], []
+        for i in range(wing, len(series) - wing):
+            w = series.iloc[i - wing: i + wing + 1]
+            if series.iloc[i] == w.max(): highs.append(i)
+            if series.iloc[i] == w.min(): lows.append(i)
+        return highs, lows
 
-    _, pdi, mdi = QuantEngine.adx(df_d, 14)
-    f2 = "BULLISH" if pdi.iloc[-1] > mdi.iloc[-1] else "BEARISH"
-    score += 1 if pdi.iloc[-1] > mdi.iloc[-1] else -1
-    detail["DI+/DI-"] = f2
+    sh_idx, _   = _swing_pts(high)
+    _,  sl_idx  = _swing_pts(low)
 
-    df_copy = df_d.copy()
-    if df_copy.index.tz is None:
-        df_copy.index = df_copy.index.tz_localize("UTC")
-    weekly_open_rows = df_copy[df_copy.index.dayofweek.isin([0, 6])]
-    if not weekly_open_rows.empty:
-        weekly_open = weekly_open_rows['open'].iloc[-1]
-        f3 = "BULLISH" if cur > weekly_open else "BEARISH"
-        score += 1 if cur > weekly_open else -1
-        detail["Weekly Open"] = f3
+    struct_vote = "NEUTRAL"
+    if len(sh_idx) >= 2 and len(sl_idx) >= 2:
+        hh = high.iloc[sh_idx[-1]] > high.iloc[sh_idx[-2]]
+        hl = low.iloc[sl_idx[-1]]  > low.iloc[sl_idx[-2]]
+        lh = high.iloc[sh_idx[-1]] < high.iloc[sh_idx[-2]]
+        ll = low.iloc[sl_idx[-1]]  < low.iloc[sl_idx[-2]]
+        if hh and hl:
+            struct_vote = "BULLISH"; votes_bull += 2
+        elif lh and ll:
+            struct_vote = "BEARISH"; votes_bear += 2
+    detail["Structure"] = struct_vote
+
+    # ── Facteur 2 : EMA 21/50 stack vs prix intraday ─────────────
+    ema50_series = close.ewm(span=50, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+    ema50 = ema50_series.iloc[-1]
+    if   cur > ema21 > ema50: detail["EMA 21/50"] = "BULLISH"; votes_bull += 1
+    elif cur < ema21 < ema50: detail["EMA 21/50"] = "BEARISH"; votes_bear += 1
+    else:                     detail["EMA 21/50"] = "NEUTRAL"
+
+    # ── Facteur 3 : Weekly Open vs prix intraday ─────────────────
+    wo_vote = "NEUTRAL"
+    try:
+        df_copy = df_d.copy()
+        if df_copy.index.tz is None:
+            df_copy.index = df_copy.index.tz_localize("UTC")
+        weekly_open_rows = df_copy[df_copy.index.dayofweek.isin([0, 6])]
+        if not weekly_open_rows.empty:
+            weekly_open = float(weekly_open_rows['open'].iloc[-1])
+            wo_vote = "BULLISH" if cur > weekly_open else "BEARISH"
+            if wo_vote == "BULLISH": votes_bull += 1
+            else:                   votes_bear += 1
+    except Exception:
+        pass
+    detail["Weekly Open"] = wo_vote
+
+    # ── Facteur 4 : Close J-1 vs midpoint J-1 ────────────────────
+    if len(df_d) >= 2:
+        midpoint = (float(high.iloc[-2]) + float(low.iloc[-2])) / 2
+        if float(close.iloc[-2]) > midpoint:
+            detail["Close J-1"] = "BULLISH"; votes_bull += 1
+        else:
+            detail["Close J-1"] = "BEARISH"; votes_bear += 1
     else:
-        detail["Weekly Open"] = "NEUTRAL"
+        detail["Close J-1"] = "NEUTRAL"
 
-    detail["Score"] = score
+    # ── Facteur 5 : Pente EMA50 D1 normalisée ATR ────────────────
+    # Mesure la vélocité institutionnelle sur 5 bougies D1 (~1 semaine).
+    # Normalisée par ATR D pour être indépendante de la magnitude du prix.
+    # Seuil : > +0.05 ATR = tendance qui accélère (bull)
+    #         < -0.05 ATR = tendance qui décélère  (bear)
+    slope_vote = "NEUTRAL"
+    try:
+        if len(ema50_series) >= 6:
+            atr_d_val = float(
+                pd.concat([
+                    high - low,
+                    (high - close.shift()).abs(),
+                    (low  - close.shift()).abs(),
+                ], axis=1).max(axis=1).ewm(alpha=1/14, adjust=False).mean().iloc[-1]
+            )
+            slope_5d = float(ema50_series.iloc[-1] - ema50_series.iloc[-6])
+            if atr_d_val > 0:
+                slope_norm = slope_5d / atr_d_val
+                if   slope_norm >  0.05:
+                    slope_vote = "BULLISH"; votes_bull += 1
+                elif slope_norm < -0.05:
+                    slope_vote = "BEARISH"; votes_bear += 1
+                # Entre ±0.05 : EMA50 trop plate → neutre, on ne vote pas
+            detail["EMA50 Slope"] = f"{slope_vote} ({slope_norm:+.3f})"
+    except Exception:
+        detail["EMA50 Slope"] = "NEUTRAL"
 
-    if   score ==  3: bias = "STRONG BULLISH"
-    elif score >=  1: bias = "BULLISH"
-    elif score == -3: bias = "STRONG BEARISH"
-    elif score <= -1: bias = "BEARISH"
-    else:             bias = "NEUTRAL"
+    detail["Votes"] = f"{votes_bull}B / {votes_bear}S"
+
+    # Résolution mise à jour pour 6 votes max
+    if   votes_bull >= 5: bias = "STRONG BULLISH"
+    elif votes_bull >= 3: bias = "BULLISH"
+    elif votes_bear >= 5: bias = "STRONG BEARISH"
+    elif votes_bear >= 3: bias = "BEARISH"
+    else:                 bias = "NEUTRAL"
 
     return bias, detail
 
@@ -676,7 +762,9 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
 
         price = df_m15['close'].iloc[-1]
 
-        bias, bias_detail = get_daily_bias_v2(df_d)
+        # Prix M15 intraday passé au biais D1 (identique SniperBot)
+        current_price_proxy = float(df_m15['close'].iloc[-1])
+        bias, bias_detail = get_daily_bias_v2(df_d, current_price=current_price_proxy)
         bias_bull = bias in ("BULLISH", "STRONG BULLISH")
         bias_bear = bias in ("BEARISH", "STRONG BEARISH")
 
@@ -1257,4 +1345,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
