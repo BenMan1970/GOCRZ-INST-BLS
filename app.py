@@ -373,14 +373,15 @@ def get_strength_delta(ticker: str, strength_scores: dict) -> float | None:
 
 
 # ----------------------------------------------------------------
-#  MOMENTUM SCORE  (ADX H4 + ADX H1 + ATR expansion)
+#  MOMENTUM SCORE  (ADX H4 + ADX H1 + ADX M15 — tous alignés)
 # ----------------------------------------------------------------
 def compute_momentum_score(df_h4, df_h1, df_m15, signal_is_bull: bool) -> int:
     """
     0-3 points :
-      +1 ADX H4 >= 25 ET DI aligné avec le signal
-      +1 ADX H1 >= 25 ET DI aligné avec le signal
-      +1 ATR M15 actuel > ATR M15 moyen 50 bougies
+      +1 ADX H4  >= 25 ET DI aligné avec le signal
+      +1 ADX H1  >= 25 ET DI aligné avec le signal
+      +1 ADX M15 >= 25 ET DI aligné avec le signal
+    Les 3 TF confirment la même direction = momentum plein.
     """
     score = 0
 
@@ -405,11 +406,11 @@ def compute_momentum_score(df_h4, df_h1, df_m15, signal_is_bull: bool) -> int:
         pass
 
     try:
-        if df_m15 is not None and len(df_m15) >= 50:
-            atr_series = QuantEngine.atr(df_m15, 14)
-            atr_now  = float(atr_series.iloc[-1])
-            atr_mean = float(atr_series.iloc[-50:].mean())
-            if atr_now > atr_mean:
+        if df_m15 is not None and len(df_m15) >= 20:
+            adx_m15, pdi_m15, mdi_m15 = QuantEngine.adx(df_m15, 14)
+            adx_v = float(adx_m15.iloc[-1])
+            di_ok = (pdi_m15.iloc[-1] > mdi_m15.iloc[-1]) if signal_is_bull else (mdi_m15.iloc[-1] > pdi_m15.iloc[-1])
+            if adx_v >= 25 and di_ok:
                 score += 1
     except Exception:
         pass
@@ -417,11 +418,29 @@ def compute_momentum_score(df_h4, df_h1, df_m15, signal_is_bull: bool) -> int:
     return score
 
 
-def momentum_flames(score: int) -> str:
-    if score == 3: return "🔥🔥🔥"
-    if score == 2: return "🔥🔥"
-    if score == 1: return "🔥"
-    return "—"
+def momentum_bar(score: int, signal_is_bull: bool) -> str:
+    """
+    Barre de 3 segments — un par TF (H4 / H1 / M15).
+    Vert si aligné bull, rouge si aligné bear, gris si absent.
+    """
+    color   = "#5a9e7a" if signal_is_bull else "#9e4a3a"
+    filled  = f'background:{color};border-radius:2px'
+    empty   = 'background:#1e1e2e;border-radius:2px'
+    seg_w   = 14
+    seg_h   = 10
+    gap     = 3
+
+    segments = []
+    for i in range(3):
+        style = filled if i < score else empty
+        segments.append(
+            f'<div style="width:{seg_w}px;height:{seg_h}px;{style}"></div>'
+        )
+
+    bars = f'<div style="display:flex;gap:{gap}px;align-items:center">{"".join(segments)}</div>'
+    label_color = color if score > 0 else "#2a2a3a"
+    label = f'<span style="font-family:\'IBM Plex Mono\',monospace;font-size:10px;color:{label_color};margin-left:5px">{score}/3</span>'
+    return f'<div style="display:flex;align-items:center">{bars}{label}</div>'
 
 
 # ----------------------------------------------------------------
@@ -739,6 +758,14 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         pdi_val = round(pdi_s.iloc[-1], 1)
         mdi_val = round(mdi_s.iloc[-1], 1)
 
+        # ATR H1 — affiché dans le tableau à la place de l'ADX H1
+        atr_h1_val = None
+        try:
+            if df_h1 is not None and not (hasattr(df_h1, 'empty') and df_h1.empty) and len(df_h1) >= 20:
+                atr_h1_val = round(float(QuantEngine.atr(df_h1, 14).iloc[-1]), 5)
+        except Exception:
+            pass
+
         score, grade, score_detail = compute_score(
             flip_type, candles_ago, mtf_pct, mtf_dominant,
             zone_discount, zone_premium, near_pdl, near_pdh,
@@ -771,7 +798,8 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             "Zone":           zone_label,
             "Score /100":     score,
             "Grade":          grade,
-            "ADX H1":         adx_val,
+            "ADX H1":         adx_val,       # utilisé pour le score interne
+            "ATR H1":         atr_h1_val,    # affiché dans le tableau
             "MTF Pct":        mtf_pct,
             "MTF Dom":        mtf_dominant,
             "MTF Details":    mtf_details,
@@ -840,7 +868,7 @@ def main():
           BLUESTAR SNIPER V14 {kz_html}
         </h1>
         <p style="margin:0;color:#4a4a7a;font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.1em">
-          HMA 20 M15 · MTF INSTITUTIONAL · STRENGTH Δ · MOMENTUM 🔥 · LUXALGO FVG
+          HMA 20 M15 · MTF INSTITUTIONAL · STRENGTH Δ · FORCE H4·H1·M15 · LUXALGO FVG
         </p>
       </div>
     </div>
@@ -878,7 +906,7 @@ def main():
 | Colonne | Description |
 |---|---|
 | **Strength Δ** | Force relative base vs quote sur H1 · >0 = base forte · <0 = quote forte |
-| **🔥 Momentum** | ADX H4 ≥ 25 aligné (+1) · ADX H1 ≥ 25 aligné (+1) · ATR M15 expansif (+1) |
+| **🔥 Momentum** | ADX H4 ≥ 25 aligné (+1) · ADX H1 ≥ 25 aligné (+1) · ADX M15 ≥ 25 aligné (+1) · Barre 3 segments |
         """)
 
     run = st.button("🚀  LANCER LE SCANNER", use_container_width=True)
@@ -1017,13 +1045,13 @@ def main():
             return "color:#9e4a3a;font-weight:700;font-size:16px;letter-spacing:.03em"
         return "color:#303040;font-size:12px"
 
-    def adx_style(v):
-        try:
-            f = float(v)
-            if f >= 25: return "color:#5a9e7a;font-weight:700"
-            if f >= 20: return "color:#9a7820;font-weight:700"
-            return "color:#404055"
-        except: return "color:#333"
+    def atr_h1_cell(v):
+        """Affiche l'ATR H1 avec 5 décimales, sans coloration particulière."""
+        if v is None:
+            return '<span style="color:#303040">—</span>'
+        # Format adapté : JPY a des ATR en centièmes, forex standard en dix-millièmes
+        formatted = f"{v:.5f}" if v < 1.0 else f"{v:.2f}"
+        return f'<span style="color:#7a8aa0;font-family:\'IBM Plex Mono\',monospace;font-size:13px">{formatted}</span>'
 
     def bias_daily_label(b):
         if b == "STRONG BULLISH": return "▲▲ STRONG BULL"
@@ -1064,15 +1092,8 @@ def main():
         sign  = "+" if delta > 0 else ""
         return f'<span style="color:{color};font-weight:700;font-family:\'IBM Plex Mono\',monospace">{sign}{delta:.1f}</span>'
 
-    def momentum_cell(score):
-        flames = momentum_flames(score)
-        if score == 3:
-            return f'<span style="font-size:14px">{flames}</span>'
-        if score == 2:
-            return f'<span style="font-size:14px">{flames}</span>'
-        if score == 1:
-            return f'<span style="font-size:13px;opacity:.7">{flames}</span>'
-        return '<span style="color:#252535">—</span>'
+    def momentum_cell(score, is_bull):
+        return momentum_bar(score, is_bull)
 
     html = """
 <style>
@@ -1107,9 +1128,9 @@ def main():
   <th>Biais Daily</th>
   <th>Zone</th>
   <th>Score /100</th>
-  <th>ADX H1</th>
+  <th>ATR H1</th>
   <th>Strength Δ</th>
-  <th>🔥 Force</th>
+  <th>Force H4·H1·M15</th>
 </tr></thead><tbody>
 """
     active_kz = get_current_killzone()
@@ -1122,12 +1143,14 @@ def main():
         ticker    = str(row.get("Actif + Note", "")).split("  ")[0].strip()
         sig       = str(row.get("Signal", "—"))
         adx_v     = str(row.get("ADX H1", "—"))
+        atr_h1_v  = row.get("ATR H1")
         bias      = str(row.get("Biais Daily", "—"))
         alignment = str(row.get("Alignement", "ALIGNED"))
         zone      = str(row.get("Zone", "—"))
         fresh_str = str(row.get("Fraîcheur", "—"))
         sdelta    = row.get("Strength Δ")
         momentum  = int(row.get("Momentum", 0))
+        is_bull   = bool(row.get("signal_is_bull", True))
 
         bull_bias  = "BULLISH" in bias
         bias_icon  = "▲" if bull_bias else "▼"
@@ -1158,9 +1181,9 @@ def main():
   <td style="{bias_daily_style(bias)}">{bias_daily_label(bias)}</td>
   <td style="{zone_style(zone)}">{zone}</td>
   <td>{score_bar(score)}</td>
-  <td style="{adx_style(adx_v)}">{adx_v}</td>
+  <td>{atr_h1_cell(atr_h1_v)}</td>
   <td style="text-align:center">{strength_cell(sdelta)}</td>
-  <td style="text-align:center">{momentum_cell(momentum)}</td>
+  <td>{momentum_cell(momentum, is_bull)}</td>
 </tr>"""
 
     html += "</tbody></table></div>"
