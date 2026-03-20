@@ -708,10 +708,8 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         fvg_near_bear = (nr_fvg is not None and
                          abs(price - (nr_fvg[0] + nr_fvg[1]) / 2) < atr_val * 1.0)
 
-        if flip_type == "BULL" and not (in_bull_fvg or fvg_near_bull):
-            return _reject("NO_BULL_FVG")
-        if flip_type == "BEAR" and not (in_bear_fvg or fvg_near_bear):
-            return _reject("NO_BEAR_FVG")
+        # FVG : score uniquement (15/7/0 pts) — pas de gate dure
+        # Le scanner est un filtre, pas un éliminateur
 
         pdh = df_d['high'].iloc[-1]
         pdl = df_d['low'].iloc[-1]
