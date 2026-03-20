@@ -11,18 +11,11 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================================================================
-#  BLUESTAR SNIPER V13  —  ICT SIGNAL ENGINE
-#  V13 vs V12 (audit complet) :
-#  🔴  FIX PDH/PDL : iloc[-1] sur bougie D complète (plus iloc[-2])
-#  🔴  FIX M/W MTF : fetch 250 bougies — SMA200 enfin calculable
-#  🔴  FIX Midnight fallback : PDL fallback si aucune bougie 00h00
-#  🔴  FIX FVG : inclusion dernière bougie (plus :-1)
-#  🟠  FIX NEUTRAL bias : gate dur si biais NEUTRAL
-#  🟠  FIX HMA lookback : 20 bougies (150 → 300 min)
-#  🟠  FIX FVG proche : seuil ATR*1.0 au lieu de ATR*2
-#  🟡  PERF WMA : numpy vectorisé 10x plus rapide
-#  🟡  PERF fetch : ThreadPoolExecutor — fetches parallèles
-#  🔵  CLEAN : code mort supprimé (mtf_label, score_detail inutilisé)
+#  BLUESTAR SNIPER V14  —  ICT SIGNAL ENGINE
+#  V14 vs V13 :
+#  🔴  FVG : traduction exacte LuxAlgo (close[i-1], mitigation, seuil auto)
+#  🟠  Strength Δ : force relative base/quote sur H1 (0-10)
+#  🟠  Momentum Score : ADX H4 + ADX H1 aligné + ATR expansion (0-3 🔥)
 # ================================================================
 
 
@@ -30,17 +23,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 #  KILLZONE DETECTOR  (UTC+1 — Paris / Tunis)
 # ----------------------------------------------------------------
 KILLZONES_UTC1 = {
-    "London":    (( 8,  0), ( 9, 30)),
-    "NY AM":     ((13,  0), (14, 30)),
-    "Asia":      (( 2,  0), ( 4,  0)),
+    "London": ((8,  0), (9,  30)),
+    "NY AM":  ((13, 0), (14, 30)),
+    "Asia":   ((2,  0), (4,  0)),
 }
 
 def get_current_killzone() -> str:
-    """Retourne le nom de la killzone active (UTC+1) ou ''."""
     tz_utc1 = pytz.timezone("Europe/Paris")
     now = datetime.now(tz_utc1)
-    h, m = now.hour, now.minute
-    t = h * 60 + m
+    t = now.hour * 60 + now.minute
     for name, (start, end) in KILLZONES_UTC1.items():
         s = start[0] * 60 + start[1]
         e = end[0]   * 60 + end[1]
@@ -49,12 +40,9 @@ def get_current_killzone() -> str:
     return ""
 
 def killzone_badge(kz: str) -> str:
-    if kz == "London":
-        return "🟢 KZ London"
-    if kz == "NY AM":
-        return "🔵 KZ NY AM"
-    if kz == "Asia":
-        return "🟠 KZ Asia"
+    if kz == "London": return "🟢 KZ London"
+    if kz == "NY AM":  return "🔵 KZ NY AM"
+    if kz == "Asia":   return "🟠 KZ Asia"
     return ""
 
 
@@ -65,7 +53,6 @@ class QuantEngine:
 
     @staticmethod
     def wma(series, period):
-        # Numpy vectorisé — 10x plus rapide que rolling().apply(lambda)
         weights = np.arange(1, period + 1, dtype=np.float64)
         w_sum   = weights.sum()
         arr     = series.to_numpy(dtype=np.float64)
@@ -121,37 +108,17 @@ class QuantEngine:
 
 
 # ----------------------------------------------------------------
-#  MTF INSTITUTIONAL TREND  (miroir du Pine Script)
+#  MTF INSTITUTIONAL TREND
 # ----------------------------------------------------------------
-#  Weights : M=4.0  W=3.5  D=3.0  4H=2.5  1H=2.0  15m=1.5
-#  Même logique que le tableau TradingView
-# ----------------------------------------------------------------
-TF_WEIGHTS = {
-    "M":   4.0,
-    "W":   3.5,
-    "D":   3.0,
-    "4H":  2.5,
-    "1H":  2.0,
-    "15m": 1.5,
-}
-TOTAL_WEIGHT = sum(TF_WEIGHTS.values())   # 17.0
+TF_WEIGHTS = {"M": 4.0, "W": 3.5, "D": 3.0, "4H": 2.5, "1H": 2.0, "15m": 1.5}
+TOTAL_WEIGHT = sum(TF_WEIGHTS.values())
 
 
 def get_tf_trend(df: pd.DataFrame, tf_type: str):
-    """
-    Retourne (trend: int, strength: float, label: str)
-    trend  : +1 Bull / -1 Bear / 0 Neutre
-    strength : 0–100
-    Miroir exact de getInstitutionalTrend() dans Pine Script.
-    """
     if df is None or len(df) < 50:
         return 0, 40.0, "NEUT"
-
     close = df['close']
 
-    # ── M & W : croisement EMA50 / SMA200 ─────────────────────
-    # FIX : fetch 250W / 80M garantit assez de données pour SMA200 W
-    #        et EMA50 M. Seuil minimal abaissé à 52.
     if tf_type in ("M", "W"):
         min_bars = 52 if tf_type == "M" else 200
         if len(df) < min_bars:
@@ -165,29 +132,23 @@ def get_tf_trend(df: pd.DataFrame, tf_type: str):
         label    = "BULL" if trend == 1 else ("BEAR" if trend == -1 else "NEUT")
         return trend, strength, label
 
-    # ── 4H : 3 facteurs orthogonaux ───────────────────────────
     elif tf_type == "4H":
         score = 0
         ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
         score += 1 if close.iloc[-1] > ema50 else -1
-
         adx_s, pdi_s, mdi_s = QuantEngine.adx(df, 14)
         score += 1 if pdi_s.iloc[-1] > mdi_s.iloc[-1] else -1
-
-        # Daily open : première bougie du jour courant (FIX: sans copy inutile)
         idx = df.index.tz_localize("UTC") if df.index.tz is None else df.index
         today = idx[-1].date()
         day_rows = df[idx.date == today]
         if not day_rows.empty:
             daily_open = day_rows['open'].iloc[0]
             score += 1 if close.iloc[-1] > daily_open else -1
-
         trend    = 1 if score > 0 else (-1 if score < 0 else 0)
         strength = 90.0 if abs(score) == 3 else (70.0 if abs(score) >= 1 else 40.0)
         label    = "BULL" if trend == 1 else ("BEAR" if trend == -1 else "NEUT")
         return trend, strength, label
 
-    # ── H1 & 15m : confluence maximale ────────────────────────
     else:
         ema50 = close.ewm(span=50, adjust=False).mean()
         ema21 = close.ewm(span=21, adjust=False).mean()
@@ -196,46 +157,32 @@ def get_tf_trend(df: pd.DataFrame, tf_type: str):
         rsi_v = QuantEngine.rsi(close, 14)
         macd  = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
         sig   = macd.ewm(span=9, adjust=False).mean()
-
         c = close.iloc[-1]
-        bullish = (c > zl.iloc[-1]    and
-                   ema9.iloc[-1]  > ema21.iloc[-1] and
-                   ema21.iloc[-1] > ema50.iloc[-1] and
-                   rsi_v.iloc[-1] > 50             and
+        bullish = (c > zl.iloc[-1] and ema9.iloc[-1] > ema21.iloc[-1] and
+                   ema21.iloc[-1] > ema50.iloc[-1] and rsi_v.iloc[-1] > 50 and
                    macd.iloc[-1]  > sig.iloc[-1])
-        bearish = (c < zl.iloc[-1]    and
-                   ema9.iloc[-1]  < ema21.iloc[-1] and
-                   ema21.iloc[-1] < ema50.iloc[-1] and
-                   rsi_v.iloc[-1] < 50             and
+        bearish = (c < zl.iloc[-1] and ema9.iloc[-1] < ema21.iloc[-1] and
+                   ema21.iloc[-1] < ema50.iloc[-1] and rsi_v.iloc[-1] < 50 and
                    macd.iloc[-1]  < sig.iloc[-1])
-
-        base_str  = min(80.0, abs(c - zl.iloc[-1]) / c * 1000)
-        strength  = (base_str if (bullish or bearish) else 30.0)
-        trend     = 1 if bullish else (-1 if bearish else 0)
-        label     = "BULL" if trend == 1 else ("BEAR" if trend == -1 else "NEUT")
+        base_str = min(80.0, abs(c - zl.iloc[-1]) / c * 1000)
+        strength = base_str if (bullish or bearish) else 30.0
+        trend    = 1 if bullish else (-1 if bearish else 0)
+        label    = "BULL" if trend == 1 else ("BEAR" if trend == -1 else "NEUT")
         return trend, strength, label
 
 
 def compute_mtf_analysis(dfs: dict):
-    """
-    dfs = {"M": df_monthly, "W": df_weekly, "D": df_daily,
-           "4H": df_4h, "1H": df_1h, "15m": df_15m}
-    Retourne (alignment_pct: int, dominant: str, details: dict)
-    Miroir exact du bloc MTF du Pine Script.
-    """
     results = {}
     for tf, df in dfs.items():
         t, s, lbl = get_tf_trend(df, tf)
         results[tf] = {"trend": t, "strength": s, "label": lbl}
 
-    # Macro filter (M → W → D → 4H)
     macro_trend = 0
     for tf in ("M", "W", "D", "4H"):
         if tf in results and results[tf]["trend"] != 0:
             macro_trend = results[tf]["trend"]
             break
 
-    # Filtres 1H & 15m
     t1h  = results.get("1H",  {}).get("trend", 0)
     t15m = results.get("15m", {}).get("trend", 0)
     f1h  = 0 if (macro_trend != 0 and macro_trend != t1h)  else t1h
@@ -243,55 +190,35 @@ def compute_mtf_analysis(dfs: dict):
     results["1H"]["trend"]  = f1h
     results["15m"]["trend"] = f15m
 
-    bull_score = sum(
-        TF_WEIGHTS[tf] for tf in TF_WEIGHTS
-        if results.get(tf, {}).get("trend", 0) == 1
-    )
-    bear_score = sum(
-        TF_WEIGHTS[tf] for tf in TF_WEIGHTS
-        if results.get(tf, {}).get("trend", 0) == -1
-    )
-
+    bull_score = sum(TF_WEIGHTS[tf] for tf in TF_WEIGHTS if results.get(tf, {}).get("trend", 0) == 1)
+    bear_score = sum(TF_WEIGHTS[tf] for tf in TF_WEIGHTS if results.get(tf, {}).get("trend", 0) == -1)
     alignment_pct = round(max(bull_score, bear_score) / TOTAL_WEIGHT * 100)
     dominant      = ("Bullish" if bull_score > bear_score
-                     else "Bearish" if bear_score > bull_score
-                     else "Neutral")
-
+                     else "Bearish" if bear_score > bull_score else "Neutral")
     return alignment_pct, dominant, results
 
 
 # ----------------------------------------------------------------
-#  DAILY BIAS AMÉLIORÉ  (3 facteurs — miroir Pine getDailyBias)
+#  DAILY BIAS  (3 facteurs)
 # ----------------------------------------------------------------
 def get_daily_bias_v2(df_d: pd.DataFrame):
-    """
-    3 facteurs orthogonaux identiques au Pine Script :
-    1. Prix vs EMA50 D1
-    2. DI+ vs DI-
-    3. Weekly Open
-    Score ±3 → 90% | ±1/2 → 70% | 0 → 40%
-    """
     if df_d is None or len(df_d) < 60:
         return "NEUTRAL", {}
-
     close = df_d['close']
     score = 0
     detail = {}
 
-    # Facteur 1 : EMA 50
     ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
     cur   = close.iloc[-1]
     f1    = "BULLISH" if cur > ema50 else "BEARISH"
     score += 1 if cur > ema50 else -1
     detail["EMA 50"] = f1
 
-    # Facteur 2 : DI+ vs DI-
     _, pdi, mdi = QuantEngine.adx(df_d, 14)
     f2 = "BULLISH" if pdi.iloc[-1] > mdi.iloc[-1] else "BEARISH"
     score += 1 if pdi.iloc[-1] > mdi.iloc[-1] else -1
     detail["DI+/DI-"] = f2
 
-    # Facteur 3 : Weekly Open
     df_copy = df_d.copy()
     if df_copy.index.tz is None:
         df_copy.index = df_copy.index.tz_localize("UTC")
@@ -316,6 +243,188 @@ def get_daily_bias_v2(df_d: pd.DataFrame):
 
 
 # ----------------------------------------------------------------
+#  FVG M15  —  traduction exacte "Fair Value Gap [LuxAlgo]"
+# ----------------------------------------------------------------
+def detect_fvg(df, price, lookback=80):
+    """
+    LuxAlgo exact :
+      Bull : low[i] > high[i-2]  ET  close[i-1] > high[i-2]
+             ET  (low[i]-high[i-2])/high[i-2] > seuil_auto
+      Bear : high[i] < low[i-2]  ET  close[i-1] < low[i-2]
+             ET  (low[i-2]-high[i])/high[i]   > seuil_auto
+    Seuil auto : ta.cum((high-low)/low) / bar_index × 2
+    Mitigation : bull supprimé quand close < bottom
+                 bear supprimé quand close > top
+    """
+    sub = df.iloc[-(lookback + 3):].reset_index(drop=True)
+    n   = len(sub)
+    if n < 3:
+        return False, False, None, None
+
+    denom     = sub["low"].replace(0, 1e-9)
+    range_pct = (sub["high"] - sub["low"]) / denom
+    auto_thr  = float(range_pct.expanding().mean().iloc[-1]) * 2.0
+
+    active_bulls = []
+    active_bears = []
+
+    for i in range(2, n):
+        h0 = float(sub["high"].iloc[i]);   l0 = float(sub["low"].iloc[i])
+        c0 = float(sub["close"].iloc[i]);  c1 = float(sub["close"].iloc[i - 1])
+        h2 = float(sub["high"].iloc[i - 2]); l2 = float(sub["low"].iloc[i - 2])
+
+        active_bulls = [(b, t) for b, t in active_bulls if c0 >= b]
+        active_bears = [(b, t) for b, t in active_bears if c0 <= t]
+
+        if l0 > h2 and c1 > h2:
+            size_pct = (l0 - h2) / h2 if h2 > 0 else 0.0
+            if size_pct >= auto_thr:
+                active_bulls.insert(0, (h2, l0))
+        elif h0 < l2 and c1 < l2:
+            size_pct = (l2 - h0) / h0 if h0 > 0 else 0.0
+            if size_pct >= auto_thr:
+                active_bears.insert(0, (h0, l2))
+
+    in_bull = any(b <= price <= t for b, t in active_bulls)
+    in_bear = any(b <= price <= t for b, t in active_bears)
+
+    def _nearest(lst):
+        if not lst:
+            return None
+        return min(lst, key=lambda r: abs(price - (r[0] + r[1]) / 2))
+
+    return (in_bull, in_bear, _nearest(active_bulls), _nearest(active_bears))
+
+
+# ----------------------------------------------------------------
+#  CURRENCY STRENGTH Δ  (H1 — base vs quote)
+# ----------------------------------------------------------------
+CURRENCIES = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
+
+STRENGTH_PAIRS = [
+    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF",
+    "AUD_USD", "USD_CAD", "NZD_USD",
+    "EUR_GBP", "EUR_JPY", "EUR_CHF",
+    "GBP_JPY", "AUD_JPY", "CAD_JPY", "NZD_JPY",
+]
+
+def compute_currency_strength(dfs_h1: dict) -> dict:
+    """
+    Score de force relative par devise sur H1.
+    Retourne {currency: score_0_10}.
+    Logique : EMA9 > EMA21 > EMA50 + RSI > 50 = haussier pour la base.
+    """
+    raw = {c: 0.0 for c in CURRENCIES}
+    counts = {c: 0 for c in CURRENCIES}
+
+    for pair, df in dfs_h1.items():
+        if df is None or df.empty or len(df) < 60:
+            continue
+        parts = pair.split("_")
+        if len(parts) != 2:
+            continue
+        base, quote = parts[0], parts[1]
+        if base not in CURRENCIES or quote not in CURRENCIES:
+            continue
+
+        close = df["close"]
+        ema9  = close.ewm(span=9,  adjust=False).mean().iloc[-1]
+        ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+        ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+        rsi_v = QuantEngine.rsi(close, 14).iloc[-1]
+
+        # Score directionnel : +1 bull, -1 bear, 0 neutre
+        bullish = ema9 > ema21 > ema50 and rsi_v > 50
+        bearish = ema9 < ema21 < ema50 and rsi_v < 50
+        contrib = 1.0 if bullish else (-1.0 if bearish else 0.0)
+
+        raw[base]  += contrib
+        raw[quote] -= contrib
+        counts[base]  += 1
+        counts[quote] += 1
+
+    # Normalisation 0-10
+    scores = {}
+    for c in CURRENCIES:
+        if counts[c] > 0:
+            scores[c] = raw[c] / counts[c]
+        else:
+            scores[c] = 0.0
+
+    vals = list(scores.values())
+    s_min, s_max = min(vals), max(vals)
+    spread = s_max - s_min
+    if spread < 1e-8:
+        return {c: 5.0 for c in CURRENCIES}
+    return {c: round((v - s_min) / spread * 10, 2) for c, v in scores.items()}
+
+
+def get_strength_delta(ticker: str, strength_scores: dict) -> float | None:
+    """Retourne diff base-quote sur 0-10, ou None si non disponible."""
+    parts = ticker.split("_")
+    if len(parts) != 2:
+        return None
+    base, quote = parts[0], parts[1]
+    sb = strength_scores.get(base)
+    sq = strength_scores.get(quote)
+    if sb is None or sq is None:
+        return None
+    return round(sb - sq, 2)
+
+
+# ----------------------------------------------------------------
+#  MOMENTUM SCORE  (ADX H4 + ADX H1 + ATR expansion)
+# ----------------------------------------------------------------
+def compute_momentum_score(df_h4, df_h1, df_m15, signal_is_bull: bool) -> int:
+    """
+    0-3 points :
+      +1 ADX H4 >= 25 ET DI aligné avec le signal
+      +1 ADX H1 >= 25 ET DI aligné avec le signal
+      +1 ATR M15 actuel > ATR M15 moyen 50 bougies
+    """
+    score = 0
+
+    try:
+        if df_h4 is not None and len(df_h4) >= 20:
+            adx_h4, pdi_h4, mdi_h4 = QuantEngine.adx(df_h4, 14)
+            adx_v = float(adx_h4.iloc[-1])
+            di_ok = (pdi_h4.iloc[-1] > mdi_h4.iloc[-1]) if signal_is_bull else (mdi_h4.iloc[-1] > pdi_h4.iloc[-1])
+            if adx_v >= 25 and di_ok:
+                score += 1
+    except Exception:
+        pass
+
+    try:
+        if df_h1 is not None and len(df_h1) >= 20:
+            adx_h1, pdi_h1, mdi_h1 = QuantEngine.adx(df_h1, 14)
+            adx_v = float(adx_h1.iloc[-1])
+            di_ok = (pdi_h1.iloc[-1] > mdi_h1.iloc[-1]) if signal_is_bull else (mdi_h1.iloc[-1] > pdi_h1.iloc[-1])
+            if adx_v >= 25 and di_ok:
+                score += 1
+    except Exception:
+        pass
+
+    try:
+        if df_m15 is not None and len(df_m15) >= 50:
+            atr_series = QuantEngine.atr(df_m15, 14)
+            atr_now  = float(atr_series.iloc[-1])
+            atr_mean = float(atr_series.iloc[-50:].mean())
+            if atr_now > atr_mean:
+                score += 1
+    except Exception:
+        pass
+
+    return score
+
+
+def momentum_flames(score: int) -> str:
+    if score == 3: return "🔥🔥🔥"
+    if score == 2: return "🔥🔥"
+    if score == 1: return "🔥"
+    return "—"
+
+
+# ----------------------------------------------------------------
 #  SYSTÈME DE NOTATION  V11
 # ----------------------------------------------------------------
 def compute_score(flip_type, candles_ago,
@@ -325,10 +434,9 @@ def compute_score(flip_type, candles_ago,
                   in_bull_fvg, in_bear_fvg, fvg_near_bull, fvg_near_bear,
                   adx_val, pdi_val, mdi_val, atr_val, atr_mean):
 
-    score        = 0
+    score = 0
     score_detail = {}
 
-    # ── TRIGGER HMA ──────────────────────────────────────────────
     if flip_type is not None and candles_ago is not None:
         mins = candles_ago * 15
         if   mins <= 15: pts = 30
@@ -343,55 +451,38 @@ def compute_score(flip_type, candles_ago,
     signal_is_bull = (flip_type == "BULL")
     signal_is_bear = (flip_type == "BEAR")
 
-    # ── MTF ALIGNMENT  (remplace Biais simple, 25 pts) ───────────
-    # Vérifie que le MTF dominant est dans la même direction que le signal
-    mtf_aligned = (
-        (signal_is_bull and mtf_dominant == "Bullish") or
-        (signal_is_bear and mtf_dominant == "Bearish")
-    )
+    mtf_aligned = ((signal_is_bull and mtf_dominant == "Bullish") or
+                   (signal_is_bear and mtf_dominant == "Bearish"))
     if mtf_aligned:
         if   mtf_pct >= 80: pts = 25
         elif mtf_pct >= 65: pts = 18
         elif mtf_pct >= 50: pts = 10
         else:               pts = 5
     else:
-        pts = 0   # contre-MTF = 0 pt (signal autorisé mais décoté)
+        pts = 0
     score += pts
     score_detail["MTF"] = pts
 
-    # ── ZONE D'INTÉRÊT  (15 pts) ─────────────────────────────────
     if signal_is_bull:
-        if zone_discount:   pts = 15
-        elif below_mid:     pts = 8
-        else:               pts = 0
+        pts = 15 if zone_discount else (8 if below_mid else 0)
     elif signal_is_bear:
-        if zone_premium:    pts = 15
-        elif above_mid:     pts = 8
-        else:               pts = 0
+        pts = 15 if zone_premium  else (8 if above_mid else 0)
     else:
         pts = 0
     score += pts
     score_detail["Zone"] = pts
 
-    # ── FVG M15  (15 pts) ─────────────────────────────────────────
     if signal_is_bull:
-        if in_bull_fvg:     pts = 15
-        elif fvg_near_bull: pts = 7
-        else:               pts = 0
+        pts = 15 if in_bull_fvg else (7 if fvg_near_bull else 0)
     elif signal_is_bear:
-        if in_bear_fvg:     pts = 15
-        elif fvg_near_bear: pts = 7
-        else:               pts = 0
+        pts = 15 if in_bear_fvg else (7 if fvg_near_bear else 0)
     else:
         pts = 0
     score += pts
     score_detail["FVG"] = pts
 
-    # ── ADX / MOMENTUM  (10 pts) ──────────────────────────────────
-    adx_dir_ok = (
-        (signal_is_bull and pdi_val > mdi_val) or
-        (signal_is_bear and mdi_val > pdi_val)
-    )
+    adx_dir_ok = ((signal_is_bull and pdi_val > mdi_val) or
+                  (signal_is_bear and mdi_val > pdi_val))
     if   adx_val > 25 and adx_dir_ok: pts = 10
     elif adx_val > 20 and adx_dir_ok: pts = 6
     elif adx_val > 20:                pts = 3
@@ -399,14 +490,12 @@ def compute_score(flip_type, candles_ago,
     score += pts
     score_detail["ADX"] = pts
 
-    # ── ATR  (5 pts) ──────────────────────────────────────────────
-    if   atr_val >= atr_mean:         pts = 5
-    elif atr_val >= atr_mean * 0.5:   pts = 3
-    else:                             pts = 0
+    if   atr_val >= atr_mean:       pts = 5
+    elif atr_val >= atr_mean * 0.5: pts = 3
+    else:                           pts = 0
     score += pts
     score_detail["ATR"] = pts
 
-    # ── GRADE ─────────────────────────────────────────────────────
     if   score >= 85: grade = "A+"
     elif score >= 70: grade = "A"
     elif score >= 55: grade = "B+"
@@ -419,7 +508,7 @@ def compute_score(flip_type, candles_ago,
 # ----------------------------------------------------------------
 #  FLIP HMA
 # ----------------------------------------------------------------
-def find_last_hma_flip(hma_series, max_lookback=10):
+def find_last_hma_flip(hma_series, max_lookback=20):
     colors = []
     for i in range(len(hma_series) - 1,
                    max(len(hma_series) - max_lookback - 2, 1), -1):
@@ -428,41 +517,13 @@ def find_last_hma_flip(hma_series, max_lookback=10):
         if pd.isna(v_curr) or pd.isna(v_prev):
             continue
         colors.append((i, "GREEN" if v_curr > v_prev else "RED"))
-
     for j in range(len(colors) - 1):
         idx_curr, col_curr = colors[j]
         _,        col_prev = colors[j + 1]
         if col_curr != col_prev:
             candles_ago = (len(hma_series) - 1) - idx_curr
             return ("BULL" if col_curr == "GREEN" else "BEAR"), candles_ago
-
     return None, None
-
-
-# ----------------------------------------------------------------
-#  FVG M15
-# ----------------------------------------------------------------
-def detect_fvg(df, price, lookback=80):
-    # FIX: :-1 excluait la dernière bougie — un FVG récent n'était jamais détecté
-    sub = df.iloc[-(lookback + 3):]
-    bull_fvgs, bear_fvgs = [], []
-
-    for i in range(2, len(sub)):
-        lo = sub['high'].iloc[i - 2];  hi = sub['low'].iloc[i]
-        if hi > lo: bull_fvgs.append((lo, hi))
-
-        lo2 = sub['high'].iloc[i];  hi2 = sub['low'].iloc[i - 2]
-        if hi2 > lo2: bear_fvgs.append((lo2, hi2))
-
-    bull_fvgs.sort(key=lambda x: abs(price - (x[0] + x[1]) / 2))
-    bear_fvgs.sort(key=lambda x: abs(price - (x[0] + x[1]) / 2))
-
-    in_bull = any(lo <= price <= hi  for lo, hi in bull_fvgs)
-    in_bear = any(lo <= price <= hi  for lo, hi in bear_fvgs)
-
-    return (in_bull, in_bear,
-            bull_fvgs[0] if bull_fvgs else None,
-            bear_fvgs[0] if bear_fvgs else None)
 
 
 # ----------------------------------------------------------------
@@ -479,13 +540,11 @@ def fetch_oanda_data(client, instrument, granularity, count):
                 params={"count": count, "granularity": granularity}
             )
             client.request(r)
-
             if not isinstance(r.response, dict) or "candles" not in r.response:
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY * attempt)
                     continue
                 return pd.DataFrame(), "Réponse inattendue"
-
             rows = [
                 {"time":  pd.to_datetime(c["time"]),
                  "open":  float(c["mid"]["o"]),
@@ -494,21 +553,16 @@ def fetch_oanda_data(client, instrument, granularity, count):
                  "close": float(c["mid"]["c"])}
                 for c in r.response["candles"] if c.get("complete")
             ]
-
             if not rows:
                 return pd.DataFrame(), "Aucune bougie complète"
-
             df = pd.DataFrame(rows).set_index("time")
             if df.index.tz is None:
                 df.index = df.index.tz_localize("UTC")
             return df, None
-
         except Exception as e:
             err_str = str(e)
             if "401" in err_str or "Unauthorized" in err_str:
                 return pd.DataFrame(), "TOKEN_INVALID"
-            elif "403" in err_str:
-                return pd.DataFrame(), "TOKEN_FORBIDDEN"
             elif "429" in err_str:
                 time.sleep(RETRY_DELAY * attempt * 3)
             elif "500" in err_str or "503" in err_str:
@@ -517,13 +571,9 @@ def fetch_oanda_data(client, instrument, granularity, count):
                     continue
             if attempt == MAX_RETRIES:
                 return pd.DataFrame(), str(e)
-
     return pd.DataFrame(), "MAX_RETRIES"
 
 
-# ----------------------------------------------------------------
-#  TEST CONNEXION
-# ----------------------------------------------------------------
 def test_oanda_connection(client, account_id=None):
     try:
         if account_id:
@@ -534,11 +584,11 @@ def test_oanda_connection(client, account_id=None):
         if account_id:
             acc      = r.response.get("account", {})
             currency = acc.get("currency", "?")
-            balance  = acc.get("balance", "?")
+            balance  = acc.get("balance",  "?")
             return True, f"✅ Connecté — compte `{account_id}` · {currency} {balance}"
         else:
             accs = r.response.get("accounts", [])
-            ids  = [a.get("id","?") for a in accs]
+            ids  = [a.get("id", "?") for a in accs]
             return True, f"✅ Connecté — {len(ids)} compte(s)"
     except Exception as e:
         err = str(e)
@@ -548,9 +598,32 @@ def test_oanda_connection(client, account_id=None):
 
 
 # ----------------------------------------------------------------
+#  FETCH STRENGTH  (H1 sur paires strength)
+# ----------------------------------------------------------------
+def fetch_strength_data(client) -> dict:
+    """
+    Fetch H1 en parallèle pour le calcul du Currency Strength.
+    Retourne {pair: df} — silencieux sur les erreurs.
+    """
+    dfs = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {
+            ex.submit(fetch_oanda_data, client, pair, "H1", 100): pair
+            for pair in STRENGTH_PAIRS
+        }
+        for fut in as_completed(futures):
+            pair = futures[fut]
+            df, err = fut.result()
+            if not df.empty:
+                dfs[pair] = df
+    return dfs
+
+
+# ----------------------------------------------------------------
 #  ANALYSE PRINCIPALE
 # ----------------------------------------------------------------
-def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
+def analyze_asset(client, ticker, freshness_limit_min=30,
+                  strength_scores=None, debug_log=None):
 
     def _reject(reason):
         if debug_log is not None:
@@ -558,9 +631,6 @@ def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
         return None
 
     try:
-        # ── FETCH PARALLÈLE  ─────────────────────────────────────
-        # FIX: fetches parallèles par actif (6 threads) → ~5x plus rapide
-        # FIX: W=250 bougies → SMA200 calculable. M=80 → EMA50 calculable.
         fetch_specs = [
             ("M15", 400), ("H1", 200), ("D", 300),
             ("H4", 300),  ("W", 250),  ("M", 80),
@@ -582,19 +652,15 @@ def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
         df_w,   _       = fetch_results["W"]
         df_mo,  _       = fetch_results["M"]
 
-        if df_m15.empty:
-            return _reject(f"FETCH_M15: {err_m15}")
-        if df_d.empty:
-            return _reject(f"FETCH_D: {err_d}")
+        if df_m15.empty: return _reject(f"FETCH_M15: {err_m15}")
+        if df_d.empty:   return _reject(f"FETCH_D: {err_d}")
 
         price = df_m15['close'].iloc[-1]
 
-        # ── DAILY BIAS V2 (3 facteurs Pine) ─────────────────────
         bias, bias_detail = get_daily_bias_v2(df_d)
         bias_bull = bias in ("BULLISH", "STRONG BULLISH")
         bias_bear = bias in ("BEARISH", "STRONG BEARISH")
 
-        # ── MTF ANALYSIS ─────────────────────────────────────────
         dfs_mtf = {
             "M":   df_mo  if not (df_mo  is None or (hasattr(df_mo,  'empty') and df_mo.empty))  else None,
             "W":   df_w   if not (df_w   is None or (hasattr(df_w,   'empty') and df_w.empty))   else None,
@@ -605,20 +671,17 @@ def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
         }
         mtf_pct, mtf_dominant, mtf_details = compute_mtf_analysis(dfs_mtf)
 
-        # ── HMA 20 FLIP M15 ──────────────────────────────────────
         hma = QuantEngine.hma(df_m15['close'], 20)
         if hma.isna().iloc[-5:].any():
             return _reject("HMA_NAN")
 
-        flip_type, candles_ago = find_last_hma_flip(hma, max_lookback=20)  # FIX: 300 min coverage
+        flip_type, candles_ago = find_last_hma_flip(hma, max_lookback=20)
         if flip_type is None:
             return _reject("NO_HMA_FLIP")
 
-        # FIX: NEUTRAL = rejet dur — pas de direction institutionnelle claire
         if bias == "NEUTRAL":
             return _reject("BIAS_NEUTRAL")
 
-        # Alignement biais / flip
         if   (flip_type == "BULL" and bias_bull) or (flip_type == "BEAR" and bias_bear):
             bias_alignment = "ALIGNED"
         else:
@@ -628,49 +691,39 @@ def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
         freshness_str = f"⚡ {mins_ago} min" if mins_ago <= freshness_limit_min else f"⏳ {mins_ago} min"
         signal_fresh  = mins_ago <= freshness_limit_min
 
-        # ── GATE : PRIX DU BON CÔTÉ DE LA HMA ───────────────────
         hma_now = hma.iloc[-1]
         if flip_type == "BULL" and price <= hma_now:
             return _reject("PRICE_BELOW_HMA_ON_BULL")
         if flip_type == "BEAR" and price >= hma_now:
             return _reject("PRICE_ABOVE_HMA_ON_BEAR")
 
-        # ── FVG ───────────────────────────────────────────────────
         atr_m15  = QuantEngine.atr(df_m15, 14)
         atr_val  = atr_m15.iloc[-1]
         atr_mean = atr_m15.iloc[-50:].mean()
 
+        # FVG LuxAlgo exact
         in_bull_fvg, in_bear_fvg, nb_fvg, nr_fvg = detect_fvg(df_m15, price, lookback=80)
-
-        # FIX: seuil ATR*1.0 — ATR*2 était trop permissif (ex: 4-6$ sur XAU)
-        fvg_near_bull = (nb_fvg is not None
-                         and abs(price - (nb_fvg[0] + nb_fvg[1]) / 2) < atr_val * 1.0)
-        fvg_near_bear = (nr_fvg is not None
-                         and abs(price - (nr_fvg[0] + nr_fvg[1]) / 2) < atr_val * 1.0)
+        fvg_near_bull = (nb_fvg is not None and
+                         abs(price - (nb_fvg[0] + nb_fvg[1]) / 2) < atr_val * 1.0)
+        fvg_near_bear = (nr_fvg is not None and
+                         abs(price - (nr_fvg[0] + nr_fvg[1]) / 2) < atr_val * 1.0)
 
         if flip_type == "BULL" and not (in_bull_fvg or fvg_near_bull):
             return _reject("NO_BULL_FVG")
         if flip_type == "BEAR" and not (in_bear_fvg or fvg_near_bear):
             return _reject("NO_BEAR_FVG")
 
-        # ── ZONE PDH/PDL ─────────────────────────────────────────
-        # FIX: complete=True → iloc[-1] = hier (dernière bougie complète)
-        # iloc[-2] était avant-hier — niveaux décalés d'un jour
         pdh = df_d['high'].iloc[-1]
         pdl = df_d['low'].iloc[-1]
 
-        ny_tz     = pytz.timezone('America/New_York')
-        df_ny     = df_m15.copy()
+        ny_tz   = pytz.timezone('America/New_York')
+        df_ny   = df_m15.copy()
         df_ny.index = df_ny.index.tz_convert(ny_tz)
-        today_ny  = datetime.now(ny_tz).date()
-        mask      = ((df_ny.index.date == today_ny) &
-                     (df_ny.index.hour == 0) & (df_ny.index.minute == 0))
-        mid_c     = df_ny[mask]
-        # FIX: fallback = milieu PDL/PDH du jour précédent (pas iloc[0] du dataset)
-        if not mid_c.empty:
-            m_open = mid_c['open'].iloc[0]
-        else:
-            m_open = (pdh + pdl) / 2
+        today_ny = datetime.now(ny_tz).date()
+        mask     = ((df_ny.index.date == today_ny) &
+                    (df_ny.index.hour == 0) & (df_ny.index.minute == 0))
+        mid_c    = df_ny[mask]
+        m_open   = mid_c['open'].iloc[0] if not mid_c.empty else (pdh + pdl) / 2
 
         atr_d         = QuantEngine.atr(df_d, 14).iloc[-1]
         below_mid     = price < m_open
@@ -682,42 +735,51 @@ def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
         zone_label    = ("DISCOUNT" if zone_discount else
                          "PREMIUM"  if zone_premium  else "NEUTRE")
 
-        # ── ADX H1 ───────────────────────────────────────────────
-        df_adx_src          = df_h1 if not (df_h1 is None or (hasattr(df_h1,'empty') and df_h1.empty)) and len(df_h1) >= 20 else df_m15
+        df_adx_src           = df_h1 if not (df_h1 is None or (hasattr(df_h1, 'empty') and df_h1.empty)) and len(df_h1) >= 20 else df_m15
         adx_s, pdi_s, mdi_s = QuantEngine.adx(df_adx_src, 14)
         adx_val = round(adx_s.iloc[-1], 1)
         pdi_val = round(pdi_s.iloc[-1], 1)
         mdi_val = round(mdi_s.iloc[-1], 1)
 
-        # ── SCORE ─────────────────────────────────────────────────
         score, grade, score_detail = compute_score(
-            flip_type, candles_ago,
-            mtf_pct, mtf_dominant,
-            zone_discount, zone_premium,
-            near_pdl, near_pdh, below_mid, above_mid,
-            in_bull_fvg, in_bear_fvg,
-            fvg_near_bull, fvg_near_bear,
-            adx_val, pdi_val, mdi_val,
-            atr_val, atr_mean
+            flip_type, candles_ago, mtf_pct, mtf_dominant,
+            zone_discount, zone_premium, near_pdl, near_pdh,
+            below_mid, above_mid,
+            in_bull_fvg, in_bear_fvg, fvg_near_bull, fvg_near_bear,
+            adx_val, pdi_val, mdi_val, atr_val, atr_mean
         )
+
+        # ── Strength Δ ────────────────────────────────────────────
+        strength_delta = None
+        if strength_scores:
+            strength_delta = get_strength_delta(ticker, strength_scores)
+
+        # ── Momentum Score ────────────────────────────────────────
+        signal_is_bull = (flip_type == "BULL")
+        _df_h4 = df_4h if not (df_4h is None or (hasattr(df_4h, 'empty') and df_4h.empty)) else None
+        _df_h1 = df_h1 if not (df_h1 is None or (hasattr(df_h1, 'empty') and df_h1.empty)) else None
+        momentum = compute_momentum_score(_df_h4, _df_h1, df_m15, signal_is_bull)
 
         sig = (("▲ LONG"  if flip_type == "BULL" else "▼ SHORT")
                if signal_fresh else
                ("LONG (expiré)" if flip_type == "BULL" else "SHORT (expiré)"))
 
         return {
-            "Actif + Note":  ticker,
-            "Signal":        sig,
-            "Fraîcheur":     freshness_str,
-            "Score /100":    score,
-            "Grade":         grade,
-            "Biais Daily":   bias,
-            "Alignement":    bias_alignment,
-            "Zone":          zone_label,
-            "ADX H1":        adx_val,
-            "MTF Pct":       mtf_pct,
-            "MTF Dom":       mtf_dominant,
-            "MTF Details":   mtf_details,
+            "Fraîcheur":      freshness_str,
+            "Actif + Note":   ticker,
+            "Signal":         sig,
+            "Biais Daily":    bias,
+            "Alignement":     bias_alignment,
+            "Zone":           zone_label,
+            "Score /100":     score,
+            "Grade":          grade,
+            "ADX H1":         adx_val,
+            "MTF Pct":        mtf_pct,
+            "MTF Dom":        mtf_dominant,
+            "MTF Details":    mtf_details,
+            "Strength Δ":     strength_delta,
+            "Momentum":       momentum,
+            "signal_is_bull": signal_is_bull,
         }
 
     except Exception as e:
@@ -731,7 +793,7 @@ def analyze_asset(client, ticker, freshness_limit_min=30, debug_log=None):
 # ----------------------------------------------------------------
 def main():
     st.set_page_config(
-        page_title="BLUESTAR SNIPER V13",
+        page_title="BLUESTAR SNIPER V14",
         layout="wide",
         initial_sidebar_state="collapsed"
     )
@@ -739,11 +801,9 @@ def main():
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;600;700&display=swap');
-
     html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
     .stApp { background: #0e0e14; }
     h1 { font-family: 'IBM Plex Mono', monospace !important; letter-spacing: .04em; }
-
     .stButton > button {
         background: #141420 !important; color: #a0b4cc !important;
         border: 1px solid #2a3448 !important;
@@ -768,7 +828,6 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    # ── HEADER ────────────────────────────────────────────────────
     kz_now  = get_current_killzone()
     kz_html = (f'<span style="font-size:12px;font-family:\'IBM Plex Mono\',monospace;'
                f'color:#5a9e7a;letter-spacing:.08em;margin-left:14px">'
@@ -780,17 +839,16 @@ def main():
       <span style="font-size:36px">🎯</span>
       <div>
         <h1 style="margin:0;font-size:28px;color:#e8e8f8">
-          BLUESTAR SNIPER V11 {kz_html}
+          BLUESTAR SNIPER V14 {kz_html}
         </h1>
         <p style="margin:0;color:#4a4a7a;font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.1em">
-          HMA 20 M15 · MTF INSTITUTIONAL · KILLZONE · SCORE /100 · ICT / SMC ENGINE
+          HMA 20 M15 · MTF INSTITUTIONAL · STRENGTH Δ · MOMENTUM 🔥 · LUXALGO FVG
         </p>
       </div>
     </div>
     <hr>
     """, unsafe_allow_html=True)
 
-    # ── SECRETS ───────────────────────────────────────────────────
     missing = [k for k in ("OANDA_ACCESS_TOKEN", "OANDA_ACCOUNT_ID") if k not in st.secrets]
     if missing:
         st.error(f"🔑 **Secret(s) manquant(s) :** `{'`, `'.join(missing)}`")
@@ -800,7 +858,6 @@ def main():
     ACCOUNT_ID   = st.secrets["OANDA_ACCOUNT_ID"]
     env          = "practice"
 
-    # ── CONTRÔLES ─────────────────────────────────────────────────
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         freshness  = st.selectbox("Fraîcheur max du signal (min)", [15, 30, 45, 60], index=1)
@@ -809,29 +866,23 @@ def main():
     with col3:
         show_debug = st.toggle("🐛 Debug", value=False)
 
-    with st.expander("📘 Grille de notation V13"):
+    with st.expander("📘 Grille de notation V14"):
         st.markdown("""
 | Critère | Max | Détail |
 |---|---|---|
 | **Trigger HMA flip** | 30 pts | ≤15 min = 30 · ≤30 min = 20 · ≤45 min = 10 · >45 min = 0 |
-| **MTF Alignment** | 25 pts | ≥80% aligné = 25 · ≥65% = 18 · ≥50% = 10 · contre-MTF = 0 |
-| **Zone d'intérêt** | 15 pts | Discount+PDL ou Premium+PDH = 15 · Zone seule = 8 · Hors zone = 0 |
-| **FVG M15** | 15 pts | Dans le FVG = 15 · FVG proche = 7 · Absent = 0 |
-| **ADX momentum** | 10 pts | ADX>25+DI ok = 10 · ADX>20+DI ok = 6 · ADX>20 seul = 3 |
-| **ATR actif** | 5 pts | ≥ moyenne = 5 · ≥ 50% = 3 · Plat = 0 |
+| **MTF Alignment** | 25 pts | ≥80% = 25 · ≥65% = 18 · ≥50% = 10 · contre-MTF = 0 |
+| **Zone d'intérêt** | 15 pts | Discount+PDL ou Premium+PDH = 15 · Zone seule = 8 |
+| **FVG M15** | 15 pts | LuxAlgo exact (mitigation + seuil auto) |
+| **ADX momentum** | 10 pts | ADX>25+DI ok = 10 · ADX>20+DI ok = 6 |
+| **ATR actif** | 5 pts | ≥ moyenne = 5 · ≥ 50% = 3 |
 
-| Grade | Score | Signal |
-|---|---|---|
-| 💎 **A+** | 85-100 | MTF aligné + HMA frais + zone + FVG = trader |
-| 🥇 **A** | 70-84 | Très bon — 1 élément mineur manque |
-| 🥈 **B+** | 55-69 | En formation — surveiller |
-| 🔵 **B** | 40-54 | Partiel — attendre confirmation |
-| ⚪ **C** | < 40 | Faible — ignorer |
-
-**MTF Weights :** M=4.0 · W=3.5 · D=3.0 · 4H=2.5 · 1H=2.0 · 15m=1.5
+| Colonne | Description |
+|---|---|
+| **Strength Δ** | Force relative base vs quote sur H1 · >0 = base forte · <0 = quote forte |
+| **🔥 Momentum** | ADX H4 ≥ 25 aligné (+1) · ADX H1 ≥ 25 aligné (+1) · ATR M15 expansif (+1) |
         """)
 
-    # ── LANCER ────────────────────────────────────────────────────
     run = st.button("🚀  LANCER LE SCANNER", use_container_width=True)
 
     if not run:
@@ -867,12 +918,21 @@ def main():
     status    = st.empty()
     t_start   = time.time()
 
+    # ── Strength pre-fetch (une seule fois pour tous les actifs)
+    strength_scores = {}
+    with st.spinner("Calcul Currency Strength H1…"):
+        dfs_h1 = fetch_strength_data(client)
+        strength_scores = compute_currency_strength(dfs_h1)
+
     with st.spinner("Analyse MTF en cours…"):
         for i, ticker in enumerate(assets):
-            status.caption(f"⏳ Analyse MTF {ticker}… ({i+1}/{len(assets)})")
-            res = analyze_asset(client, ticker,
-                                freshness_limit_min=freshness,
-                                debug_log=debug_log)
+            status.caption(f"⏳ {ticker}… ({i+1}/{len(assets)})")
+            res = analyze_asset(
+                client, ticker,
+                freshness_limit_min=freshness,
+                strength_scores=strength_scores,
+                debug_log=debug_log
+            )
             if res:
                 results.append(res)
             time.sleep(0.15)
@@ -882,7 +942,6 @@ def main():
     status.empty()
     progress.empty()
 
-    # ── DEBUG ─────────────────────────────────────────────────────
     if show_debug:
         with st.expander(f"🐛 Debug — {len(debug_log)} rejetés en {elapsed}s"):
             if debug_log:
@@ -906,40 +965,41 @@ def main():
 
     df = pd.DataFrame(results)
 
-    # ── FILTRE GRADE ──────────────────────────────────────────────
     grade_order = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1}
     min_map     = {"Tous": 0, "B": 2, "B+": 3, "A": 4, "A+": 5}
     min_val     = min_map[min_grade]
     df = df[df["Grade"].map(grade_order) >= min_val]
 
     if df.empty:
-        st.info("Aucun signal avec ces filtres — élargis les critères.")
+        st.info("Aucun signal avec ces filtres.")
         return
 
-    # ── TRI ───────────────────────────────────────────────────────
     def sort_key(row):
         fresh = 1 if "⚡" in str(row["Fraîcheur"]) else 0
         g     = grade_order.get(row["Grade"], 0)
         s     = row["Score /100"]
         m     = row["MTF Pct"]
-        return (-fresh, -g, -s, -m)
+        mom   = row.get("Momentum", 0)
+        return (-fresh, -g, -mom, -s, -m)
 
     df["_sk"] = df.apply(sort_key, axis=1)
     df = df.sort_values("_sk").drop(columns=["_sk"]).reset_index(drop=True)
 
-    # ── MÉTRIQUES RAPIDES ─────────────────────────────────────────
-    a_plus   = len(df[(df["Grade"] == "A+") & df["Fraîcheur"].str.contains("⚡", na=False)])
-    a_grade  = len(df[(df["Grade"] == "A")  & df["Fraîcheur"].str.contains("⚡", na=False)])
-    b_watch  = len(df[df["Grade"].isin(["B+","B"]) & df["Fraîcheur"].str.contains("⚡", na=False)])
-    longs    = len(df[df["Signal"].str.contains("LONG",  na=False) & ~df["Signal"].str.contains("expiré")])
-    shorts   = len(df[df["Signal"].str.contains("SHORT", na=False) & ~df["Signal"].str.contains("expiré")])
+    # Métriques
+    a_plus  = len(df[(df["Grade"] == "A+") & df["Fraîcheur"].str.contains("⚡", na=False)])
+    a_grade = len(df[(df["Grade"] == "A")  & df["Fraîcheur"].str.contains("⚡", na=False)])
+    b_watch = len(df[df["Grade"].isin(["B+","B"]) & df["Fraîcheur"].str.contains("⚡", na=False)])
+    longs   = len(df[df["Signal"].str.contains("LONG",  na=False) & ~df["Signal"].str.contains("expiré")])
+    shorts  = len(df[df["Signal"].str.contains("SHORT", na=False) & ~df["Signal"].str.contains("expiré")])
+    max_mom = len(df[df.get("Momentum", 0) == 3]) if "Momentum" in df.columns else 0
 
-    mc = st.columns(5)
+    mc = st.columns(6)
     with mc[0]: st.metric("💎 Signaux A+", a_plus)
     with mc[1]: st.metric("🥇 Signaux A",  a_grade)
     with mc[2]: st.metric("👀 Watch B/B+", b_watch)
     with mc[3]: st.metric("▲ LONG actifs", longs)
     with mc[4]: st.metric("▼ SHORT actifs", shorts)
+    with mc[5]: st.metric("🔥🔥🔥 Momentum max", max_mom)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -967,19 +1027,19 @@ def main():
             return "color:#404055"
         except: return "color:#333"
 
-    def bias_daily_style(b):
-        if "STRONG BULLISH" in b: return "color:#4d9467;font-weight:700;font-size:14px"
-        if "BULLISH"        in b: return "color:#3d7055;font-weight:600;font-size:14px"
-        if "STRONG BEARISH" in b: return "color:#a04848;font-weight:700;font-size:14px"
-        if "BEARISH"        in b: return "color:#7a3535;font-weight:600;font-size:14px"
-        return "color:#404055;font-size:14px"
-
     def bias_daily_label(b):
         if b == "STRONG BULLISH": return "▲▲ STRONG BULL"
         if b == "BULLISH":        return "▲ BULL"
         if b == "STRONG BEARISH": return "▼▼ STRONG BEAR"
         if b == "BEARISH":        return "▼ BEAR"
         return "— NEUTRAL"
+
+    def bias_daily_style(b):
+        if "STRONG BULLISH" in b: return "color:#4d9467;font-weight:700;font-size:14px"
+        if "BULLISH"        in b: return "color:#3d7055;font-weight:600;font-size:14px"
+        if "STRONG BEARISH" in b: return "color:#a04848;font-weight:700;font-size:14px"
+        if "BEARISH"        in b: return "color:#7a3535;font-weight:600;font-size:14px"
+        return "color:#404055;font-size:14px"
 
     def zone_style(z):
         if "DISCOUNT" in z: return "color:#4a7898;font-weight:600"
@@ -988,17 +1048,6 @@ def main():
 
     def fresh_style(f):
         return "color:#9a7820;font-weight:700" if "⚡" in f else "color:#303040"
-
-    def mtf_style(pct, dominant):
-        bull = dominant == "Bullish"
-        bear = dominant == "Bearish"
-        if pct >= 70:
-            c = "#5a9e7a" if bull else ("#9e4a3a" if bear else "#606080")
-            return f"color:{c};font-weight:700"
-        if pct >= 50:
-            c = "#4a8060" if bull else ("#7e3a2a" if bear else "#505060")
-            return f"color:{c};font-weight:600"
-        return "color:#404055"
 
     def score_bar(score):
         color = "#5a9e7a" if score >= 70 else "#9a7820" if score >= 40 else "#9e4a3a"
@@ -1010,17 +1059,22 @@ def main():
           <span style="color:{color};font-weight:700;font-size:15px">{score}</span>
         </div>"""
 
-    def mtf_bar(pct, dominant):
-        bull = dominant == "Bullish"
-        bear = dominant == "Bearish"
-        bar_c = "#5a9e7a" if bull else ("#9e4a3a" if bear else "#606080")
-        txt_c = bar_c
-        return f"""<div style="display:flex;align-items:center;gap:8px">
-          <div style="width:44px;height:4px;background:#1a1a22;border-radius:2px;overflow:hidden">
-            <div style="width:{pct}%;height:100%;background:{bar_c};border-radius:2px"></div>
-          </div>
-          <span style="color:{txt_c};font-weight:700;font-size:12px">{pct}%</span>
-        </div>"""
+    def strength_cell(delta):
+        if delta is None:
+            return '<span style="color:#303040">—</span>'
+        color = "#5a9e7a" if delta >= 1.5 else ("#9e4a3a" if delta <= -1.5 else "#9a7820")
+        sign  = "+" if delta > 0 else ""
+        return f'<span style="color:{color};font-weight:700;font-family:\'IBM Plex Mono\',monospace">{sign}{delta:.1f}</span>'
+
+    def momentum_cell(score):
+        flames = momentum_flames(score)
+        if score == 3:
+            return f'<span style="font-size:14px">{flames}</span>'
+        if score == 2:
+            return f'<span style="font-size:14px">{flames}</span>'
+        if score == 1:
+            return f'<span style="font-size:13px;opacity:.7">{flames}</span>'
+        return '<span style="color:#252535">—</span>'
 
     html = """
 <style>
@@ -1046,8 +1100,6 @@ def main():
   background:rgba(90,158,122,0.12);color:#5a9e7a;
   border:1px solid rgba(90,158,122,0.3);margin-left:8px;vertical-align:middle
 }
-.mtf-row{display:flex;flex-direction:column;gap:3px;min-width:80px}
-.mtf-tf{font-size:10px;color:#3a3a5a;letter-spacing:.06em}
 </style>
 <div class="sc-wrap"><table class="sc-tbl">
 <thead><tr>
@@ -1058,41 +1110,43 @@ def main():
   <th>Zone</th>
   <th>Score /100</th>
   <th>ADX H1</th>
+  <th>Strength Δ</th>
+  <th>🔥 Force</th>
 </tr></thead><tbody>
 """
     active_kz = get_current_killzone()
 
     for _, row in df.iterrows():
-        grade     = str(row.get("Grade","C"))
-        fresh     = "⚡" in str(row.get("Fraîcheur",""))
+        grade     = str(row.get("Grade", "C"))
+        fresh     = "⚡" in str(row.get("Fraîcheur", ""))
         gs        = GRADE_STYLE.get(grade, GRADE_STYLE["C"])
         score     = int(row.get("Score /100", 0))
-        ticker    = str(row.get("Actif + Note","")).split("  ")[0].strip()
-        sig       = str(row.get("Signal","—"))
-        adx_v     = str(row.get("ADX H1","—"))
-        bias      = str(row.get("Biais Daily","—"))
-        alignment = str(row.get("Alignement","ALIGNED"))
-        zone      = str(row.get("Zone","—"))
-        fresh_str = str(row.get("Fraîcheur","—"))
+        ticker    = str(row.get("Actif + Note", "")).split("  ")[0].strip()
+        sig       = str(row.get("Signal", "—"))
+        adx_v     = str(row.get("ADX H1", "—"))
+        bias      = str(row.get("Biais Daily", "—"))
+        alignment = str(row.get("Alignement", "ALIGNED"))
+        zone      = str(row.get("Zone", "—"))
+        fresh_str = str(row.get("Fraîcheur", "—"))
+        sdelta    = row.get("Strength Δ")
+        momentum  = int(row.get("Momentum", 0))
+
         bull_bias  = "BULLISH" in bias
         bias_icon  = "▲" if bull_bias else "▼"
         bias_lbl   = ("STRONG BULL" if bias == "STRONG BULLISH"
                       else "BULL"        if bias == "BULLISH"
                       else "STRONG BEAR" if bias == "STRONG BEARISH"
-                      else "BEAR"        if "BEAR" in bias
-                      else "NEUTRAL")
+                      else "BEAR"        if "BEAR" in bias else "NEUTRAL")
         bias_color = "#5a9e7a" if bull_bias else ("#9e4a3a" if "BEAR" in bias else "#606080")
 
         align_tag = ""
         if alignment == "COUNTER":
-            align_tag = '<span style="font-size:10px;color:#9e4a3a;font-weight:700;margin-left:6px;letter-spacing:.05em">⚠ COUNTER</span>'
-        elif alignment == "NEUTRAL":
-            align_tag = '<span style="font-size:10px;color:#606080;font-weight:600;margin-left:6px;letter-spacing:.05em">~ NEUTRAL</span>'
+            align_tag = '<span style="font-size:10px;color:#9e4a3a;font-weight:700;margin-left:6px">⚠ COUNTER</span>'
 
-        # Badge killzone sur le signal
-        kz_tag = f'<span class="kz-badge">{killzone_badge(active_kz)}</span>' if active_kz and fresh else ""
+        kz_tag = (f'<span class="kz-badge">{killzone_badge(active_kz)}</span>'
+                  if active_kz and fresh else "")
 
-        row_bg = gs["bg"] if fresh and grade in ("A+","A") else "transparent"
+        row_bg = gs["bg"] if fresh and grade in ("A+", "A") else "transparent"
 
         html += f"""<tr style="background:{row_bg}">
   <td style="{fresh_style(fresh_str)}">{fresh_str}</td>
@@ -1107,6 +1161,8 @@ def main():
   <td style="{zone_style(zone)}">{zone}</td>
   <td>{score_bar(score)}</td>
   <td style="{adx_style(adx_v)}">{adx_v}</td>
+  <td style="text-align:center">{strength_cell(sdelta)}</td>
+  <td style="text-align:center">{momentum_cell(momentum)}</td>
 </tr>"""
 
     html += "</tbody></table></div>"
