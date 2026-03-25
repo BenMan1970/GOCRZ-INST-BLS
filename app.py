@@ -16,6 +16,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 #  🔴  FVG : traduction exacte LuxAlgo (close[i-1], mitigation, seuil auto)
 #  🟠  Strength Δ : force relative base/quote sur H1 (0-10)
 #  🟠  Momentum Score : ADX H4 + ADX H1 aligné + ATR expansion (0-3 🔥)
+#
+#  FIXES UI :
+#  ✅  Colonne ACTIF : suppression badge tendance (redondant avec Biais Daily)
+#  ✅  En-têtes tableau : contraste amélioré
+#  ✅  Zone DISCOUNT/PREMIUM : référence D1 d'hier (bougie complète)
+#       Ancien : df_d['high'].iloc[-1]  → bougie courante incomplète intraday
+#       Corrigé: df_d['high'].iloc[-2]  → bougie d'hier complète (aligné V24)
 # ================================================================
 
 
@@ -213,6 +220,7 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
       4. Close J-1 vs midpoint J-1         → 1 vote
       5. Pente EMA50 D1 / ATR D            → 1 vote  ← ajout quant
          Mesure si la tendance accélère ou se fatigue.
+         Normalisé par ATR pour être indépendant de la magnitude du prix.
          Un biais bull avec EMA50 qui s'aplatit = signal de faiblesse.
          Normalisé par ATR pour être indépendant de la magnitude du prix.
 
@@ -290,10 +298,6 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
         detail["Close J-1"] = "NEUTRAL"
 
     # ── Facteur 5 : Pente EMA50 D1 normalisée ATR ────────────────
-    # Mesure la vélocité institutionnelle sur 5 bougies D1 (~1 semaine).
-    # Normalisée par ATR D pour être indépendante de la magnitude du prix.
-    # Seuil : > +0.05 ATR = tendance qui accélère (bull)
-    #         < -0.05 ATR = tendance qui décélère  (bear)
     slope_vote = "NEUTRAL"
     try:
         if len(ema50_series) >= 6:
@@ -311,14 +315,12 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
                     slope_vote = "BULLISH"; votes_bull += 1
                 elif slope_norm < -0.05:
                     slope_vote = "BEARISH"; votes_bear += 1
-                # Entre ±0.05 : EMA50 trop plate → neutre, on ne vote pas
             detail["EMA50 Slope"] = f"{slope_vote} ({slope_norm:+.3f})"
     except Exception:
         detail["EMA50 Slope"] = "NEUTRAL"
 
     detail["Votes"] = f"{votes_bull}B / {votes_bear}S"
 
-    # Résolution mise à jour pour 6 votes max
     if   votes_bull >= 5: bias = "STRONG BULLISH"
     elif votes_bull >= 3: bias = "BULLISH"
     elif votes_bear >= 5: bias = "STRONG BEARISH"
@@ -332,16 +334,6 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
 #  FVG M15  —  traduction exacte "Fair Value Gap [LuxAlgo]"
 # ----------------------------------------------------------------
 def detect_fvg(df, price, lookback=80):
-    """
-    LuxAlgo exact :
-      Bull : low[i] > high[i-2]  ET  close[i-1] > high[i-2]
-             ET  (low[i]-high[i-2])/high[i-2] > seuil_auto
-      Bear : high[i] < low[i-2]  ET  close[i-1] < low[i-2]
-             ET  (low[i-2]-high[i])/high[i]   > seuil_auto
-    Seuil auto : ta.cum((high-low)/low) / bar_index × 2
-    Mitigation : bull supprimé quand close < bottom
-                 bear supprimé quand close > top
-    """
     sub = df.iloc[-(lookback + 3):].reset_index(drop=True)
     n   = len(sub)
     if n < 3:
@@ -395,11 +387,6 @@ STRENGTH_PAIRS = [
 ]
 
 def compute_currency_strength(dfs_h1: dict) -> dict:
-    """
-    Score de force relative par devise sur H1.
-    Retourne {currency: score_0_10}.
-    Logique : EMA9 > EMA21 > EMA50 + RSI > 50 = haussier pour la base.
-    """
     raw = {c: 0.0 for c in CURRENCIES}
     counts = {c: 0 for c in CURRENCIES}
 
@@ -419,7 +406,6 @@ def compute_currency_strength(dfs_h1: dict) -> dict:
         ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
         rsi_v = QuantEngine.rsi(close, 14).iloc[-1]
 
-        # Score directionnel : +1 bull, -1 bear, 0 neutre
         bullish = ema9 > ema21 > ema50 and rsi_v > 50
         bearish = ema9 < ema21 < ema50 and rsi_v < 50
         contrib = 1.0 if bullish else (-1.0 if bearish else 0.0)
@@ -429,7 +415,6 @@ def compute_currency_strength(dfs_h1: dict) -> dict:
         counts[base]  += 1
         counts[quote] += 1
 
-    # Normalisation 0-10
     scores = {}
     for c in CURRENCIES:
         if counts[c] > 0:
@@ -446,7 +431,6 @@ def compute_currency_strength(dfs_h1: dict) -> dict:
 
 
 def get_strength_delta(ticker: str, strength_scores: dict) -> float | None:
-    """Retourne diff base-quote sur 0-10, ou None si non disponible."""
     parts = ticker.split("_")
     if len(parts) != 2:
         return None
@@ -462,13 +446,6 @@ def get_strength_delta(ticker: str, strength_scores: dict) -> float | None:
 #  MOMENTUM SCORE  (ADX H4 + ADX H1 + ADX M15 — tous alignés)
 # ----------------------------------------------------------------
 def compute_momentum_score(df_h4, df_h1, df_m15, signal_is_bull: bool) -> int:
-    """
-    0-3 points :
-      +1 ADX H4  >= 25 ET DI aligné avec le signal
-      +1 ADX H1  >= 25 ET DI aligné avec le signal
-      +1 ADX M15 >= 25 ET DI aligné avec le signal
-    Les 3 TF confirment la même direction = momentum plein.
-    """
     score = 0
 
     try:
@@ -505,10 +482,6 @@ def compute_momentum_score(df_h4, df_h1, df_m15, signal_is_bull: bool) -> int:
 
 
 def momentum_bar(score: int, signal_is_bull: bool) -> str:
-    """
-    Barre de 3 segments — un par TF (H4 / H1 / M15).
-    Vert si aligné bull, rouge si aligné bear, gris si absent.
-    """
     color   = "#5a9e7a" if signal_is_bull else "#9e4a3a"
     filled  = f'background:{color};border-radius:2px'
     empty   = 'background:#1e1e2e;border-radius:2px'
@@ -706,10 +679,6 @@ def test_oanda_connection(client, account_id=None):
 #  FETCH STRENGTH  (H1 sur paires strength)
 # ----------------------------------------------------------------
 def fetch_strength_data(client) -> dict:
-    """
-    Fetch H1 en parallèle pour le calcul du Currency Strength.
-    Retourne {pair: df} — silencieux sur les erreurs.
-    """
     dfs = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {
@@ -762,7 +731,6 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
 
         price = df_m15['close'].iloc[-1]
 
-        # Prix M15 intraday passé au biais D1 (identique SniperBot)
         current_price_proxy = float(df_m15['close'].iloc[-1])
         bias, bias_detail = get_daily_bias_v2(df_d, current_price=current_price_proxy)
         bias_bull = bias in ("BULLISH", "STRONG BULLISH")
@@ -815,81 +783,87 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         fvg_near_bear = (nr_fvg is not None and
                          abs(price - (nr_fvg[0] + nr_fvg[1]) / 2) < atr_val * 1.0)
 
-        # FVG : score uniquement (15/7/0 pts) — pas de gate dure
-        # Le scanner est un filtre, pas un éliminateur
+        # ══════════════════════════════════════════════════════════
+        # ZONE DISCOUNT / PREMIUM — aligné V24 SniperBot
+        #
+        # FIX : utilise la bougie D1 d'HIER (complète, iloc[-2])
+        # et non la bougie courante (incomplète intraday, iloc[-1]).
+        # La bougie D1 courante à 9h UTC ne représente que quelques
+        # heures — son high/low n'est pas un niveau institutionnel.
+        #
+        # Logique (identique _mtf_trigger_ict V24) :
+        #   d1_mid = (high_hier + low_hier) / 2
+        #   DISCOUNT : price < d1_mid  (moitié basse du range D1)
+        #   PREMIUM  : price > d1_mid  (moitié haute du range D1)
+        #   Midnight Open = bonus de confirmation (pas gate dur)
+        # ══════════════════════════════════════════════════════════
+        _d1_ref = -2 if len(df_d) >= 2 else -1
+        d1_high = float(df_d['high'].iloc[_d1_ref])
+        d1_low  = float(df_d['low'].iloc[_d1_ref])
+        d1_mid  = (d1_high + d1_low) / 2.0
 
-        pdh = df_d['high'].iloc[-1]
-        pdl = df_d['low'].iloc[-1]
-
-        # ── Midpoint D1 — référence ICT Discount/Premium ─────────
-        # Discount = prix sous le 50% du range D1 (identique SniperBot ICT)
-        d1_mid = (pdh + pdl) / 2.0
-
-        # ── Midnight Open NY — bonus de confirmation ──────────────
-        # Pas la référence principale, mais renforce la zone si aligné
+        # Midnight Open NY
         midnight_open = None
         try:
-            ny_tz   = pytz.timezone('America/New_York')
-            df_ny   = df_m15.copy()
-            df_ny.index = df_ny.index.tz_convert(ny_tz)
-            today_ny = datetime.now(ny_tz).date()
-            mask     = ((df_ny.index.date == today_ny) &
-                        (df_ny.index.hour == 0) & (df_ny.index.minute == 0))
-            mid_c    = df_ny[mask]
-            if not mid_c.empty:
-                midnight_open = float(mid_c['open'].iloc[0])
+            ny_tz     = pytz.timezone('America/New_York')
+            df_ny     = df_m15.copy()
+            _m15_raw  = pd.to_datetime(df_ny.index)
+            if _m15_raw.tz is None:
+                m15_times = _m15_raw.tz_localize("UTC").tz_convert(ny_tz)
             else:
-                today_c = df_ny[(df_ny.index.date == today_ny)]
+                m15_times = _m15_raw.tz_convert(ny_tz)
+            today_ny = datetime.now(ny_tz).date()
+            mn_mask  = (
+                (m15_times.date == today_ny)
+                & (m15_times.hour == 0)
+                & (m15_times.minute == 0)
+            )
+            mn_c = df_m15[mn_mask]
+            if mn_c.empty:
+                today_c = df_m15[m15_times.date == today_ny]
                 if not today_c.empty:
                     midnight_open = float(today_c['open'].iloc[0])
+            else:
+                midnight_open = float(mn_c['open'].iloc[0])
         except Exception:
             pass
 
-        atr_d = QuantEngine.atr(df_d, 14).iloc[-1]
-
-        # Marge PDH/PDL : 25% du range D1 (identique SniperBot)
-        # Fallback ATR_D × 0.5 si range D1 trop petit
-        if pdh > pdl:
-            zone_margin = (pdh - pdl) * 0.25
-        else:
-            zone_margin = float(atr_d) * 0.5
-
-        # Discount : prix sous d1_mid ET proche PDL (définition ICT)
+        # Position vs equilibrium D1 (Discount/Premium ICT)
         in_discount = price < d1_mid
         in_premium  = price > d1_mid
-        near_pdl    = price <= (pdl + zone_margin)
-        near_pdh    = price >= (pdh - zone_margin)
 
-        # Midnight comme bonus : aligne avec la direction du move intraday
+        # Alignement midnight (bonus de confirmation)
         midnight_below = midnight_open is not None and price < midnight_open
         midnight_above = midnight_open is not None and price > midnight_open
 
-        # Zone complète = midpoint ICT + PDL/PDH + midnight aligné (comme SniperBot)
-        zone_discount = in_discount and near_pdl and (midnight_below or midnight_open is None)
-        zone_premium  = in_premium  and near_pdh and (midnight_above or midnight_open is None)
+        # Zone complète : midpoint ICT + confirmation midnight
+        zone_discount = in_discount and (midnight_below or midnight_open is None)
+        zone_premium  = in_premium  and (midnight_above or midnight_open is None)
 
-        # Zones partielles pour le score (sans midnight)
+        # below_mid / above_mid = fallback score (sans midnight)
         below_mid = in_discount
         above_mid = in_premium
 
-        zone_label = ("DISCOUNT" if zone_discount else
-                      "PREMIUM"  if zone_premium  else "NEUTRE")
+        # Label : basé uniquement sur la position vs midpoint D1
+        zone_label = ("DISCOUNT" if in_discount else
+                      "PREMIUM"  if in_premium  else "NEUTRE")
 
         df_adx_src           = df_h1 if not (df_h1 is None or (hasattr(df_h1, 'empty') and df_h1.empty)) and len(df_h1) >= 20 else df_m15
         adx_s, pdi_s, mdi_s = QuantEngine.adx(df_adx_src, 14)
-        adx_val = round(adx_s.iloc[-1], 1)
+        adx_val_score = round(adx_s.iloc[-1], 1)
         pdi_val = round(pdi_s.iloc[-1], 1)
         mdi_val = round(mdi_s.iloc[-1], 1)
 
-        # ATR Daily — référence institutionnelle pour les SL (remplace ATR H1)
+        atr_d = QuantEngine.atr(df_d, 14).iloc[-1]
         atr_d_display = round(float(atr_d), 5) if not pd.isna(atr_d) else None
 
         score, grade, score_detail = compute_score(
             flip_type, candles_ago, mtf_pct, mtf_dominant,
-            zone_discount, zone_premium, near_pdl, near_pdh,
+            zone_discount, zone_premium,
+            False, False,   # near_pdl / near_pdh supprimés (non utilisés dans V24)
             below_mid, above_mid,
             in_bull_fvg, in_bear_fvg, fvg_near_bull, fvg_near_bear,
-            adx_val, pdi_val, mdi_val, atr_val, atr_mean
+            adx_val_score, pdi_val, mdi_val, atr_val, atr_mean
         )
 
         # ── Strength Δ ────────────────────────────────────────────
@@ -916,13 +890,13 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             "Zone":           zone_label,
             "Score /100":     score,
             "Grade":          grade,
-            "ADX H1":         adx_val,        # score interne uniquement
-            "ATR D":          atr_d_display,  # affiché dans le tableau
+            "ADX H1":         adx_val_score,
+            "ATR D":          atr_d_display,
             "MTF Pct":        mtf_pct,
             "MTF Dom":        mtf_dominant,
             "MTF Details":    mtf_details,
-            "Strength Δ":     strength_delta,  # combiné dans colonne Force
-            "Momentum":       momentum,         # combiné dans colonne Force
+            "Strength Δ":     strength_delta,
+            "Momentum":       momentum,
             "signal_is_bull": signal_is_bull,
         }
 
@@ -1016,13 +990,14 @@ def main():
 |---|---|---|
 | **Trigger HMA flip** | 30 pts | ≤15 min = 30 · ≤30 min = 20 · ≤45 min = 10 · >45 min = 0 |
 | **MTF Alignment** | 25 pts | ≥80% = 25 · ≥65% = 18 · ≥50% = 10 · contre-MTF = 0 |
-| **Zone d'intérêt** | 15 pts | Discount+PDL ou Premium+PDH = 15 · Zone seule = 8 |
+| **Zone d'intérêt** | 15 pts | Discount/Premium + Midnight = 15 · Zone seule = 8 |
 | **FVG M15** | 15 pts | LuxAlgo exact (mitigation + seuil auto) |
 | **ADX momentum** | 10 pts | ADX>25+DI ok = 10 · ADX>20+DI ok = 6 |
 | **ATR actif** | 5 pts | ≥ moyenne = 5 · ≥ 50% = 3 |
 
 | Colonne | Description |
 |---|---|
+| **Zone** | DISCOUNT = prix sous equilibrium D1 hier · PREMIUM = prix dessus (aligné V24) |
 | **ATR D** | ATR Daily 14 — référence institutionnelle pour calibrer les SL |
 | **Force** | ■■■ = ADX H4·H1·M15 ≥ 25 alignés (vert bull / rouge bear) · chiffre = Strength Δ base/quote |
         """)
@@ -1062,7 +1037,6 @@ def main():
     status    = st.empty()
     t_start   = time.time()
 
-    # ── Strength pre-fetch (une seule fois pour tous les actifs)
     strength_scores = {}
     with st.spinner("Calcul Currency Strength H1…"):
         dfs_h1 = fetch_strength_data(client)
@@ -1163,14 +1137,6 @@ def main():
             return "color:#9e4a3a;font-weight:700;font-size:16px;letter-spacing:.03em"
         return "color:#303040;font-size:12px"
 
-    def atr_h1_cell(v):
-        """Affiche l'ATR H1 avec 5 décimales, sans coloration particulière."""
-        if v is None:
-            return '<span style="color:#303040">—</span>'
-        # Format adapté : JPY a des ATR en centièmes, forex standard en dix-millièmes
-        formatted = f"{v:.5f}" if v < 1.0 else f"{v:.2f}"
-        return f'<span style="color:#7a8aa0;font-family:\'IBM Plex Mono\',monospace;font-size:13px">{formatted}</span>'
-
     def bias_daily_label(b):
         if b == "STRONG BULLISH": return "▲▲ STRONG BULL"
         if b == "BULLISH":        return "▲ BULL"
@@ -1204,7 +1170,6 @@ def main():
         </div>"""
 
     def atr_d_cell(v):
-        """ATR Daily — format adapté selon la magnitude."""
         if v is None:
             return '<span style="color:#303040">—</span>'
         formatted = f"{v:.5f}" if v < 1.0 else f"{v:.2f}"
@@ -1212,12 +1177,6 @@ def main():
                 f'monospace;font-size:13px">{formatted}</span>')
 
     def force_cell(momentum_score: int, delta, is_bull: bool) -> str:
-        """
-        Colonne Force unifiée :
-          • 3 segments ADX (H4 / H1 / M15) — vert bull / rouge bear
-          • Strength Δ en chiffre à droite
-        Lecture en un coup d'œil : ■■■ +7.1 = fort et aligné.
-        """
         color    = "#5a9e7a" if is_bull else "#9e4a3a"
         filled   = f'background:{color};border-radius:2px'
         empty    = 'background:#1e1e2e;border-radius:2px'
@@ -1242,19 +1201,25 @@ def main():
         return (f'<div style="display:flex;align-items:center">'
                 f'{bars}{delta_html}</div>')
 
+    # ── CORRECTION 2 : En-têtes — contraste amélioré ─────────────
+    # Avant : color:#3a3a6a (quasi invisible sur fond noir)
+    # Après : color:#8090c0 + bg séparé + font-weight 700
     html = """
 <style>
 .sc-wrap{overflow-x:auto;margin-top:4px}
 .sc-tbl{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono','Courier New',monospace;font-size:15px}
-.sc-tbl thead tr{border-bottom:2px solid #1e1e3a}
+.sc-tbl thead tr{border-bottom:2px solid #2a2a5a}
 .sc-tbl th{
-  padding:10px 16px;text-align:left;color:#3a3a6a;
-  font-size:12px;text-transform:uppercase;letter-spacing:.12em;font-weight:600;white-space:nowrap
+  padding:10px 16px;text-align:left;
+  color:#8090c0;
+  font-size:12px;text-transform:uppercase;letter-spacing:.12em;font-weight:700;
+  white-space:nowrap;
+  background:#0c0c12;
+  border-bottom:2px solid #2a2a5a;
 }
 .sc-tbl td{padding:13px 16px;border-bottom:1px solid #0f0f1e;vertical-align:middle}
 .sc-tbl tr:hover td{background:#111118 !important}
 .ticker{font-size:22px;font-weight:800;color:#c8c8d8;letter-spacing:.04em;white-space:nowrap;font-family:'IBM Plex Mono',monospace}
-.bias-tag{font-size:12px;font-weight:700;letter-spacing:.07em;vertical-align:middle;margin-left:8px;text-transform:uppercase;opacity:.85}
 .grade-pill{
   display:inline-block;padding:2px 8px;border-radius:2px;
   font-size:12px;font-weight:700;letter-spacing:.08em;
@@ -1288,7 +1253,6 @@ def main():
         score     = int(row.get("Score /100", 0))
         ticker    = str(row.get("Actif + Note", "")).split("  ")[0].strip()
         sig       = str(row.get("Signal", "—"))
-        adx_v     = str(row.get("ADX H1", "—"))
         atr_d_v   = row.get("ATR D")
         bias      = str(row.get("Biais Daily", "—"))
         alignment = str(row.get("Alignement", "ALIGNED"))
@@ -1297,14 +1261,6 @@ def main():
         sdelta    = row.get("Strength Δ")
         momentum  = int(row.get("Momentum", 0))
         is_bull   = bool(row.get("signal_is_bull", True))
-
-        bull_bias  = "BULLISH" in bias
-        bias_icon  = "▲" if bull_bias else "▼"
-        bias_lbl   = ("STRONG BULL" if bias == "STRONG BULLISH"
-                      else "BULL"        if bias == "BULLISH"
-                      else "STRONG BEAR" if bias == "STRONG BEARISH"
-                      else "BEAR"        if "BEAR" in bias else "NEUTRAL")
-        bias_color = "#5a9e7a" if bull_bias else ("#9e4a3a" if "BEAR" in bias else "#606080")
 
         align_tag = ""
         if alignment == "COUNTER":
@@ -1315,11 +1271,13 @@ def main():
 
         row_bg = gs["bg"] if fresh and grade in ("A+", "A") else "transparent"
 
+        # ── CORRECTION 1 : Colonne ACTIF ─────────────────────────
+        # Suppression du badge de tendance (▲ BULL, ▼ BEAR etc.)
+        # → déjà visible dans la colonne Biais Daily, source de confusion
         html += f"""<tr style="background:{row_bg}">
   <td style="{fresh_style(fresh_str)}">{fresh_str}</td>
   <td style="white-space:nowrap">
     <span class="ticker">{ticker}</span>
-    <span class="bias-tag" style="color:{bias_color}">{bias_icon} {bias_lbl}</span>
     <span class="grade-pill" style="color:{gs['color']}">{gs['label']}</span>
     {align_tag}
   </td>
@@ -1345,3 +1303,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
