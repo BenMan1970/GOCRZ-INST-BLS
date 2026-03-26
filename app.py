@@ -11,17 +11,12 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================================================================
-#  BLUESTAR SNIPER V15  —  ICT SIGNAL ENGINE
-#  Modifications vs V14 :
-#  ✅  ADR (Average Daily Range) pour forex/metals
-#      ATR Daily conservé pour indices (US30, NAS100, DE30)
-#      Colonne renommée "ADR / ATR" avec label par ligne
-#  ✅  Zone PREMIUM / DISCOUNT — ICT pur (patch V15 final)
-#      PREMIUM  = price > Midnight Open  ET price ≤ PDH
-#      DISCOUNT = price < Midnight Open  ET price ≥ PDL
-#      EXT HIGH / EXT LOW = hors range PDH/PDL
-#      Fallback midpoint D1 si Midnight Open absent
-#      Midnight Open calculé EN PREMIER (avant la zone)
+#  BLUESTAR SNIPER V16  —  ICT SIGNAL ENGINE
+#  Modifications vs V15 :
+#  ✅  ADR Consumed : range journalier consommé depuis minuit NY
+#      Jauge visuelle dans la cellule ADR / ATR
+#      🟢 < 40% = range vierge   🟡 40–70% = range partiel
+#      🔴 > 70% = range épuisé + malus -5 pts sur le score
 # ================================================================
 
 
@@ -123,6 +118,39 @@ def compute_adr(df_d: pd.DataFrame, period: int = 14) -> float:
         return float("nan")
     ranges = (df_d["high"] - df_d["low"]).iloc[-(period + 1):-1]
     return float(ranges.mean()) if not ranges.empty else float("nan")
+
+
+# ----------------------------------------------------------------
+#  ADR CONSUMED  (V16) — range consommé depuis minuit NY
+# ----------------------------------------------------------------
+def compute_adr_consumed(df_m15: pd.DataFrame, midnight_open_price: float,
+                         adr_value: float) -> float | None:
+    """
+    Range consommé depuis Minuit NY jusqu'à maintenant, exprimé en % de l'ADR.
+    Retourne None si données insuffisantes.
+    """
+    if df_m15 is None or df_m15.empty or adr_value is None or adr_value <= 0:
+        return None
+    try:
+        ny_tz    = pytz.timezone("America/New_York")
+        idx      = df_m15.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        idx_ny   = idx.tz_convert(ny_tz)
+        today_ny = datetime.now(ny_tz).date()
+
+        # Bougies depuis 00h00 NY aujourd'hui
+        mask = idx_ny.date == today_ny
+        today_bars = df_m15[mask]
+        if today_bars.empty:
+            return None
+
+        today_h  = float(today_bars["high"].max())
+        today_l  = float(today_bars["low"].min())
+        consumed = (today_h - today_l) / adr_value * 100.0
+        return round(min(consumed, 100.0), 1)
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------
@@ -471,7 +499,7 @@ def compute_momentum_score(df_h4, df_h1, df_m15, signal_is_bull: bool) -> int:
 
 
 # ----------------------------------------------------------------
-#  SYSTÈME DE NOTATION  V15
+#  SYSTÈME DE NOTATION  V16
 # ----------------------------------------------------------------
 def compute_score(flip_type, candles_ago,
                   mtf_pct, mtf_dominant,
@@ -479,7 +507,8 @@ def compute_score(flip_type, candles_ago,
                   near_pdl, near_pdh, below_mid, above_mid,
                   in_bull_fvg, in_bear_fvg, fvg_near_bull, fvg_near_bear,
                   adx_val, pdi_val, mdi_val, atr_val, atr_mean,
-                  midnight_bonus: bool = False):
+                  midnight_bonus: bool = False,
+                  adr_consumed: float | None = None):
 
     score = 0
     score_detail = {}
@@ -548,6 +577,13 @@ def compute_score(flip_type, candles_ago,
     else:                           pts = 0
     score += pts
     score_detail["ATR"] = pts
+
+    # ── Malus range épuisé (V16) ────────────────────────────────
+    if adr_consumed is not None and adr_consumed > 70:
+        score -= 5
+        score_detail["ADR Malus"] = -5
+    else:
+        score_detail["ADR Malus"] = 0
 
     if   score >= 85: grade = "A+"
     elif score >= 70: grade = "A"
@@ -759,8 +795,6 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
 
         # ══════════════════════════════════════════════════════════════
         #  MIDNIGHT OPEN — calculé EN PREMIER (avant la zone)
-        #  Référence : 00h00 America/New_York (identique Pine Script TV)
-        #  midnightSession = "0000-0001:23456"
         # ══════════════════════════════════════════════════════════════
         midnight_open = None
         try:
@@ -788,24 +822,12 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
 
         # ══════════════════════════════════════════════════════════════
         #  ZONE DISCOUNT / PREMIUM — ICT pur
-        #
-        #  PDH  = df_d["high"].iloc[-2]  ←→  high[1] Daily Pine Script (ligne verte)
-        #  PDL  = df_d["low"].iloc[-2]   ←→  low[1]  Daily Pine Script (ligne rouge)
-        #  MO   = open M15 à 00:00 NY    ←→  midnightOpenPrice Pine Script (ligne jaune)
-        #
-        #  PREMIUM   = price > MO  ET  price ≤ PDH
-        #  DISCOUNT  = price < MO  ET  price ≥ PDL
-        #  EXT HIGH  = price > PDH  (hors range)
-        #  EXT LOW   = price < PDL  (hors range)
-        #
-        #  Fallback si MO absent : midpoint PDH/PDL classique
         # ══════════════════════════════════════════════════════════════
         _d1_ref = -2 if len(df_d) >= 2 else -1
-        pdh = float(df_d["high"].iloc[_d1_ref])   # PDH — ligne verte TV
-        pdl = float(df_d["low"].iloc[_d1_ref])    # PDL — ligne rouge TV
+        pdh = float(df_d["high"].iloc[_d1_ref])
+        pdl = float(df_d["low"].iloc[_d1_ref])
 
         if midnight_open is not None:
-            # Logique ICT pur avec MO comme équilibre intraday
             in_premium       = (price > midnight_open) and (price <= pdh)
             in_discount      = (price < midnight_open) and (price >= pdl)
             in_extended_high = price > pdh
@@ -828,7 +850,6 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             above_mid     = in_premium
 
         else:
-            # Fallback : midpoint PDH/PDL si MO absent
             d1_mid        = (pdh + pdl) / 2.0
             in_discount   = price < d1_mid
             in_premium    = price > d1_mid
@@ -839,7 +860,6 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             zone_label    = ("DISCOUNT" if in_discount else
                              "PREMIUM"  if in_premium  else "EQUILIBRE")
 
-        # Bonus Midnight : confluence directionnelle avec MO
         midnight_bonus = False
         if midnight_open is not None:
             if flip_type == "BULL" and price < midnight_open:
@@ -858,10 +878,13 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             _atr_d_raw  = QuantEngine.atr(df_d, 14).iloc[-1]
             adr_display = round(float(_atr_d_raw), 2) if not pd.isna(_atr_d_raw) else None
             adr_label   = "ATR"
+            adr_consumed = None   # pas de calcul consumed pour les indices
         else:
             _adr_raw    = compute_adr(df_d, period=14)
             adr_display = round(float(_adr_raw), 5) if not pd.isna(_adr_raw) else None
             adr_label   = "ADR"
+            # ── ADR Consumed V16 ──────────────────────────────────
+            adr_consumed = compute_adr_consumed(df_m15, midnight_open, adr_display)
 
         score, grade, score_detail = compute_score(
             flip_type, candles_ago, mtf_pct, mtf_dominant,
@@ -870,7 +893,8 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             below_mid, above_mid,
             in_bull_fvg, in_bear_fvg, fvg_near_bull, fvg_near_bear,
             adx_val_score, pdi_val, mdi_val, atr_val, atr_mean,
-            midnight_bonus=midnight_bonus
+            midnight_bonus=midnight_bonus,
+            adr_consumed=adr_consumed,
         )
 
         strength_delta = None
@@ -898,6 +922,7 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             "ADX H1":         adx_val_score,
             "ADR":            adr_display,
             "ADR Label":      adr_label,
+            "ADR Consumed":   adr_consumed,
             "MTF Pct":        mtf_pct,
             "MTF Dom":        mtf_dominant,
             "MTF Details":    mtf_details,
@@ -914,11 +939,11 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
 
 
 # ----------------------------------------------------------------
-#  INTERFACE STREAMLIT  (identique V15 original)
+#  INTERFACE STREAMLIT
 # ----------------------------------------------------------------
 def main():
     st.set_page_config(
-        page_title="BLUESTAR SNIPER V15",
+        page_title="BLUESTAR SNIPER V16",
         layout="wide",
         initial_sidebar_state="collapsed"
     )
@@ -964,7 +989,7 @@ def main():
       <span style="font-size:36px">🎯</span>
       <div>
         <h1 style="margin:0;font-size:28px;color:#e8e8f8">
-          BLUESTAR SNIPER V15 {kz_html}
+          BLUESTAR SNIPER V16 {kz_html}
         </h1>
         <p style="margin:0;color:#4a4a7a;font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.1em">
           HMA 20 M15 · MTF INSTITUTIONAL · ADR DAILY · FORCE H4·H1·M15 · LUXALGO FVG
@@ -991,7 +1016,7 @@ def main():
     with col3:
         show_debug = st.toggle("🐛 Debug", value=False)
 
-    with st.expander("📘 Grille de notation V15"):
+    with st.expander("📘 Grille de notation V16"):
         st.markdown("""
 | Critère | Max | Détail |
 |---|---|---|
@@ -1002,11 +1027,12 @@ def main():
 | **FVG M15** | 15 pts | LuxAlgo exact (mitigation + seuil auto) |
 | **ADX momentum** | 10 pts | ADX>25+DI ok = 10 · ADX>20+DI ok = 6 |
 | **ATR actif** | 5 pts | ≥ moyenne = 5 · ≥ 50% = 3 |
+| **ADR Malus** | -5 pts | Range journalier > 70% consommé depuis minuit NY |
 
 | Colonne | Description |
 |---|---|
 | **Zone** | DISCOUNT = prix sous MO (00h00 NY) · PREMIUM = prix dessus · EXT HIGH/LOW = hors PDH/PDL |
-| **ADR / ATR** | ADR = Average Daily Range (forex/metals) · ATR = indices (US30, NAS100, DE30) |
+| **ADR / ATR** | Valeur + jauge de consommation du range (🟢 <40% · 🟡 40–70% · 🔴 >70%) |
 | **Force** | ■■■ = ADX H4·H1·M15 ≥ 25 alignés · chiffre = Strength Δ base/quote |
         """)
 
@@ -1128,7 +1154,7 @@ def main():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── TABLE HTML (identique V15 original) ──────────────────
+    # ── STYLES ───────────────────────────────────────────────────
     GRADE_STYLE = {
         "A+": {"color": "#5a9e7a", "bg": "rgba(90,158,122,0.07)", "label": "A+"},
         "A":  {"color": "#4e8a6c", "bg": "rgba(78,138,108,0.05)", "label": "A"},
@@ -1178,17 +1204,47 @@ def main():
           <span style="color:{color};font-weight:700;font-size:15px">{score}</span>
         </div>"""
 
-    def adr_cell(v, label="ADR"):
+    def adr_cell(v, label="ADR", consumed: float | None = None):
         if v is None:
             return '<span style="color:#303040">—</span>'
+
         formatted = f"{v:.5f}" if v < 1.0 else f"{v:.2f}"
         tag_color = "#4a7898" if label == "ADR" else "#6a5a78"
-        return (
+
+        tag_html = (
             f'<span style="color:{tag_color};font-size:10px;font-family:\'IBM Plex Mono\','
             f'monospace;margin-right:4px">{label}</span>'
             f'<span style="color:#5a6880;font-family:\'IBM Plex Mono\','
             f'monospace;font-size:13px">{formatted}</span>'
         )
+
+        if consumed is None:
+            return tag_html
+
+        # Couleur selon consommation
+        if consumed < 40:
+            bar_color = "#5a9e7a"   # vert — range vierge
+            pct_color = "#5a9e7a"
+        elif consumed < 70:
+            bar_color = "#9a7820"   # orange — range partiel
+            pct_color = "#9a7820"
+        else:
+            bar_color = "#9e4a3a"   # rouge — range épuisé
+            pct_color = "#9e4a3a"
+
+        fill_width = int(consumed)
+
+        gauge_html = (
+            f'<div style="display:flex;align-items:center;gap:6px;margin-top:4px">'
+            f'<div style="width:52px;height:3px;background:#1a1a22;border-radius:2px;overflow:hidden">'
+            f'<div style="width:{fill_width}%;height:100%;background:{bar_color};border-radius:2px"></div>'
+            f'</div>'
+            f'<span style="color:{pct_color};font-size:10px;font-family:\'IBM Plex Mono\','
+            f'monospace;font-weight:700">{consumed:.0f}%</span>'
+            f'</div>'
+        )
+
+        return f'<div>{tag_html}{gauge_html}</div>'
 
     def force_cell(momentum_score: int, delta, is_bull: bool) -> str:
         color    = "#5a9e7a" if is_bull else "#9e4a3a"
@@ -1266,6 +1322,7 @@ def main():
         sig         = str(row.get("Signal", "—"))
         adr_v       = row.get("ADR")
         adr_lbl     = str(row.get("ADR Label", "ADR"))
+        adr_cons    = row.get("ADR Consumed")
         bias        = str(row.get("Biais Daily", "—"))
         alignment   = str(row.get("Alignement", "ALIGNED"))
         zone        = str(row.get("Zone", "—"))
@@ -1299,7 +1356,7 @@ def main():
   <td style="{bias_daily_style(bias)}">{bias_daily_label(bias)}</td>
   <td style="{zone_style(zone)}">{zone}{mn_tag}</td>
   <td>{score_bar(score)}</td>
-  <td>{adr_cell(adr_v, adr_lbl)}</td>
+  <td>{adr_cell(adr_v, adr_lbl, consumed=adr_cons)}</td>
   <td>{force_cell(momentum, sdelta, is_bull)}</td>
 </tr>"""
 
