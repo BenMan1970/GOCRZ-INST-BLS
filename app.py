@@ -3,42 +3,589 @@ import pandas as pd
 import numpy as np
 import oandapyV20
 import oandapyV20.endpoints.instruments as instruments
+import oandapyV20.endpoints.accounts as accounts
 from datetime import datetime
 import pytz
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================================================================
-#  BLUESTAR ZONE INDICATOR — PDH / MIDNIGHT OPEN / PDL
-#  Visualisation des zones PREMIUM / DISCOUNT (ICT pur)
-#  Compatible 100% avec l'indicateur TradingView :
-#    PDH  = ligne VERTE  = df_d["high"].iloc[-2]
-#    MO   = ligne JAUNE  = open M15 à 00:00 NY
-#    PDL  = ligne ROUGE  = df_d["low"].iloc[-2]
+#  BLUESTAR SNIPER V15  —  ICT SIGNAL ENGINE
+#  Modifications vs V14 :
+#  ✅  ADR (Average Daily Range) pour forex/metals
+#      ATR Daily conservé pour indices (US30, NAS100, DE30)
+#      Colonne renommée "ADR / ATR" avec label par ligne
+#  ✅  Zone PREMIUM / DISCOUNT — ICT pur (patch V15 final)
+#      PREMIUM  = price > Midnight Open  ET price ≤ PDH
+#      DISCOUNT = price < Midnight Open  ET price ≥ PDL
+#      EXT HIGH / EXT LOW = hors range PDH/PDL
+#      Fallback midpoint D1 si Midnight Open absent
+#      Midnight Open calculé EN PREMIER (avant la zone)
 # ================================================================
 
-ASSETS = [
+
+# ----------------------------------------------------------------
+#  KILLZONE DETECTOR  (UTC+1 — Paris / Tunis)
+# ----------------------------------------------------------------
+KILLZONES_UTC1 = {
+    "London": ((8,  0), (9,  30)),
+    "NY AM":  ((13, 0), (14, 30)),
+    "Asia":   ((2,  0), (4,  0)),
+}
+
+INDICES = {"US30_USD", "NAS100_USD", "DE30_EUR"}
+
+def get_current_killzone() -> str:
+    tz_utc1 = pytz.timezone("Europe/Paris")
+    now = datetime.now(tz_utc1)
+    t = now.hour * 60 + now.minute
+    for name, (start, end) in KILLZONES_UTC1.items():
+        s = start[0] * 60 + start[1]
+        e = end[0]   * 60 + end[1]
+        if s <= t <= e:
+            return name
+    return ""
+
+def killzone_badge(kz: str) -> str:
+    if kz == "London": return "🟢 KZ London"
+    if kz == "NY AM":  return "🔵 KZ NY AM"
+    if kz == "Asia":   return "🟠 KZ Asia"
+    return ""
+
+
+# ----------------------------------------------------------------
+#  QUANT ENGINE
+# ----------------------------------------------------------------
+class QuantEngine:
+
+    @staticmethod
+    def wma(series, period):
+        weights = np.arange(1, period + 1, dtype=np.float64)
+        w_sum   = weights.sum()
+        arr     = series.to_numpy(dtype=np.float64)
+        n       = len(arr)
+        out     = np.full(n, np.nan)
+        for i in range(period - 1, n):
+            out[i] = np.dot(arr[i - period + 1: i + 1], weights) / w_sum
+        return pd.Series(out, index=series.index)
+
+    @staticmethod
+    def hma(series, period=20):
+        half   = int(period / 2)
+        sqrt_p = int(np.sqrt(period))
+        raw    = 2 * QuantEngine.wma(series, half) - QuantEngine.wma(series, period)
+        if raw.isna().all():
+            return pd.Series(np.nan, index=series.index)
+        return QuantEngine.wma(raw, sqrt_p).ewm(span=5, adjust=False).mean()
+
+    @staticmethod
+    def atr(df, period=14):
+        c  = df['close'].shift(1)
+        tr = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - c).abs(),
+            (df['low']  - c).abs()
+        ], axis=1).max(axis=1)
+        return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+    @staticmethod
+    def adx(df, period=14):
+        pdm = df['high'].diff()
+        mdm = -df['low'].diff()
+        pdm = pdm.where((pdm > mdm) & (pdm > 0), 0.0)
+        mdm = mdm.where((mdm > pdm) & (mdm > 0), 0.0)
+        atr = QuantEngine.atr(df, period)
+        pdi = 100 * pdm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+        mdi = 100 * mdm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+        dx  = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+        return dx.ewm(alpha=1/period, adjust=False).mean(), pdi, mdi
+
+    @staticmethod
+    def rsi(series, period=14):
+        delta = series.diff()
+        gain  = delta.where(delta > 0, 0.0).ewm(alpha=1/period, adjust=False).mean()
+        loss  = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/period, adjust=False).mean()
+        rs    = gain / loss.replace(0, np.nan)
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def zlema(series, period=50, lag=17):
+        src = series + (series - series.shift(lag))
+        return src.ewm(span=period, adjust=False).mean()
+
+
+# ----------------------------------------------------------------
+#  ADR — Average Daily Range (forex/metals uniquement)
+# ----------------------------------------------------------------
+def compute_adr(df_d: pd.DataFrame, period: int = 14) -> float:
+    if df_d is None or len(df_d) < 2:
+        return float("nan")
+    ranges = (df_d["high"] - df_d["low"]).iloc[-(period + 1):-1]
+    return float(ranges.mean()) if not ranges.empty else float("nan")
+
+
+# ----------------------------------------------------------------
+#  MTF INSTITUTIONAL TREND
+# ----------------------------------------------------------------
+TF_WEIGHTS = {"M": 4.0, "W": 3.5, "D": 3.0, "4H": 2.5, "1H": 2.0, "15m": 1.5}
+TOTAL_WEIGHT = sum(TF_WEIGHTS.values())
+
+
+def get_tf_trend(df: pd.DataFrame, tf_type: str):
+    if df is None or len(df) < 50:
+        return 0, 40.0, "NEUT"
+    close = df['close']
+
+    if tf_type in ("M", "W"):
+        min_bars = 52 if tf_type == "M" else 200
+        if len(df) < min_bars:
+            return 0, 40.0, "NEUT"
+        sma200 = close.rolling(min(200, len(df))).mean().iloc[-1]
+        ema50  = close.ewm(span=50, adjust=False).mean().iloc[-1]
+        if pd.isna(sma200) or pd.isna(ema50):
+            return 0, 40.0, "NEUT"
+        trend    = 1 if ema50 > sma200 else (-1 if ema50 < sma200 else 0)
+        strength = 75.0 if ema50 != sma200 else 40.0
+        label    = "BULL" if trend == 1 else ("BEAR" if trend == -1 else "NEUT")
+        return trend, strength, label
+
+    elif tf_type == "4H":
+        score = 0
+        ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+        score += 1 if close.iloc[-1] > ema50 else -1
+        adx_s, pdi_s, mdi_s = QuantEngine.adx(df, 14)
+        score += 1 if pdi_s.iloc[-1] > mdi_s.iloc[-1] else -1
+        idx = df.index.tz_localize("UTC") if df.index.tz is None else df.index
+        today = idx[-1].date()
+        day_rows = df[idx.date == today]
+        if not day_rows.empty:
+            daily_open = day_rows['open'].iloc[0]
+            score += 1 if close.iloc[-1] > daily_open else -1
+        trend    = 1 if score > 0 else (-1 if score < 0 else 0)
+        strength = 90.0 if abs(score) == 3 else (70.0 if abs(score) >= 1 else 40.0)
+        label    = "BULL" if trend == 1 else ("BEAR" if trend == -1 else "NEUT")
+        return trend, strength, label
+
+    else:
+        ema50 = close.ewm(span=50, adjust=False).mean()
+        ema21 = close.ewm(span=21, adjust=False).mean()
+        ema9  = close.ewm(span=9,  adjust=False).mean()
+        zl    = QuantEngine.zlema(close, 50, 17)
+        rsi_v = QuantEngine.rsi(close, 14)
+        macd  = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        sig   = macd.ewm(span=9, adjust=False).mean()
+        c = close.iloc[-1]
+        bullish = (c > zl.iloc[-1] and ema9.iloc[-1] > ema21.iloc[-1] and
+                   ema21.iloc[-1] > ema50.iloc[-1] and rsi_v.iloc[-1] > 50 and
+                   macd.iloc[-1]  > sig.iloc[-1])
+        bearish = (c < zl.iloc[-1] and ema9.iloc[-1] < ema21.iloc[-1] and
+                   ema21.iloc[-1] < ema50.iloc[-1] and rsi_v.iloc[-1] < 50 and
+                   macd.iloc[-1]  < sig.iloc[-1])
+        base_str = min(80.0, abs(c - zl.iloc[-1]) / c * 1000)
+        strength = base_str if (bullish or bearish) else 30.0
+        trend    = 1 if bullish else (-1 if bearish else 0)
+        label    = "BULL" if trend == 1 else ("BEAR" if trend == -1 else "NEUT")
+        return trend, strength, label
+
+
+def compute_mtf_analysis(dfs: dict):
+    results = {}
+    for tf, df in dfs.items():
+        t, s, lbl = get_tf_trend(df, tf)
+        results[tf] = {"trend": t, "strength": s, "label": lbl}
+
+    macro_trend = 0
+    for tf in ("M", "W", "D", "4H"):
+        if tf in results and results[tf]["trend"] != 0:
+            macro_trend = results[tf]["trend"]
+            break
+
+    t1h  = results.get("1H",  {}).get("trend", 0)
+    t15m = results.get("15m", {}).get("trend", 0)
+    f1h  = 0 if (macro_trend != 0 and macro_trend != t1h)  else t1h
+    f15m = 0 if (macro_trend != 0 and macro_trend != t15m) else t15m
+    results["1H"]["trend"]  = f1h
+    results["15m"]["trend"] = f15m
+
+    bull_score = sum(TF_WEIGHTS[tf] for tf in TF_WEIGHTS if results.get(tf, {}).get("trend", 0) == 1)
+    bear_score = sum(TF_WEIGHTS[tf] for tf in TF_WEIGHTS if results.get(tf, {}).get("trend", 0) == -1)
+    alignment_pct = round(max(bull_score, bear_score) / TOTAL_WEIGHT * 100)
+    dominant      = ("Bullish" if bull_score > bear_score
+                     else "Bearish" if bear_score > bull_score else "Neutral")
+    return alignment_pct, dominant, results
+
+
+# ----------------------------------------------------------------
+#  DAILY BIAS  (5 facteurs)
+# ----------------------------------------------------------------
+def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
+    if df_d is None or len(df_d) < 60:
+        return "NEUTRAL", {}
+
+    close = df_d['close']
+    high  = df_d['high']
+    low   = df_d['low']
+
+    cur = current_price if current_price is not None else float(close.iloc[-1])
+
+    votes_bull = 0
+    votes_bear = 0
+    detail = {}
+
+    def _swing_pts(series, wing=5):
+        highs, lows = [], []
+        for i in range(wing, len(series) - wing):
+            w = series.iloc[i - wing: i + wing + 1]
+            if series.iloc[i] == w.max(): highs.append(i)
+            if series.iloc[i] == w.min(): lows.append(i)
+        return highs, lows
+
+    sh_idx, _   = _swing_pts(high)
+    _,  sl_idx  = _swing_pts(low)
+
+    struct_vote = "NEUTRAL"
+    if len(sh_idx) >= 2 and len(sl_idx) >= 2:
+        hh = high.iloc[sh_idx[-1]] > high.iloc[sh_idx[-2]]
+        hl = low.iloc[sl_idx[-1]]  > low.iloc[sl_idx[-2]]
+        lh = high.iloc[sh_idx[-1]] < high.iloc[sh_idx[-2]]
+        ll = low.iloc[sl_idx[-1]]  < low.iloc[sl_idx[-2]]
+        if hh and hl:
+            struct_vote = "BULLISH"; votes_bull += 2
+        elif lh and ll:
+            struct_vote = "BEARISH"; votes_bear += 2
+    detail["Structure"] = struct_vote
+
+    ema50_series = close.ewm(span=50, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+    ema50 = ema50_series.iloc[-1]
+    if   cur > ema21 > ema50: detail["EMA 21/50"] = "BULLISH"; votes_bull += 1
+    elif cur < ema21 < ema50: detail["EMA 21/50"] = "BEARISH"; votes_bear += 1
+    else:                     detail["EMA 21/50"] = "NEUTRAL"
+
+    wo_vote = "NEUTRAL"
+    try:
+        df_copy = df_d.copy()
+        if df_copy.index.tz is None:
+            df_copy.index = df_copy.index.tz_localize("UTC")
+        weekly_open_rows = df_copy[df_copy.index.dayofweek.isin([0, 6])]
+        if not weekly_open_rows.empty:
+            weekly_open = float(weekly_open_rows['open'].iloc[-1])
+            wo_vote = "BULLISH" if cur > weekly_open else "BEARISH"
+            if wo_vote == "BULLISH": votes_bull += 1
+            else:                   votes_bear += 1
+    except Exception:
+        pass
+    detail["Weekly Open"] = wo_vote
+
+    if len(df_d) >= 2:
+        midpoint = (float(high.iloc[-2]) + float(low.iloc[-2])) / 2
+        if float(close.iloc[-2]) > midpoint:
+            detail["Close J-1"] = "BULLISH"; votes_bull += 1
+        else:
+            detail["Close J-1"] = "BEARISH"; votes_bear += 1
+    else:
+        detail["Close J-1"] = "NEUTRAL"
+
+    slope_vote = "NEUTRAL"
+    try:
+        if len(ema50_series) >= 6:
+            atr_d_val = float(
+                pd.concat([
+                    high - low,
+                    (high - close.shift()).abs(),
+                    (low  - close.shift()).abs(),
+                ], axis=1).max(axis=1).ewm(alpha=1/14, adjust=False).mean().iloc[-1]
+            )
+            slope_5d = float(ema50_series.iloc[-1] - ema50_series.iloc[-6])
+            if atr_d_val > 0:
+                slope_norm = slope_5d / atr_d_val
+                if   slope_norm >  0.05:
+                    slope_vote = "BULLISH"; votes_bull += 1
+                elif slope_norm < -0.05:
+                    slope_vote = "BEARISH"; votes_bear += 1
+            detail["EMA50 Slope"] = f"{slope_vote} ({slope_norm:+.3f})"
+    except Exception:
+        detail["EMA50 Slope"] = "NEUTRAL"
+
+    detail["Votes"] = f"{votes_bull}B / {votes_bear}S"
+
+    if   votes_bull >= 5: bias = "STRONG BULLISH"
+    elif votes_bull >= 3: bias = "BULLISH"
+    elif votes_bear >= 5: bias = "STRONG BEARISH"
+    elif votes_bear >= 3: bias = "BEARISH"
+    else:                 bias = "NEUTRAL"
+
+    return bias, detail
+
+
+# ----------------------------------------------------------------
+#  FVG M15
+# ----------------------------------------------------------------
+def detect_fvg(df, price, lookback=80):
+    sub = df.iloc[-(lookback + 3):].reset_index(drop=True)
+    n   = len(sub)
+    if n < 3:
+        return False, False, None, None
+
+    denom     = sub["low"].replace(0, 1e-9)
+    range_pct = (sub["high"] - sub["low"]) / denom
+    auto_thr  = float(range_pct.expanding().mean().iloc[-1]) * 2.0
+
+    active_bulls = []
+    active_bears = []
+
+    for i in range(2, n):
+        h0 = float(sub["high"].iloc[i]);   l0 = float(sub["low"].iloc[i])
+        c0 = float(sub["close"].iloc[i]);  c1 = float(sub["close"].iloc[i - 1])
+        h2 = float(sub["high"].iloc[i - 2]); l2 = float(sub["low"].iloc[i - 2])
+
+        active_bulls = [(b, t) for b, t in active_bulls if c0 >= b]
+        active_bears = [(b, t) for b, t in active_bears if c0 <= t]
+
+        if l0 > h2 and c1 > h2:
+            size_pct = (l0 - h2) / h2 if h2 > 0 else 0.0
+            if size_pct >= auto_thr:
+                active_bulls.insert(0, (h2, l0))
+        elif h0 < l2 and c1 < l2:
+            size_pct = (l2 - h0) / h0 if h0 > 0 else 0.0
+            if size_pct >= auto_thr:
+                active_bears.insert(0, (h0, l2))
+
+    in_bull = any(b <= price <= t for b, t in active_bulls)
+    in_bear = any(b <= price <= t for b, t in active_bears)
+
+    def _nearest(lst):
+        if not lst:
+            return None
+        return min(lst, key=lambda r: abs(price - (r[0] + r[1]) / 2))
+
+    return (in_bull, in_bear, _nearest(active_bulls), _nearest(active_bears))
+
+
+# ----------------------------------------------------------------
+#  CURRENCY STRENGTH
+# ----------------------------------------------------------------
+CURRENCIES = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
+
+STRENGTH_PAIRS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF",
     "AUD_USD", "USD_CAD", "NZD_USD",
     "EUR_GBP", "EUR_JPY", "EUR_CHF",
-    "EUR_AUD", "EUR_CAD", "EUR_NZD",
-    "GBP_JPY", "GBP_CHF", "GBP_AUD",
-    "GBP_CAD", "GBP_NZD",
-    "AUD_JPY", "CAD_JPY", "CHF_JPY", "NZD_JPY",
-    "AUD_CAD", "AUD_CHF", "AUD_NZD",
-    "CAD_CHF", "NZD_CAD", "NZD_CHF",
-    "XAU_USD", "XAG_USD",
-    "US30_USD", "NAS100_USD", "DE30_EUR",
+    "GBP_JPY", "AUD_JPY", "CAD_JPY", "NZD_JPY",
 ]
 
-MAX_RETRIES = 3
-RETRY_DELAY = 1.5
+def compute_currency_strength(dfs_h1: dict) -> dict:
+    raw = {c: 0.0 for c in CURRENCIES}
+    counts = {c: 0 for c in CURRENCIES}
+
+    for pair, df in dfs_h1.items():
+        if df is None or df.empty or len(df) < 60:
+            continue
+        parts = pair.split("_")
+        if len(parts) != 2:
+            continue
+        base, quote = parts[0], parts[1]
+        if base not in CURRENCIES or quote not in CURRENCIES:
+            continue
+
+        close = df["close"]
+        ema9  = close.ewm(span=9,  adjust=False).mean().iloc[-1]
+        ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+        ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+        rsi_v = QuantEngine.rsi(close, 14).iloc[-1]
+
+        bullish = ema9 > ema21 > ema50 and rsi_v > 50
+        bearish = ema9 < ema21 < ema50 and rsi_v < 50
+        contrib = 1.0 if bullish else (-1.0 if bearish else 0.0)
+
+        raw[base]  += contrib
+        raw[quote] -= contrib
+        counts[base]  += 1
+        counts[quote] += 1
+
+    scores = {}
+    for c in CURRENCIES:
+        if counts[c] > 0:
+            scores[c] = raw[c] / counts[c]
+        else:
+            scores[c] = 0.0
+
+    vals = list(scores.values())
+    s_min, s_max = min(vals), max(vals)
+    spread = s_max - s_min
+    if spread < 1e-8:
+        return {c: 5.0 for c in CURRENCIES}
+    return {c: round((v - s_min) / spread * 10, 2) for c, v in scores.items()}
+
+
+def get_strength_delta(ticker: str, strength_scores: dict) -> float | None:
+    parts = ticker.split("_")
+    if len(parts) != 2:
+        return None
+    base, quote = parts[0], parts[1]
+    sb = strength_scores.get(base)
+    sq = strength_scores.get(quote)
+    if sb is None or sq is None:
+        return None
+    return round(sb - sq, 2)
+
+
+# ----------------------------------------------------------------
+#  MOMENTUM SCORE
+# ----------------------------------------------------------------
+def compute_momentum_score(df_h4, df_h1, df_m15, signal_is_bull: bool) -> int:
+    score = 0
+
+    try:
+        if df_h4 is not None and len(df_h4) >= 20:
+            adx_h4, pdi_h4, mdi_h4 = QuantEngine.adx(df_h4, 14)
+            adx_v = float(adx_h4.iloc[-1])
+            di_ok = (pdi_h4.iloc[-1] > mdi_h4.iloc[-1]) if signal_is_bull else (mdi_h4.iloc[-1] > pdi_h4.iloc[-1])
+            if adx_v >= 25 and di_ok:
+                score += 1
+    except Exception:
+        pass
+
+    try:
+        if df_h1 is not None and len(df_h1) >= 20:
+            adx_h1, pdi_h1, mdi_h1 = QuantEngine.adx(df_h1, 14)
+            adx_v = float(adx_h1.iloc[-1])
+            di_ok = (pdi_h1.iloc[-1] > mdi_h1.iloc[-1]) if signal_is_bull else (mdi_h1.iloc[-1] > pdi_h1.iloc[-1])
+            if adx_v >= 25 and di_ok:
+                score += 1
+    except Exception:
+        pass
+
+    try:
+        if df_m15 is not None and len(df_m15) >= 20:
+            adx_m15, pdi_m15, mdi_m15 = QuantEngine.adx(df_m15, 14)
+            adx_v = float(adx_m15.iloc[-1])
+            di_ok = (pdi_m15.iloc[-1] > mdi_m15.iloc[-1]) if signal_is_bull else (mdi_m15.iloc[-1] > pdi_m15.iloc[-1])
+            if adx_v >= 25 and di_ok:
+                score += 1
+    except Exception:
+        pass
+
+    return score
+
+
+# ----------------------------------------------------------------
+#  SYSTÈME DE NOTATION  V15
+# ----------------------------------------------------------------
+def compute_score(flip_type, candles_ago,
+                  mtf_pct, mtf_dominant,
+                  zone_discount, zone_premium,
+                  near_pdl, near_pdh, below_mid, above_mid,
+                  in_bull_fvg, in_bear_fvg, fvg_near_bull, fvg_near_bear,
+                  adx_val, pdi_val, mdi_val, atr_val, atr_mean,
+                  midnight_bonus: bool = False):
+
+    score = 0
+    score_detail = {}
+
+    if flip_type is not None and candles_ago is not None:
+        mins = candles_ago * 15
+        if   mins <= 15: pts = 30
+        elif mins <= 30: pts = 20
+        elif mins <= 45: pts = 10
+        else:            pts = 0
+    else:
+        pts = 0
+    score += pts
+    score_detail["Trigger"] = pts
+
+    signal_is_bull = (flip_type == "BULL")
+    signal_is_bear = (flip_type == "BEAR")
+
+    mtf_aligned = ((signal_is_bull and mtf_dominant == "Bullish") or
+                   (signal_is_bear and mtf_dominant == "Bearish"))
+    if mtf_aligned:
+        if   mtf_pct >= 80: pts = 25
+        elif mtf_pct >= 65: pts = 18
+        elif mtf_pct >= 50: pts = 10
+        else:               pts = 5
+    else:
+        pts = 0
+    score += pts
+    score_detail["MTF"] = pts
+
+    if signal_is_bull:
+        pts = 15 if zone_discount else (8 if below_mid else 0)
+    elif signal_is_bear:
+        pts = 15 if zone_premium  else (8 if above_mid else 0)
+    else:
+        pts = 0
+    score += pts
+    score_detail["Zone"] = pts
+
+    if midnight_bonus:
+        score += 3
+        score_detail["Midnight"] = 3
+    else:
+        score_detail["Midnight"] = 0
+
+    if signal_is_bull:
+        pts = 15 if in_bull_fvg else (7 if fvg_near_bull else 0)
+    elif signal_is_bear:
+        pts = 15 if in_bear_fvg else (7 if fvg_near_bear else 0)
+    else:
+        pts = 0
+    score += pts
+    score_detail["FVG"] = pts
+
+    adx_dir_ok = ((signal_is_bull and pdi_val > mdi_val) or
+                  (signal_is_bear and mdi_val > pdi_val))
+    if   adx_val > 25 and adx_dir_ok: pts = 10
+    elif adx_val > 20 and adx_dir_ok: pts = 6
+    elif adx_val > 20:                pts = 3
+    else:                             pts = 0
+    score += pts
+    score_detail["ADX"] = pts
+
+    if   atr_val >= atr_mean:       pts = 5
+    elif atr_val >= atr_mean * 0.5: pts = 3
+    else:                           pts = 0
+    score += pts
+    score_detail["ATR"] = pts
+
+    if   score >= 85: grade = "A+"
+    elif score >= 70: grade = "A"
+    elif score >= 55: grade = "B+"
+    elif score >= 40: grade = "B"
+    else:             grade = "C"
+
+    return score, grade, score_detail
+
+
+# ----------------------------------------------------------------
+#  FLIP HMA
+# ----------------------------------------------------------------
+def find_last_hma_flip(hma_series, max_lookback=20):
+    colors = []
+    for i in range(len(hma_series) - 1,
+                   max(len(hma_series) - max_lookback - 2, 1), -1):
+        v_curr = hma_series.iloc[i]
+        v_prev = hma_series.iloc[i - 1]
+        if pd.isna(v_curr) or pd.isna(v_prev):
+            continue
+        colors.append((i, "GREEN" if v_curr > v_prev else "RED"))
+    for j in range(len(colors) - 1):
+        idx_curr, col_curr = colors[j]
+        _,        col_prev = colors[j + 1]
+        if col_curr != col_prev:
+            candles_ago = (len(hma_series) - 1) - idx_curr
+            return ("BULL" if col_curr == "GREEN" else "BEAR"), candles_ago
+    return None, None
 
 
 # ----------------------------------------------------------------
 #  FETCH OANDA
 # ----------------------------------------------------------------
-def fetch_oanda(client, instrument, granularity, count):
+MAX_RETRIES = 3
+RETRY_DELAY = 1.5
+
+def fetch_oanda_data(client, instrument, granularity, count):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = instruments.InstrumentsCandles(
@@ -46,548 +593,332 @@ def fetch_oanda(client, instrument, granularity, count):
                 params={"count": count, "granularity": granularity}
             )
             client.request(r)
+            if not isinstance(r.response, dict) or "candles" not in r.response:
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY * attempt)
+                    continue
+                return pd.DataFrame(), "Réponse inattendue"
             rows = [
                 {"time":  pd.to_datetime(c["time"]),
                  "open":  float(c["mid"]["o"]),
                  "high":  float(c["mid"]["h"]),
                  "low":   float(c["mid"]["l"]),
                  "close": float(c["mid"]["c"])}
-                for c in r.response.get("candles", []) if c.get("complete")
+                for c in r.response["candles"] if c.get("complete")
             ]
             if not rows:
-                return pd.DataFrame(), "Aucune bougie"
+                return pd.DataFrame(), "Aucune bougie complète"
             df = pd.DataFrame(rows).set_index("time")
             if df.index.tz is None:
                 df.index = df.index.tz_localize("UTC")
             return df, None
         except Exception as e:
+            err_str = str(e)
+            if "401" in err_str or "Unauthorized" in err_str:
+                return pd.DataFrame(), "TOKEN_INVALID"
+            elif "429" in err_str:
+                time.sleep(RETRY_DELAY * attempt * 3)
+            elif "500" in err_str or "503" in err_str:
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY * attempt)
+                    continue
             if attempt == MAX_RETRIES:
                 return pd.DataFrame(), str(e)
-            time.sleep(RETRY_DELAY * attempt)
     return pd.DataFrame(), "MAX_RETRIES"
 
 
+def test_oanda_connection(client, account_id=None):
+    try:
+        if account_id:
+            r = accounts.AccountDetails(account_id)
+        else:
+            r = accounts.AccountList()
+        client.request(r)
+        if account_id:
+            acc      = r.response.get("account", {})
+            currency = acc.get("currency", "?")
+            balance  = acc.get("balance",  "?")
+            return True, f"✅ Connecté — compte `{account_id}` · {currency} {balance}"
+        else:
+            accs = r.response.get("accounts", [])
+            ids  = [a.get("id", "?") for a in accs]
+            return True, f"✅ Connecté — {len(ids)} compte(s)"
+    except Exception as e:
+        err = str(e)
+        if "401" in err or "Unauthorized" in err:
+            return False, "❌ Token invalide ou expiré"
+        return False, f"❌ Erreur : {err}"
+
+
 # ----------------------------------------------------------------
-#  CALCUL DES NIVEAUX CLÉS
+#  FETCH STRENGTH
 # ----------------------------------------------------------------
-def compute_levels(df_d, df_m15):
-    """
-    Retourne pdh, pdl, midnight_open, price, zone_label
-    Logique identique au Pine Script TradingView :
-      PDH  = high[1]  daily  → iloc[-2]
-      PDL  = low[1]   daily  → iloc[-2]
-      MO   = open bougie M15 à 00:00 America/New_York
-    """
-    if df_d is None or len(df_d) < 2 or df_m15 is None or df_m15.empty:
+def fetch_strength_data(client) -> dict:
+    dfs = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {
+            ex.submit(fetch_oanda_data, client, pair, "H1", 100): pair
+            for pair in STRENGTH_PAIRS
+        }
+        for fut in as_completed(futures):
+            pair = futures[fut]
+            df, err = fut.result()
+            if not df.empty:
+                dfs[pair] = df
+    return dfs
+
+
+# ----------------------------------------------------------------
+#  ANALYSE PRINCIPALE
+# ----------------------------------------------------------------
+def analyze_asset(client, ticker, freshness_limit_min=30,
+                  strength_scores=None, debug_log=None):
+
+    def _reject(reason):
+        if debug_log is not None:
+            debug_log.append((ticker, reason))
         return None
 
-    pdh   = float(df_d["high"].iloc[-2])
-    pdl   = float(df_d["low"].iloc[-2])
-    price = float(df_m15["close"].iloc[-1])
-
-    # ── Midnight Open (00:00 NY) ──────────────────────────────
-    midnight_open = None
     try:
-        ny_tz     = pytz.timezone("America/New_York")
-        m15_idx   = df_m15.index
-        if m15_idx.tz is None:
-            m15_times = m15_idx.tz_localize("UTC").tz_convert(ny_tz)
-        else:
-            m15_times = m15_idx.tz_convert(ny_tz)
+        fetch_specs = [
+            ("M15", 400), ("H1", 200), ("D", 300),
+            ("H4", 300),  ("W", 250),  ("M", 80),
+        ]
+        fetch_results = {}
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futures = {
+                ex.submit(fetch_oanda_data, client, ticker, gran, cnt): gran
+                for gran, cnt in fetch_specs
+            }
+            for fut in as_completed(futures):
+                gran = futures[fut]
+                fetch_results[gran] = fut.result()
 
-        today_ny = datetime.now(ny_tz).date()
-        mn_mask  = (
-            (m15_times.date == today_ny) &
-            (m15_times.hour  == 0) &
-            (m15_times.minute == 0)
+        df_m15, err_m15 = fetch_results["M15"]
+        df_h1,  _       = fetch_results["H1"]
+        df_d,   err_d   = fetch_results["D"]
+        df_4h,  _       = fetch_results["H4"]
+        df_w,   _       = fetch_results["W"]
+        df_mo,  _       = fetch_results["M"]
+
+        if df_m15.empty: return _reject(f"FETCH_M15: {err_m15}")
+        if df_d.empty:   return _reject(f"FETCH_D: {err_d}")
+
+        price = df_m15['close'].iloc[-1]
+
+        current_price_proxy = float(df_m15['close'].iloc[-1])
+        bias, bias_detail = get_daily_bias_v2(df_d, current_price=current_price_proxy)
+        bias_bull = bias in ("BULLISH", "STRONG BULLISH")
+        bias_bear = bias in ("BEARISH", "STRONG BEARISH")
+
+        dfs_mtf = {
+            "M":   df_mo  if not (df_mo  is None or (hasattr(df_mo,  'empty') and df_mo.empty))  else None,
+            "W":   df_w   if not (df_w   is None or (hasattr(df_w,   'empty') and df_w.empty))   else None,
+            "D":   df_d   if not df_d.empty  else None,
+            "4H":  df_4h  if not (df_4h  is None or (hasattr(df_4h,  'empty') and df_4h.empty))  else None,
+            "1H":  df_h1  if not (df_h1  is None or (hasattr(df_h1,  'empty') and df_h1.empty))  else None,
+            "15m": df_m15 if not df_m15.empty else None,
+        }
+        mtf_pct, mtf_dominant, mtf_details = compute_mtf_analysis(dfs_mtf)
+
+        hma = QuantEngine.hma(df_m15['close'], 20)
+        if hma.isna().iloc[-5:].any():
+            return _reject("HMA_NAN")
+
+        flip_type, candles_ago = find_last_hma_flip(hma, max_lookback=20)
+        if flip_type is None:
+            return _reject("NO_HMA_FLIP")
+
+        if bias == "NEUTRAL":
+            return _reject("BIAS_NEUTRAL")
+
+        if   (flip_type == "BULL" and bias_bull) or (flip_type == "BEAR" and bias_bear):
+            bias_alignment = "ALIGNED"
+        else:
+            bias_alignment = "COUNTER"
+
+        mins_ago      = candles_ago * 15
+        freshness_str = f"⚡ {mins_ago} min" if mins_ago <= freshness_limit_min else f"⏳ {mins_ago} min"
+        signal_fresh  = mins_ago <= freshness_limit_min
+
+        hma_now = hma.iloc[-1]
+        if flip_type == "BULL" and price <= hma_now:
+            return _reject("PRICE_BELOW_HMA_ON_BULL")
+        if flip_type == "BEAR" and price >= hma_now:
+            return _reject("PRICE_ABOVE_HMA_ON_BEAR")
+
+        atr_m15  = QuantEngine.atr(df_m15, 14)
+        atr_val  = atr_m15.iloc[-1]
+        atr_mean = atr_m15.iloc[-50:].mean()
+
+        in_bull_fvg, in_bear_fvg, nb_fvg, nr_fvg = detect_fvg(df_m15, price, lookback=80)
+        fvg_near_bull = (nb_fvg is not None and
+                         abs(price - (nb_fvg[0] + nb_fvg[1]) / 2) < atr_val * 1.0)
+        fvg_near_bear = (nr_fvg is not None and
+                         abs(price - (nr_fvg[0] + nr_fvg[1]) / 2) < atr_val * 1.0)
+
+        # ══════════════════════════════════════════════════════════════
+        #  MIDNIGHT OPEN — calculé EN PREMIER (avant la zone)
+        #  Référence : 00h00 America/New_York (identique Pine Script TV)
+        #  midnightSession = "0000-0001:23456"
+        # ══════════════════════════════════════════════════════════════
+        midnight_open = None
+        try:
+            ny_tz     = pytz.timezone("America/New_York")
+            _m15_raw  = pd.to_datetime(df_m15.index)
+            if _m15_raw.tz is None:
+                m15_times = _m15_raw.tz_localize("UTC").tz_convert(ny_tz)
+            else:
+                m15_times = _m15_raw.tz_convert(ny_tz)
+            today_ny = datetime.now(ny_tz).date()
+            mn_mask  = (
+                (m15_times.date == today_ny) &
+                (m15_times.hour  == 0) &
+                (m15_times.minute == 0)
+            )
+            mn_c = df_m15[mn_mask]
+            if mn_c.empty:
+                today_c = df_m15[m15_times.date == today_ny]
+                if not today_c.empty:
+                    midnight_open = float(today_c["open"].iloc[0])
+            else:
+                midnight_open = float(mn_c["open"].iloc[0])
+        except Exception:
+            pass
+
+        # ══════════════════════════════════════════════════════════════
+        #  ZONE DISCOUNT / PREMIUM — ICT pur
+        #
+        #  PDH  = df_d["high"].iloc[-2]  ←→  high[1] Daily Pine Script (ligne verte)
+        #  PDL  = df_d["low"].iloc[-2]   ←→  low[1]  Daily Pine Script (ligne rouge)
+        #  MO   = open M15 à 00:00 NY    ←→  midnightOpenPrice Pine Script (ligne jaune)
+        #
+        #  PREMIUM   = price > MO  ET  price ≤ PDH
+        #  DISCOUNT  = price < MO  ET  price ≥ PDL
+        #  EXT HIGH  = price > PDH  (hors range)
+        #  EXT LOW   = price < PDL  (hors range)
+        #
+        #  Fallback si MO absent : midpoint PDH/PDL classique
+        # ══════════════════════════════════════════════════════════════
+        _d1_ref = -2 if len(df_d) >= 2 else -1
+        pdh = float(df_d["high"].iloc[_d1_ref])   # PDH — ligne verte TV
+        pdl = float(df_d["low"].iloc[_d1_ref])    # PDL — ligne rouge TV
+
+        if midnight_open is not None:
+            # Logique ICT pur avec MO comme équilibre intraday
+            in_premium       = (price > midnight_open) and (price <= pdh)
+            in_discount      = (price < midnight_open) and (price >= pdl)
+            in_extended_high = price > pdh
+            in_extended_low  = price < pdl
+
+            if in_extended_high:
+                zone_label = "EXT HIGH"
+            elif in_extended_low:
+                zone_label = "EXT LOW"
+            elif in_premium:
+                zone_label = "PREMIUM"
+            elif in_discount:
+                zone_label = "DISCOUNT"
+            else:
+                zone_label = "EQUILIBRE"
+
+            zone_discount = in_discount
+            zone_premium  = in_premium
+            below_mid     = in_discount
+            above_mid     = in_premium
+
+        else:
+            # Fallback : midpoint PDH/PDL si MO absent
+            d1_mid        = (pdh + pdl) / 2.0
+            in_discount   = price < d1_mid
+            in_premium    = price > d1_mid
+            zone_discount = in_discount
+            zone_premium  = in_premium
+            below_mid     = in_discount
+            above_mid     = in_premium
+            zone_label    = ("DISCOUNT" if in_discount else
+                             "PREMIUM"  if in_premium  else "EQUILIBRE")
+
+        # Bonus Midnight : confluence directionnelle avec MO
+        midnight_bonus = False
+        if midnight_open is not None:
+            if flip_type == "BULL" and price < midnight_open:
+                midnight_bonus = True
+            elif flip_type == "BEAR" and price > midnight_open:
+                midnight_bonus = True
+
+        df_adx_src           = df_h1 if not (df_h1 is None or (hasattr(df_h1, 'empty') and df_h1.empty)) and len(df_h1) >= 20 else df_m15
+        adx_s, pdi_s, mdi_s = QuantEngine.adx(df_adx_src, 14)
+        adx_val_score = round(adx_s.iloc[-1], 1)
+        pdi_val = round(pdi_s.iloc[-1], 1)
+        mdi_val = round(mdi_s.iloc[-1], 1)
+
+        # ADR (forex/metals) ou ATR (indices)
+        if ticker in INDICES:
+            _atr_d_raw  = QuantEngine.atr(df_d, 14).iloc[-1]
+            adr_display = round(float(_atr_d_raw), 2) if not pd.isna(_atr_d_raw) else None
+            adr_label   = "ATR"
+        else:
+            _adr_raw    = compute_adr(df_d, period=14)
+            adr_display = round(float(_adr_raw), 5) if not pd.isna(_adr_raw) else None
+            adr_label   = "ADR"
+
+        score, grade, score_detail = compute_score(
+            flip_type, candles_ago, mtf_pct, mtf_dominant,
+            zone_discount, zone_premium,
+            False, False,
+            below_mid, above_mid,
+            in_bull_fvg, in_bear_fvg, fvg_near_bull, fvg_near_bear,
+            adx_val_score, pdi_val, mdi_val, atr_val, atr_mean,
+            midnight_bonus=midnight_bonus
         )
-        mn_c = df_m15[mn_mask]
-        if mn_c.empty:
-            today_c = df_m15[m15_times.date == today_ny]
-            if not today_c.empty:
-                midnight_open = float(today_c["open"].iloc[0])
-        else:
-            midnight_open = float(mn_c["open"].iloc[0])
-    except Exception:
-        pass
 
-    # ── Classification de zone ────────────────────────────────
-    if midnight_open is not None:
-        if price > pdh:
-            zone = "EXT HIGH"
-        elif price < pdl:
-            zone = "EXT LOW"
-        elif price > midnight_open:
-            zone = "PREMIUM"
-        elif price < midnight_open:
-            zone = "DISCOUNT"
-        else:
-            zone = "EQUILIBRE"
-    else:
-        d1_mid = (pdh + pdl) / 2.0
-        if price > pdh:
-            zone = "EXT HIGH"
-        elif price < pdl:
-            zone = "EXT LOW"
-        elif price > d1_mid:
-            zone = "PREMIUM"
-        elif price < d1_mid:
-            zone = "DISCOUNT"
-        else:
-            zone = "EQUILIBRE"
+        strength_delta = None
+        if strength_scores:
+            strength_delta = get_strength_delta(ticker, strength_scores)
 
-    return {
-        "pdh":          pdh,
-        "pdl":          pdl,
-        "midnight_open": midnight_open,
-        "price":        price,
-        "zone":         zone,
-        "mo_fallback":  midnight_open is None,
-    }
+        signal_is_bull = (flip_type == "BULL")
+        _df_h4 = df_4h if not (df_4h is None or (hasattr(df_4h, 'empty') and df_4h.empty)) else None
+        _df_h1 = df_h1 if not (df_h1 is None or (hasattr(df_h1, 'empty') and df_h1.empty)) else None
+        momentum = compute_momentum_score(_df_h4, _df_h1, df_m15, signal_is_bull)
+
+        sig = (("▲ LONG"  if flip_type == "BULL" else "▼ SHORT")
+               if signal_fresh else
+               ("LONG (expiré)" if flip_type == "BULL" else "SHORT (expiré)"))
+
+        return {
+            "Fraîcheur":      freshness_str,
+            "Actif + Note":   ticker,
+            "Signal":         sig,
+            "Biais Daily":    bias,
+            "Alignement":     bias_alignment,
+            "Zone":           zone_label,
+            "Score /100":     score,
+            "Grade":          grade,
+            "ADX H1":         adx_val_score,
+            "ADR":            adr_display,
+            "ADR Label":      adr_label,
+            "MTF Pct":        mtf_pct,
+            "MTF Dom":        mtf_dominant,
+            "MTF Details":    mtf_details,
+            "Strength Δ":     strength_delta,
+            "Momentum":       momentum,
+            "signal_is_bull": signal_is_bull,
+            "Midnight Bonus": midnight_bonus,
+        }
+
+    except Exception as e:
+        if debug_log is not None:
+            debug_log.append((ticker, f"EXCEPTION: {e}"))
+        return None
 
 
 # ----------------------------------------------------------------
-#  RENDU : BARRE VERTICALE DE ZONE (SVG-like en HTML/CSS)
-# ----------------------------------------------------------------
-def render_zone_bar(levels: dict, ticker: str) -> str:
-    """
-    Génère un bloc HTML affichant la barre verticale PDH→MO→PDL
-    avec le prix courant positionné dessus.
-    """
-    pdh   = levels["pdh"]
-    pdl   = levels["pdl"]
-    mo    = levels["midnight_open"]
-    price = levels["price"]
-    zone  = levels["zone"]
-    fallback = levels["mo_fallback"]
-
-    total_range = pdh - pdl
-    if total_range <= 0:
-        return ""
-
-    # Pivot : si MO disponible, utiliser MO; sinon midpoint
-    pivot = mo if mo is not None else (pdh + pdl) / 2.0
-
-    # Pct position (0% = PDL, 100% = PDH)
-    def pct(val):
-        v = (val - pdl) / total_range * 100
-        return max(0.0, min(100.0, v))
-
-    pivot_pct  = pct(pivot)
-    price_pct  = pct(price)
-    price_clamp = max(2.0, min(98.0, price_pct))
-
-    # ── Couleurs zones ────────────────────────────────────────
-    ZONE_COLORS = {
-        "PREMIUM":   {"bg": "rgba(138, 96, 40, 0.22)", "text": "#c8952a", "icon": "▲"},
-        "DISCOUNT":  {"bg": "rgba(74, 120, 152, 0.22)", "text": "#4a98c8", "icon": "▼"},
-        "EXT HIGH":  {"bg": "rgba(158, 74, 58, 0.18)", "text": "#e05a3a", "icon": "⚡"},
-        "EXT LOW":   {"bg": "rgba(58, 122, 158, 0.18)", "text": "#3a9ece", "icon": "⚡"},
-        "EQUILIBRE": {"bg": "rgba(90,90,90,0.15)",      "text": "#909090", "icon": "—"},
-    }
-    zc = ZONE_COLORS.get(zone, ZONE_COLORS["EQUILIBRE"])
-
-    # ── Formatage du prix (auto-détection décimales) ──────────
-    def fmt(v):
-        if v is None:
-            return "—"
-        if v > 1000:
-            return f"{v:,.2f}"
-        elif v > 10:
-            return f"{v:.3f}"
-        else:
-            return f"{v:.5f}"
-
-    # ── Label ticker court ────────────────────────────────────
-    short = ticker.replace("_USD", "").replace("_EUR", "").replace("_", "/")
-
-    # ── Hauteur totale de la barre en px ─────────────────────
-    BAR_H = 200
-
-    # position pixel du pivot et du prix (inversion: 100% = haut)
-    pivot_px   = BAR_H * (1 - pivot_pct  / 100)
-    price_px   = BAR_H * (1 - price_clamp / 100)
-
-    # Heights des deux zones (PREMIUM = pivot→top, DISCOUNT = bottom→pivot)
-    premium_h  = pivot_px         # px depuis le haut
-    discount_h = BAR_H - pivot_px # px depuis pivot jusqu'en bas
-
-    # Label fallback MO
-    mo_label_extra = (' <span style="font-size:9px;color:#606060">(fallback)</span>'
-                      if fallback else "")
-
-    # ── Pct de remplissage dans la zone (pour mini-gauge) ─────
-    if zone == "PREMIUM" and pivot is not None:
-        fill_pct = (price - pivot) / (pdh - pivot) * 100 if pdh > pivot else 50
-    elif zone == "DISCOUNT" and pivot is not None:
-        fill_pct = (pivot - price) / (pivot - pdl) * 100 if pivot > pdl else 50
-    else:
-        fill_pct = 50
-    fill_pct = max(0, min(100, fill_pct))
-
-    html = f"""
-<div style="
-    background:#0c0c14;
-    border:1px solid #1a1a2e;
-    border-top:2px solid {zc['text']}33;
-    border-radius:6px;
-    padding:14px 16px 16px;
-    font-family:'IBM Plex Mono',monospace;
-    min-width:180px;
-    position:relative;
-    overflow:hidden;
-">
-  <!-- Fond glow ambiant -->
-  <div style="
-    position:absolute;top:0;left:0;right:0;bottom:0;
-    background:radial-gradient(ellipse at 50% 0%, {zc['text']}08 0%, transparent 70%);
-    pointer-events:none;
-  "></div>
-
-  <!-- Header ticker -->
-  <div style="
-    display:flex;justify-content:space-between;align-items:center;
-    margin-bottom:12px;position:relative;
-  ">
-    <span style="
-      font-size:16px;font-weight:800;color:#c0c0d8;
-      letter-spacing:.06em;
-    ">{short}</span>
-    <span style="
-      font-size:11px;font-weight:700;color:{zc['text']};
-      background:{zc['bg']};
-      padding:2px 8px;border-radius:2px;
-      letter-spacing:.1em;
-    ">{zc['icon']} {zone}</span>
-  </div>
-
-  <!-- Corps : barre verticale + labels -->
-  <div style="display:flex;gap:12px;align-items:stretch;position:relative;">
-
-    <!-- Barre verticale -->
-    <div style="
-      position:relative;width:22px;flex-shrink:0;
-      height:{BAR_H}px;
-    ">
-      <!-- Zone PREMIUM (PDH → MO) -->
-      <div style="
-        position:absolute;top:0;left:0;right:0;
-        height:{premium_h:.1f}px;
-        background:rgba(138,96,40,0.18);
-        border-left:3px solid #c8952a44;
-      "></div>
-      <!-- Zone DISCOUNT (MO → PDL) -->
-      <div style="
-        position:absolute;left:0;right:0;bottom:0;
-        height:{discount_h:.1f}px;
-        background:rgba(74,120,152,0.18);
-        border-left:3px solid #4a98c844;
-      "></div>
-
-      <!-- Ligne PDH (verte) -->
-      <div style="
-        position:absolute;top:0px;left:-4px;right:-4px;
-        height:2px;background:#39FF14;
-        box-shadow:0 0 6px #39FF1466;
-      "></div>
-      <!-- Ligne PDL (rouge) -->
-      <div style="
-        position:absolute;bottom:0px;left:-4px;right:-4px;
-        height:2px;background:#FF003C;
-        box-shadow:0 0 6px #FF003C66;
-      "></div>
-      <!-- Ligne MO (jaune) -->
-      <div style="
-        position:absolute;left:-4px;right:-4px;
-        top:{pivot_px:.1f}px;
-        height:2px;background:#FFE000;
-        box-shadow:0 0 6px #FFE00066;
-      "></div>
-
-      <!-- Prix courant (triangle) -->
-      <div style="
-        position:absolute;
-        top:{price_px - 5:.1f}px;
-        left:26px;
-        width:0;height:0;
-        border-top:5px solid transparent;
-        border-bottom:5px solid transparent;
-        border-right:8px solid {zc['text']};
-        filter:drop-shadow(0 0 4px {zc['text']}88);
-      "></div>
-    </div>
-
-    <!-- Labels niveaux -->
-    <div style="
-      position:relative;
-      flex:1;height:{BAR_H}px;
-      font-size:11px;
-    ">
-      <!-- PDH -->
-      <div style="
-        position:absolute;top:-2px;left:0;right:0;
-        display:flex;justify-content:space-between;align-items:center;
-      ">
-        <span style="color:#39FF14;font-weight:700;font-size:10px;letter-spacing:.08em">PDH</span>
-        <span style="color:#39FF14;font-size:10px">{fmt(pdh)}</span>
-      </div>
-
-      <!-- Label PREMIUM centré dans la zone -->
-      <div style="
-        position:absolute;
-        top:{premium_h/2 - 8:.1f}px;
-        left:0;right:0;text-align:center;
-      ">
-        <span style="color:#c8952a55;font-size:9px;letter-spacing:.14em;text-transform:uppercase">PREMIUM</span>
-      </div>
-
-      <!-- MO -->
-      <div style="
-        position:absolute;top:{pivot_px - 8:.1f}px;left:0;right:0;
-        display:flex;justify-content:space-between;align-items:center;
-      ">
-        <span style="color:#FFE000;font-weight:700;font-size:10px;letter-spacing:.08em">
-          MO{mo_label_extra}
-        </span>
-        <span style="color:#FFE000;font-size:10px">{fmt(mo)}</span>
-      </div>
-
-      <!-- Label DISCOUNT centré dans la zone -->
-      <div style="
-        position:absolute;
-        top:{pivot_px + discount_h/2 - 8:.1f}px;
-        left:0;right:0;text-align:center;
-      ">
-        <span style="color:#4a98c855;font-size:9px;letter-spacing:.14em;text-transform:uppercase">DISCOUNT</span>
-      </div>
-
-      <!-- PDL -->
-      <div style="
-        position:absolute;bottom:-2px;left:0;right:0;
-        display:flex;justify-content:space-between;align-items:center;
-      ">
-        <span style="color:#FF003C;font-weight:700;font-size:10px;letter-spacing:.08em">PDL</span>
-        <span style="color:#FF003C;font-size:10px">{fmt(pdl)}</span>
-      </div>
-
-      <!-- Prix courant -->
-      <div style="
-        position:absolute;
-        top:{price_px - 9:.1f}px;
-        left:0;right:0;
-        display:flex;justify-content:space-between;align-items:center;
-      ">
-        <span style="color:{zc['text']};font-weight:700;font-size:10px;letter-spacing:.06em">PRICE</span>
-        <span style="color:{zc['text']};font-weight:700;font-size:11px">{fmt(price)}</span>
-      </div>
-    </div>
-  </div>
-
-  <!-- Footer : mini-gauge de position dans la zone -->
-  <div style="margin-top:14px;position:relative;">
-    <div style="
-      display:flex;justify-content:space-between;
-      font-size:9px;color:#303048;letter-spacing:.1em;
-      margin-bottom:3px;
-    ">
-      <span>{'PDL' if zone in ('DISCOUNT','EXT LOW')  else 'MO'}</span>
-      <span style="color:{zc['text']};font-size:9px">
-        POSITION DANS LA ZONE
-      </span>
-      <span>{'MO'  if zone in ('DISCOUNT','EXT LOW')  else 'PDH'}</span>
-    </div>
-    <div style="
-      height:3px;background:#111122;border-radius:2px;overflow:hidden;
-    ">
-      <div style="
-        height:100%;width:{fill_pct:.1f}%;
-        background:linear-gradient(90deg, {zc['text']}66, {zc['text']});
-        border-radius:2px;
-        transition:width .3s ease;
-      "></div>
-    </div>
-  </div>
-</div>
-"""
-    return html
-
-
-# ----------------------------------------------------------------
-#  RENDU : RÉSUMÉ GLOBAL (grille complète)
-# ----------------------------------------------------------------
-def render_summary_table(all_levels: list) -> str:
-    """
-    Tableau compact listant tous les actifs avec leur zone.
-    """
-    ZONE_COLORS = {
-        "PREMIUM":   "#c8952a",
-        "DISCOUNT":  "#4a98c8",
-        "EXT HIGH":  "#e05a3a",
-        "EXT LOW":   "#3a9ece",
-        "EQUILIBRE": "#707070",
-        "ERROR":     "#404040",
-    }
-
-    rows_html = ""
-    for item in all_levels:
-        ticker = item["ticker"]
-        short  = ticker.replace("_USD","").replace("_EUR","").replace("_","<br>")
-        if item.get("error"):
-            rows_html += f"""
-<tr>
-  <td style="color:#303048;font-size:11px;padding:6px 8px;border-bottom:1px solid #0f0f1e">
-    {short}
-  </td>
-  <td colspan="4" style="color:#303048;font-size:10px;padding:6px 8px;border-bottom:1px solid #0f0f1e">
-    — données indisponibles
-  </td>
-</tr>"""
-            continue
-
-        lv    = item["levels"]
-        zone  = lv["zone"]
-        zcolor = ZONE_COLORS.get(zone, "#707070")
-        mo_ind = "" if not lv["mo_fallback"] else '<span style="color:#404060;font-size:9px"> ⚠</span>'
-
-        def fmt(v):
-            if v is None: return "—"
-            if v > 1000:  return f"{v:,.0f}"
-            elif v > 10:  return f"{v:.3f}"
-            else:         return f"{v:.5f}"
-
-        rows_html += f"""
-<tr style="transition:background .15s" onmouseover="this.style.background='#111118'" onmouseout="this.style.background='transparent'">
-  <td style="
-    color:#a0a0b8;font-size:12px;font-weight:700;
-    padding:8px 10px;border-bottom:1px solid #0f0f1e;
-    letter-spacing:.06em;white-space:nowrap;
-  ">{ticker.replace("_","/")}</td>
-  <td style="
-    padding:8px 10px;border-bottom:1px solid #0f0f1e;
-    color:#39FF14;font-size:11px;font-family:'IBM Plex Mono',monospace;
-  ">{fmt(lv['pdh'])}</td>
-  <td style="
-    padding:8px 10px;border-bottom:1px solid #0f0f1e;
-    color:#FFE000;font-size:11px;font-family:'IBM Plex Mono',monospace;
-  ">{fmt(lv['midnight_open'])}{mo_ind}</td>
-  <td style="
-    padding:8px 10px;border-bottom:1px solid #0f0f1e;
-    color:#FF003C;font-size:11px;font-family:'IBM Plex Mono',monospace;
-  ">{fmt(lv['pdl'])}</td>
-  <td style="
-    padding:8px 10px;border-bottom:1px solid #0f0f1e;
-    color:#a0a0b8;font-size:11px;font-family:'IBM Plex Mono',monospace;
-  ">{fmt(lv['price'])}</td>
-  <td style="padding:8px 10px;border-bottom:1px solid #0f0f1e;">
-    <span style="
-      color:{zcolor};font-weight:700;font-size:11px;
-      background:{zcolor}18;
-      padding:2px 8px;border-radius:2px;
-      letter-spacing:.1em;
-      font-family:'IBM Plex Mono',monospace;
-    ">{zone}</span>
-  </td>
-</tr>"""
-
-    # Stats globales
-    zones_all = [i["levels"]["zone"] for i in all_levels if not i.get("error")]
-    from collections import Counter
-    cnt = Counter(zones_all)
-    total = len(zones_all) or 1
-
-    def bar(n):
-        w = int(n / total * 80)
-        return f'<div style="width:{w}px;height:6px;background:currentColor;border-radius:2px;display:inline-block"></div>'
-
-    stats_html = f"""
-<div style="
-  display:flex;gap:24px;flex-wrap:wrap;
-  font-family:'IBM Plex Mono',monospace;
-  font-size:11px;padding:14px 16px;
-  background:#0a0a12;border-radius:4px;
-  margin-bottom:16px;
-">
-  <div style="color:#c8952a">
-    {bar(cnt.get('PREMIUM',0))} PREMIUM <strong>{cnt.get('PREMIUM',0)}</strong>
-  </div>
-  <div style="color:#4a98c8">
-    {bar(cnt.get('DISCOUNT',0))} DISCOUNT <strong>{cnt.get('DISCOUNT',0)}</strong>
-  </div>
-  <div style="color:#e05a3a">
-    {bar(cnt.get('EXT HIGH',0))} EXT HIGH <strong>{cnt.get('EXT HIGH',0)}</strong>
-  </div>
-  <div style="color:#3a9ece">
-    {bar(cnt.get('EXT LOW',0))} EXT LOW <strong>{cnt.get('EXT LOW',0)}</strong>
-  </div>
-  <div style="color:#909090">
-    {bar(cnt.get('EQUILIBRE',0))} EQUILIBRE <strong>{cnt.get('EQUILIBRE',0)}</strong>
-  </div>
-</div>"""
-
-    return f"""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap');
-</style>
-{stats_html}
-<div style="overflow-x:auto">
-<table style="
-  width:100%;border-collapse:collapse;
-  font-family:'IBM Plex Mono',monospace;
-  background:#0a0a12;border-radius:6px;
-  overflow:hidden;
-">
-<thead>
-<tr style="border-bottom:2px solid #2a2a5a">
-  <th style="padding:10px 10px;text-align:left;color:#404060;font-size:11px;letter-spacing:.14em;text-transform:uppercase;font-weight:700;">Actif</th>
-  <th style="padding:10px 10px;text-align:left;color:#39FF14;font-size:11px;letter-spacing:.1em;">PDH 🟢</th>
-  <th style="padding:10px 10px;text-align:left;color:#FFE000;font-size:11px;letter-spacing:.1em;">MO 🟡</th>
-  <th style="padding:10px 10px;text-align:left;color:#FF003C;font-size:11px;letter-spacing:.1em;">PDL 🔴</th>
-  <th style="padding:10px 10px;text-align:left;color:#606080;font-size:11px;letter-spacing:.1em;">Prix</th>
-  <th style="padding:10px 10px;text-align:left;color:#606080;font-size:11px;letter-spacing:.1em;">Zone</th>
-</tr>
-</thead>
-<tbody>
-{rows_html}
-</tbody>
-</table>
-</div>"""
-
-
-# ----------------------------------------------------------------
-#  FETCH PARALLÈLE TOUS LES ACTIFS
-# ----------------------------------------------------------------
-def fetch_all_levels(client, assets, progress_cb=None):
-    results = []
-
-    def _fetch_one(ticker):
-        df_d,   _ = fetch_oanda(client, ticker, "D",   50)
-        df_m15, _ = fetch_oanda(client, ticker, "M15", 200)
-        if df_d.empty or df_m15.empty:
-            return {"ticker": ticker, "error": True}
-        lv = compute_levels(df_d, df_m15)
-        if lv is None:
-            return {"ticker": ticker, "error": True}
-        return {"ticker": ticker, "levels": lv, "error": False}
-
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(_fetch_one, t): t for t in assets}
-        done = 0
-        for fut in as_completed(futures):
-            results.append(fut.result())
-            done += 1
-            if progress_cb:
-                progress_cb(done / len(assets))
-
-    results.sort(key=lambda x: assets.index(x["ticker"]))
-    return results
-
-
-# ----------------------------------------------------------------
-#  MAIN STREAMLIT
+#  INTERFACE STREAMLIT  (identique V15 original)
 # ----------------------------------------------------------------
 def main():
     st.set_page_config(
-        page_title="BLUESTAR ZONE INDICATOR",
+        page_title="BLUESTAR SNIPER V15",
         layout="wide",
         initial_sidebar_state="collapsed"
     )
@@ -595,423 +926,393 @@ def main():
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;600;700&display=swap');
-    html, body, [class*="css"] { font-family:'Space Grotesk',sans-serif; }
-    .stApp { background:#0e0e14; }
-    h1 { font-family:'IBM Plex Mono',monospace !important; }
+    html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
+    .stApp { background: #0e0e14; }
+    h1 { font-family: 'IBM Plex Mono', monospace !important; letter-spacing: .04em; }
     .stButton > button {
-        background:#141420 !important; color:#a0b4cc !important;
-        border:1px solid #2a3448 !important;
-        font-family:'IBM Plex Mono',monospace !important;
-        font-weight:700 !important; letter-spacing:.06em !important;
-        border-radius:4px !important;
+        background: #141420 !important; color: #a0b4cc !important;
+        border: 1px solid #2a3448 !important;
+        font-family: 'IBM Plex Mono', monospace !important;
+        font-weight: 700 !important; letter-spacing: .06em !important;
+        border-radius: 4px !important; transition: all .2s ease !important;
     }
     .stButton > button:hover {
-        background:#1c2030 !important;
-        border-color:#3a4a68 !important;
-        color:#c8d8e8 !important;
+        background: #1c2030 !important; border-color: #3a4a68 !important;
+        color: #c8d8e8 !important;
     }
-    hr { border-color:#1a1a28 !important; }
-    [data-testid="stTab"] button { font-family:'IBM Plex Mono',monospace !important; }
+    .stSelectbox label { color: #606080 !important; font-size: 12px !important;
+        text-transform: uppercase !important; letter-spacing: .08em !important; }
+    [data-testid="stMetric"] {
+        background: #121218; border: 1px solid #1e1e2e;
+        border-radius: 6px; padding: 12px 16px !important;
+    }
+    [data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace !important; }
+    .streamlit-expanderHeader { color: #606080 !important; font-size: 12px !important;
+        text-transform: uppercase !important; }
+    hr { border-color: #1a1a28 !important; }
     </style>
     """, unsafe_allow_html=True)
 
-    # ── Header ────────────────────────────────────────────────
-    st.markdown("""
+    kz_now  = get_current_killzone()
+    kz_html = (f'<span style="font-size:12px;font-family:\'IBM Plex Mono\',monospace;'
+               f'color:#5a9e7a;letter-spacing:.08em;margin-left:14px">'
+               f'{killzone_badge(kz_now)}</span>'
+               if kz_now else "")
+
+    st.markdown(f"""
     <div style="display:flex;align-items:center;gap:14px;margin-bottom:4px">
-      <span style="font-size:36px">📐</span>
+      <span style="font-size:36px">🎯</span>
       <div>
-        <h1 style="margin:0;font-size:26px;color:#e8e8f8;font-family:'IBM Plex Mono',monospace">
-          BLUESTAR ZONE INDICATOR
+        <h1 style="margin:0;font-size:28px;color:#e8e8f8">
+          BLUESTAR SNIPER V15 {kz_html}
         </h1>
-        <p style="margin:0;color:#4a4a7a;font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.12em">
-          PDH 🟢 · MIDNIGHT OPEN 🟡 · PDL 🔴 · PREMIUM / DISCOUNT ICT
+        <p style="margin:0;color:#4a4a7a;font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.1em">
+          HMA 20 M15 · MTF INSTITUTIONAL · ADR DAILY · FORCE H4·H1·M15 · LUXALGO FVG
         </p>
       </div>
     </div>
     <hr>
     """, unsafe_allow_html=True)
 
-    # ── Secrets ───────────────────────────────────────────────
-    missing = [k for k in ("OANDA_ACCESS_TOKEN", "OANDA_ACCOUNT_ID")
-               if k not in st.secrets]
+    missing = [k for k in ("OANDA_ACCESS_TOKEN", "OANDA_ACCOUNT_ID") if k not in st.secrets]
     if missing:
         st.error(f"🔑 **Secret(s) manquant(s) :** `{'`, `'.join(missing)}`")
         st.stop()
 
     ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
-    client = oandapyV20.API(access_token=ACCESS_TOKEN, environment="practice")
+    ACCOUNT_ID   = st.secrets["OANDA_ACCOUNT_ID"]
+    env          = "practice"
 
-    # ── Mode selector ─────────────────────────────────────────
-    tab_global, tab_detail = st.tabs(["📊 VUE GLOBALE — tous les actifs",
-                                       "🔍 ZOOM — actif sélectionné"])
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        freshness  = st.selectbox("Fraîcheur max du signal (min)", [15, 30, 45, 60], index=1)
+    with col2:
+        min_grade  = st.selectbox("Grade minimum", ["Tous", "B", "B+", "A", "A+"], index=0)
+    with col3:
+        show_debug = st.toggle("🐛 Debug", value=False)
 
-    # ════════════════════════════════════════════════════════
-    #  TAB 1 : VUE GLOBALE
-    # ════════════════════════════════════════════════════════
-    with tab_global:
-        st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("📘 Grille de notation V15"):
+        st.markdown("""
+| Critère | Max | Détail |
+|---|---|---|
+| **Trigger HMA flip** | 30 pts | ≤15 min = 30 · ≤30 min = 20 · ≤45 min = 10 · >45 min = 0 |
+| **MTF Alignment** | 25 pts | ≥80% = 25 · ≥65% = 18 · ≥50% = 10 · contre-MTF = 0 |
+| **Zone D1** | 15 pts | Discount/Premium = 15 (MO comme équilibre) · Zone seule = 8 |
+| **Midnight Bonus** | 3 pts | Confluence directionnelle avec MO |
+| **FVG M15** | 15 pts | LuxAlgo exact (mitigation + seuil auto) |
+| **ADX momentum** | 10 pts | ADX>25+DI ok = 10 · ADX>20+DI ok = 6 |
+| **ATR actif** | 5 pts | ≥ moyenne = 5 · ≥ 50% = 3 |
 
-        col_run, col_filter = st.columns([2, 2])
-        with col_run:
-            run_global = st.button("🚀  SCANNER TOUTES LES ZONES", use_container_width=True)
-        with col_filter:
-            zone_filter = st.multiselect(
-                "Filtrer par zone",
-                ["PREMIUM", "DISCOUNT", "EXT HIGH", "EXT LOW", "EQUILIBRE"],
-                default=[],
-                placeholder="Toutes les zones"
+| Colonne | Description |
+|---|---|
+| **Zone** | DISCOUNT = prix sous MO (00h00 NY) · PREMIUM = prix dessus · EXT HIGH/LOW = hors PDH/PDL |
+| **ADR / ATR** | ADR = Average Daily Range (forex/metals) · ATR = indices (US30, NAS100, DE30) |
+| **Force** | ■■■ = ADX H4·H1·M15 ≥ 25 alignés · chiffre = Strength Δ base/quote |
+        """)
+
+    run = st.button("🚀  LANCER LE SCANNER", use_container_width=True)
+
+    if not run:
+        st.markdown("""
+        <div style="text-align:center;padding:60px 0;color:#2a2a4a">
+          <div style="font-size:48px">📡</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:14px;letter-spacing:.1em;margin-top:12px">
+            EN ATTENTE — APPUIE SUR LANCER
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    client = oandapyV20.API(access_token=ACCESS_TOKEN, environment=env)
+
+    assets = [
+        "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF",
+        "AUD_USD", "USD_CAD", "NZD_USD",
+        "EUR_GBP", "EUR_JPY", "EUR_CHF",
+        "EUR_AUD", "EUR_CAD", "EUR_NZD",
+        "GBP_JPY", "GBP_CHF", "GBP_AUD",
+        "GBP_CAD", "GBP_NZD",
+        "AUD_JPY", "CAD_JPY", "CHF_JPY", "NZD_JPY",
+        "AUD_CAD", "AUD_CHF", "AUD_NZD",
+        "CAD_CHF", "NZD_CAD", "NZD_CHF",
+        "XAU_USD", "XAG_USD",
+        "US30_USD", "NAS100_USD", "DE30_EUR",
+    ]
+
+    results   = []
+    debug_log = []
+    progress  = st.progress(0)
+    status    = st.empty()
+    t_start   = time.time()
+
+    strength_scores = {}
+    with st.spinner("Calcul Currency Strength H1…"):
+        dfs_h1 = fetch_strength_data(client)
+        strength_scores = compute_currency_strength(dfs_h1)
+
+    with st.spinner("Analyse MTF en cours…"):
+        for i, ticker in enumerate(assets):
+            status.caption(f"⏳ {ticker}… ({i+1}/{len(assets)})")
+            res = analyze_asset(
+                client, ticker,
+                freshness_limit_min=freshness,
+                strength_scores=strength_scores,
+                debug_log=debug_log
             )
+            if res:
+                results.append(res)
+            time.sleep(0.15)
+            progress.progress((i + 1) / len(assets))
 
-        if not run_global:
-            st.markdown("""
-            <div style="text-align:center;padding:50px 0;color:#2a2a4a">
-              <div style="font-size:42px">📐</div>
-              <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;
-                          letter-spacing:.1em;margin-top:10px;color:#2a2a5a">
-                APPUIE SUR SCANNER POUR CHARGER TOUTES LES ZONES
-              </div>
-              <div style="font-size:11px;color:#1e1e3e;margin-top:8px;
-                          font-family:'IBM Plex Mono',monospace;letter-spacing:.06em">
-                PDH = LIGNE VERTE · MO = LIGNE JAUNE · PDL = LIGNE ROUGE
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
+    elapsed = round(time.time() - t_start, 1)
+    status.empty()
+    progress.empty()
+
+    if show_debug:
+        with st.expander(f"🐛 Debug — {len(debug_log)} rejetés en {elapsed}s"):
+            if debug_log:
+                cols_d = st.columns(2)
+                with cols_d[0]:
+                    cats = Counter()
+                    for _, reason in debug_log:
+                        cat = reason.split("_")[0] if "_" in reason else reason[:20]
+                        cats[cat] += 1
+                    st.markdown("**Raisons agrégées**")
+                    for cat, n in cats.most_common():
+                        st.markdown(f"- `{cat}` → **{n}**")
+                with cols_d[1]:
+                    st.markdown("**Détail par actif**")
+                    for ticker, reason in debug_log[:30]:
+                        st.markdown(f"`{ticker}` — {reason}")
+
+    if not results:
+        st.warning("**Aucun signal valide détecté** sur cette session.")
+        return
+
+    df = pd.DataFrame(results)
+
+    grade_order = {"A+": 5, "A": 4, "B+": 3, "B": 2, "C": 1}
+    min_map     = {"Tous": 0, "B": 2, "B+": 3, "A": 4, "A+": 5}
+    min_val     = min_map[min_grade]
+    df = df[df["Grade"].map(grade_order) >= min_val]
+
+    if df.empty:
+        st.info("Aucun signal avec ces filtres.")
+        return
+
+    def sort_key(row):
+        fresh = 1 if "⚡" in str(row["Fraîcheur"]) else 0
+        g     = grade_order.get(row["Grade"], 0)
+        s     = row["Score /100"]
+        m     = row["MTF Pct"]
+        mom   = row.get("Momentum", 0)
+        return (-fresh, -g, -mom, -s, -m)
+
+    df["_sk"] = df.apply(sort_key, axis=1)
+    df = df.sort_values("_sk").drop(columns=["_sk"]).reset_index(drop=True)
+
+    a_plus  = len(df[(df["Grade"] == "A+") & df["Fraîcheur"].str.contains("⚡", na=False)])
+    a_grade = len(df[(df["Grade"] == "A")  & df["Fraîcheur"].str.contains("⚡", na=False)])
+    b_watch = len(df[df["Grade"].isin(["B+","B"]) & df["Fraîcheur"].str.contains("⚡", na=False)])
+    longs   = len(df[df["Signal"].str.contains("LONG",  na=False) & ~df["Signal"].str.contains("expiré")])
+    shorts  = len(df[df["Signal"].str.contains("SHORT", na=False) & ~df["Signal"].str.contains("expiré")])
+    max_mom = len(df[df.get("Momentum", 0) == 3]) if "Momentum" in df.columns else 0
+
+    mc = st.columns(6)
+    with mc[0]: st.metric("💎 Signaux A+", a_plus)
+    with mc[1]: st.metric("🥇 Signaux A",  a_grade)
+    with mc[2]: st.metric("👀 Watch B/B+", b_watch)
+    with mc[3]: st.metric("▲ LONG actifs", longs)
+    with mc[4]: st.metric("▼ SHORT actifs", shorts)
+    with mc[5]: st.metric("■■■ Force max", max_mom)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── TABLE HTML (identique V15 original) ──────────────────
+    GRADE_STYLE = {
+        "A+": {"color": "#5a9e7a", "bg": "rgba(90,158,122,0.07)", "label": "A+"},
+        "A":  {"color": "#4e8a6c", "bg": "rgba(78,138,108,0.05)", "label": "A"},
+        "B+": {"color": "#9a7820", "bg": "transparent",           "label": "B+"},
+        "B":  {"color": "#5a6880", "bg": "transparent",           "label": "B"},
+        "C":  {"color": "#383848", "bg": "transparent",           "label": "C"},
+    }
+
+    def sig_style(s):
+        if "LONG"  in s and "expiré" not in s:
+            return "color:#5a9e7a;font-weight:700;font-size:16px;letter-spacing:.03em"
+        if "SHORT" in s and "expiré" not in s:
+            return "color:#9e4a3a;font-weight:700;font-size:16px;letter-spacing:.03em"
+        return "color:#303040;font-size:12px"
+
+    def bias_daily_label(b):
+        if b == "STRONG BULLISH": return "▲▲ STRONG BULL"
+        if b == "BULLISH":        return "▲ BULL"
+        if b == "STRONG BEARISH": return "▼▼ STRONG BEAR"
+        if b == "BEARISH":        return "▼ BEAR"
+        return "— NEUTRAL"
+
+    def bias_daily_style(b):
+        if "STRONG BULLISH" in b: return "color:#4d9467;font-weight:700;font-size:14px"
+        if "BULLISH"        in b: return "color:#3d7055;font-weight:600;font-size:14px"
+        if "STRONG BEARISH" in b: return "color:#a04848;font-weight:700;font-size:14px"
+        if "BEARISH"        in b: return "color:#7a3535;font-weight:600;font-size:14px"
+        return "color:#404055;font-size:14px"
+
+    def zone_style(z):
+        if "DISCOUNT" in z: return "color:#4a7898;font-weight:600"
+        if "PREMIUM"  in z: return "color:#8a6028;font-weight:600"
+        if "EXT HIGH" in z: return "color:#9e4a3a;font-weight:600;font-style:italic"
+        if "EXT LOW"  in z: return "color:#3a7a9e;font-weight:600;font-style:italic"
+        return "color:#404055"
+
+    def fresh_style(f):
+        return "color:#9a7820;font-weight:700" if "⚡" in f else "color:#303040"
+
+    def score_bar(score):
+        color = "#5a9e7a" if score >= 70 else "#9a7820" if score >= 40 else "#9e4a3a"
+        width = max(4, score)
+        return f"""<div style="display:flex;align-items:center;gap:8px">
+          <div style="width:60px;height:4px;background:#1a1a22;border-radius:2px;overflow:hidden">
+            <div style="width:{width}%;height:100%;background:{color};border-radius:2px"></div>
+          </div>
+          <span style="color:{color};font-weight:700;font-size:15px">{score}</span>
+        </div>"""
+
+    def adr_cell(v, label="ADR"):
+        if v is None:
+            return '<span style="color:#303040">—</span>'
+        formatted = f"{v:.5f}" if v < 1.0 else f"{v:.2f}"
+        tag_color = "#4a7898" if label == "ADR" else "#6a5a78"
+        return (
+            f'<span style="color:{tag_color};font-size:10px;font-family:\'IBM Plex Mono\','
+            f'monospace;margin-right:4px">{label}</span>'
+            f'<span style="color:#5a6880;font-family:\'IBM Plex Mono\','
+            f'monospace;font-size:13px">{formatted}</span>'
+        )
+
+    def force_cell(momentum_score: int, delta, is_bull: bool) -> str:
+        color    = "#5a9e7a" if is_bull else "#9e4a3a"
+        filled   = f'background:{color};border-radius:2px'
+        empty    = 'background:#1e1e2e;border-radius:2px'
+        segments = "".join(
+            f'<div style="width:14px;height:9px;{filled if i < momentum_score else empty}"></div>'
+            for i in range(3)
+        )
+        bars = (f'<div style="display:flex;gap:3px;align-items:center">'
+                f'{segments}</div>')
+
+        if delta is not None:
+            delta_color = ("#5a9e7a" if delta >= 1.5
+                           else "#9e4a3a" if delta <= -1.5
+                           else "#6a7888")
+            sign  = "+" if delta > 0 else ""
+            delta_html = (f'<span style="color:{delta_color};font-weight:700;'
+                          f'font-size:12px;font-family:\'IBM Plex Mono\','
+                          f'monospace;margin-left:7px">{sign}{delta:.1f}</span>')
         else:
-            progress = st.progress(0)
-            status   = st.empty()
-            status.caption("⏳ Chargement des données…")
+            delta_html = '<span style="color:#303040;margin-left:7px;font-size:11px">n/a</span>'
 
-            all_data = fetch_all_levels(
-                client, ASSETS,
-                progress_cb=lambda p: progress.progress(p)
-            )
-            progress.empty()
-            status.empty()
+        return (f'<div style="display:flex;align-items:center">'
+                f'{bars}{delta_html}</div>')
 
-            # Filtrage
-            filtered = all_data
-            if zone_filter:
-                filtered = [
-                    d for d in all_data
-                    if not d.get("error") and d["levels"]["zone"] in zone_filter
-                ]
+    html = """
+<style>
+.sc-wrap{overflow-x:auto;margin-top:4px}
+.sc-tbl{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono','Courier New',monospace;font-size:15px}
+.sc-tbl thead tr{border-bottom:2px solid #2a2a5a}
+.sc-tbl th{
+  padding:10px 16px;text-align:left;
+  color:#8090c0;
+  font-size:12px;text-transform:uppercase;letter-spacing:.12em;font-weight:700;
+  white-space:nowrap;
+  background:#0c0c12;
+  border-bottom:2px solid #2a2a5a;
+}
+.sc-tbl td{padding:13px 16px;border-bottom:1px solid #0f0f1e;vertical-align:middle}
+.sc-tbl tr:hover td{background:#111118 !important}
+.ticker{font-size:22px;font-weight:800;color:#c8c8d8;letter-spacing:.04em;white-space:nowrap;font-family:'IBM Plex Mono',monospace}
+.grade-pill{
+  display:inline-block;padding:2px 8px;border-radius:2px;
+  font-size:12px;font-weight:700;letter-spacing:.08em;
+  border:1px solid currentColor;margin-left:10px;vertical-align:middle;font-family:'IBM Plex Mono',monospace
+}
+.kz-badge{
+  display:inline-block;padding:2px 7px;border-radius:2px;
+  font-size:10px;font-weight:700;letter-spacing:.06em;
+  background:rgba(90,158,122,0.12);color:#5a9e7a;
+  border:1px solid rgba(90,158,122,0.3);margin-left:8px;vertical-align:middle
+}
+</style>
+<div class="sc-wrap"><table class="sc-tbl">
+<thead><tr>
+  <th style="width:100px">Fraîcheur</th>
+  <th>Actif</th>
+  <th>Signal</th>
+  <th>Biais Daily</th>
+  <th>Zone</th>
+  <th>Score /100</th>
+  <th>ADR / ATR</th>
+  <th>Force</th>
+</tr></thead><tbody>
+"""
+    active_kz = get_current_killzone()
 
-            if not filtered:
-                st.info("Aucun actif correspondant aux filtres.")
-            else:
-                html_table = render_summary_table(
-                    [d for d in all_data
-                     if not zone_filter or
-                     (not d.get("error") and d["levels"]["zone"] in zone_filter)]
-                )
-                st.markdown(html_table, unsafe_allow_html=True)
+    for _, row in df.iterrows():
+        grade       = str(row.get("Grade", "C"))
+        fresh       = "⚡" in str(row.get("Fraîcheur", ""))
+        gs          = GRADE_STYLE.get(grade, GRADE_STYLE["C"])
+        score       = int(row.get("Score /100", 0))
+        ticker      = str(row.get("Actif + Note", "")).split("  ")[0].strip()
+        sig         = str(row.get("Signal", "—"))
+        adr_v       = row.get("ADR")
+        adr_lbl     = str(row.get("ADR Label", "ADR"))
+        bias        = str(row.get("Biais Daily", "—"))
+        alignment   = str(row.get("Alignement", "ALIGNED"))
+        zone        = str(row.get("Zone", "—"))
+        fresh_str   = str(row.get("Fraîcheur", "—"))
+        sdelta      = row.get("Strength Δ")
+        momentum    = int(row.get("Momentum", 0))
+        is_bull     = bool(row.get("signal_is_bull", True))
+        mn_bonus    = bool(row.get("Midnight Bonus", False))
 
-            st.markdown(f"""
-            <div style="color:#2a2a4a;font-family:'IBM Plex Mono',monospace;
-                        font-size:10px;text-align:right;margin-top:6px;letter-spacing:.06em">
-              {len(all_data)} actifs · {datetime.now().strftime('%H:%M:%S')}
-              · <span style="color:#FFE000">🌙 MO = 00:00 America/New_York</span>
-            </div>
-            """, unsafe_allow_html=True)
+        align_tag = ""
+        if alignment == "COUNTER":
+            align_tag = '<span style="font-size:10px;color:#9e4a3a;font-weight:700;margin-left:6px">⚠ COUNTER</span>'
 
-    # ════════════════════════════════════════════════════════
-    #  TAB 2 : ZOOM ACTIF
-    # ════════════════════════════════════════════════════════
-    with tab_detail:
-        st.markdown("<br>", unsafe_allow_html=True)
+        kz_tag = (f'<span class="kz-badge">{killzone_badge(active_kz)}</span>'
+                  if active_kz and fresh else "")
 
-        col_sel, col_run2 = st.columns([3, 1])
-        with col_sel:
-            selected = st.selectbox("Choisir un actif", ASSETS, index=0)
-        with col_run2:
-            st.markdown("<div style='margin-top:24px'>", unsafe_allow_html=True)
-            run_detail = st.button("🔍  ANALYSER", use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
+        mn_tag = ('<span style="font-size:10px;color:#5a7898;font-weight:700;'
+                  'margin-left:6px;vertical-align:middle">🌙</span>'
+                  if mn_bonus else "")
 
-        if not run_detail:
-            st.markdown("""
-            <div style="text-align:center;padding:40px 0;color:#2a2a4a">
-              <div style="font-size:36px">🔍</div>
-              <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;
-                          letter-spacing:.1em;margin-top:10px;color:#2a2a5a">
-                SÉLECTIONNE UN ACTIF ET CLIQUE ANALYSER
-              </div>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            with st.spinner(f"Chargement {selected}…"):
-                df_d,   _ = fetch_oanda(client, selected, "D",   50)
-                df_m15, _ = fetch_oanda(client, selected, "M15", 200)
+        row_bg = gs["bg"] if fresh and grade in ("A+", "A") else "transparent"
 
-            if df_d.empty or df_m15.empty:
-                st.error("Données indisponibles pour cet actif.")
-            else:
-                lv = compute_levels(df_d, df_m15)
-                if lv is None:
-                    st.error("Impossible de calculer les niveaux.")
-                else:
-                    # ── Métriques ──────────────────────────────────
-                    mc = st.columns(5)
-                    ZONE_EMOJI = {
-                        "PREMIUM": "▲", "DISCOUNT": "▼",
-                        "EXT HIGH": "⚡", "EXT LOW": "⚡", "EQUILIBRE": "—"
-                    }
-                    ZONE_COL = {
-                        "PREMIUM": "#c8952a", "DISCOUNT": "#4a98c8",
-                        "EXT HIGH": "#e05a3a", "EXT LOW": "#3a9ece",
-                        "EQUILIBRE": "#707070"
-                    }
+        html += f"""<tr style="background:{row_bg}">
+  <td style="{fresh_style(fresh_str)}">{fresh_str}</td>
+  <td style="white-space:nowrap">
+    <span class="ticker">{ticker}</span>
+    <span class="grade-pill" style="color:{gs['color']}">{gs['label']}</span>
+    {align_tag}
+  </td>
+  <td style="{sig_style(sig)}">{sig}{kz_tag}</td>
+  <td style="{bias_daily_style(bias)}">{bias_daily_label(bias)}</td>
+  <td style="{zone_style(zone)}">{zone}{mn_tag}</td>
+  <td>{score_bar(score)}</td>
+  <td>{adr_cell(adr_v, adr_lbl)}</td>
+  <td>{force_cell(momentum, sdelta, is_bull)}</td>
+</tr>"""
 
-                    def fmt(v, ticker=""):
-                        if v is None: return "—"
-                        if v > 1000:  return f"{v:,.2f}"
-                        elif v > 10:  return f"{v:.3f}"
-                        else:         return f"{v:.5f}"
+    html += "</tbody></table></div>"
+    st.markdown(html, unsafe_allow_html=True)
 
-                    total_r = lv['pdh'] - lv['pdl']
-                    if lv['midnight_open']:
-                        pct_in_range = (lv['price'] - lv['pdl']) / total_r * 100 if total_r > 0 else 50
-                    else:
-                        pct_in_range = None
-
-                    with mc[0]:
-                        st.markdown(f"""
-                        <div style="background:#121218;border:1px solid #1e1e2e;
-                                    border-top:2px solid #39FF14;
-                                    border-radius:6px;padding:12px 16px">
-                          <div style="color:#404060;font-size:10px;letter-spacing:.1em;
-                                      font-family:'IBM Plex Mono',monospace;margin-bottom:4px">
-                            PDH 🟢
-                          </div>
-                          <div style="color:#39FF14;font-size:18px;font-weight:700;
-                                      font-family:'IBM Plex Mono',monospace">
-                            {fmt(lv['pdh'])}
-                          </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    with mc[1]:
-                        mo_label = "MO 🟡" + (" ⚠ fallback" if lv['mo_fallback'] else "")
-                        st.markdown(f"""
-                        <div style="background:#121218;border:1px solid #1e1e2e;
-                                    border-top:2px solid #FFE000;
-                                    border-radius:6px;padding:12px 16px">
-                          <div style="color:#404060;font-size:10px;letter-spacing:.1em;
-                                      font-family:'IBM Plex Mono',monospace;margin-bottom:4px">
-                            {mo_label}
-                          </div>
-                          <div style="color:#FFE000;font-size:18px;font-weight:700;
-                                      font-family:'IBM Plex Mono',monospace">
-                            {fmt(lv['midnight_open'])}
-                          </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    with mc[2]:
-                        st.markdown(f"""
-                        <div style="background:#121218;border:1px solid #1e1e2e;
-                                    border-top:2px solid #FF003C;
-                                    border-radius:6px;padding:12px 16px">
-                          <div style="color:#404060;font-size:10px;letter-spacing:.1em;
-                                      font-family:'IBM Plex Mono',monospace;margin-bottom:4px">
-                            PDL 🔴
-                          </div>
-                          <div style="color:#FF003C;font-size:18px;font-weight:700;
-                                      font-family:'IBM Plex Mono',monospace">
-                            {fmt(lv['pdl'])}
-                          </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    with mc[3]:
-                        zc = ZONE_COL.get(lv['zone'], '#707070')
-                        st.markdown(f"""
-                        <div style="background:#121218;border:1px solid #1e1e2e;
-                                    border-top:2px solid {zc};
-                                    border-radius:6px;padding:12px 16px">
-                          <div style="color:#404060;font-size:10px;letter-spacing:.1em;
-                                      font-family:'IBM Plex Mono',monospace;margin-bottom:4px">
-                            Prix actuel
-                          </div>
-                          <div style="color:{zc};font-size:18px;font-weight:700;
-                                      font-family:'IBM Plex Mono',monospace">
-                            {fmt(lv['price'])}
-                          </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    with mc[4]:
-                        zc = ZONE_COL.get(lv['zone'], '#707070')
-                        st.markdown(f"""
-                        <div style="background:#121218;border:1px solid {zc}44;
-                                    border-top:2px solid {zc};
-                                    border-radius:6px;padding:12px 16px">
-                          <div style="color:#404060;font-size:10px;letter-spacing:.1em;
-                                      font-family:'IBM Plex Mono',monospace;margin-bottom:4px">
-                            Zone
-                          </div>
-                          <div style="color:{zc};font-size:18px;font-weight:700;
-                                      font-family:'IBM Plex Mono',monospace">
-                            {ZONE_EMOJI.get(lv['zone'], '—')} {lv['zone']}
-                          </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    st.markdown("<br>", unsafe_allow_html=True)
-
-                    # ── Barre visuelle + Explication ───────────────
-                    col_bar, col_explain = st.columns([1, 2])
-
-                    with col_bar:
-                        bar_html = render_zone_bar(lv, selected)
-                        st.markdown(bar_html, unsafe_allow_html=True)
-
-                    with col_explain:
-                        # Explication de la zone
-                        zone = lv['zone']
-                        mo_str = fmt(lv['midnight_open'])
-                        pdh_str = fmt(lv['pdh'])
-                        pdl_str = fmt(lv['pdl'])
-                        price_str = fmt(lv['price'])
-
-                        zone_explanations = {
-                            "PREMIUM": {
-                                "color": "#c8952a",
-                                "title": "▲ ZONE PREMIUM",
-                                "desc": f"Le prix ({price_str}) est <strong>au-dessus du Midnight Open</strong> ({mo_str}) et sous le PDH ({pdh_str}).<br><br>📌 Zone de <strong>vente institutionnelle</strong> — Les smart money distribuent dans cette zone. Cherche des setups SHORT avec confirmation (FVG, OB baissier).",
-                                "bias": "BEARISH",
-                                "bias_color": "#9e4a3a",
-                            },
-                            "DISCOUNT": {
-                                "color": "#4a98c8",
-                                "title": "▼ ZONE DISCOUNT",
-                                "desc": f"Le prix ({price_str}) est <strong>en-dessous du Midnight Open</strong> ({mo_str}) et au-dessus du PDL ({pdl_str}).<br><br>📌 Zone d'<strong>accumulation institutionnelle</strong> — Les smart money achètent dans cette zone. Cherche des setups LONG avec confirmation (FVG, OB haussier).",
-                                "bias": "BULLISH",
-                                "bias_color": "#4d9467",
-                            },
-                            "EXT HIGH": {
-                                "color": "#e05a3a",
-                                "title": "⚡ EXTENSION HAUTE",
-                                "desc": f"Le prix ({price_str}) est <strong>au-dessus du PDH</strong> ({pdh_str}).<br><br>⚠️ Hors range quotidien — Possible <strong>liquidity grab</strong> sur les stops au-dessus du PDH. Prudence : attendre le retour dans le range avant de trader.",
-                                "bias": "ATTENTION",
-                                "bias_color": "#e05a3a",
-                            },
-                            "EXT LOW": {
-                                "color": "#3a9ece",
-                                "title": "⚡ EXTENSION BASSE",
-                                "desc": f"Le prix ({price_str}) est <strong>en-dessous du PDL</strong> ({pdl_str}).<br><br>⚠️ Hors range quotidien — Possible <strong>liquidity sweep</strong> sous le PDL. Attendre le retour dans le range ou une confirmation de continuation.",
-                                "bias": "ATTENTION",
-                                "bias_color": "#3a9ece",
-                            },
-                            "EQUILIBRE": {
-                                "color": "#909090",
-                                "title": "— EQUILIBRE",
-                                "desc": f"Le prix ({price_str}) est au niveau du Midnight Open ({mo_str}).<br><br>Zone neutre — pas de biais directionnel clair. Attendre un éclatement clair du MO pour qualifier la zone.",
-                                "bias": "NEUTRAL",
-                                "bias_color": "#606060",
-                            },
-                        }
-                        ze = zone_explanations.get(zone, zone_explanations["EQUILIBRE"])
-
-                        # ADR journalier
-                        total_range_pts = lv['pdh'] - lv['pdl']
-                        if lv['midnight_open']:
-                            pct_pos = (lv['price'] - lv['pdl']) / total_range_pts * 100
-                            mo_pct  = (lv['midnight_open'] - lv['pdl']) / total_range_pts * 100
-                        else:
-                            pct_pos = 50.0
-                            mo_pct  = 50.0
-
-                        st.markdown(f"""
-<div style="
-  background:#0c0c14;border:1px solid #1a1a2e;
-  border-left:3px solid {ze['color']};
-  border-radius:6px;padding:18px 20px;
-  font-family:'IBM Plex Mono',monospace;
-">
-  <div style="font-size:14px;font-weight:700;color:{ze['color']};
-              letter-spacing:.1em;margin-bottom:10px">
-    {ze['title']}
-  </div>
-  <div style="font-size:13px;color:#7a7a9a;line-height:1.8;margin-bottom:16px">
-    {ze['desc']}
-  </div>
-
-  <!-- Range journalier horizontal -->
-  <div style="margin-bottom:14px">
-    <div style="font-size:9px;color:#303050;letter-spacing:.12em;
-                text-transform:uppercase;margin-bottom:5px">
-      Position dans le range journalier
+    st.markdown(f"""
+    <div style="color:#2a2a4a;font-family:'IBM Plex Mono',monospace;font-size:10px;
+                text-align:right;margin-top:6px;letter-spacing:.06em">
+      {len(df)} signal(s) · scanné en {elapsed}s · {datetime.now().strftime('%H:%M:%S')}
+      {'· <span style="color:#5a9e7a">KZ ' + active_kz + ' ACTIVE</span>' if active_kz else ''}
     </div>
-    <div style="position:relative;height:18px;background:#0a0a12;
-                border-radius:3px;overflow:visible;">
-
-      <!-- Zone DISCOUNT -->
-      <div style="
-        position:absolute;left:0;top:0;bottom:0;
-        width:{mo_pct:.1f}%;
-        background:rgba(74,120,152,0.2);border-radius:3px 0 0 3px;
-      "></div>
-      <!-- Zone PREMIUM -->
-      <div style="
-        position:absolute;top:0;bottom:0;
-        left:{mo_pct:.1f}%;right:0;
-        background:rgba(138,96,40,0.2);border-radius:0 3px 3px 0;
-      "></div>
-
-      <!-- MO marker -->
-      <div style="
-        position:absolute;top:-2px;bottom:-2px;
-        left:{mo_pct:.1f}%;
-        width:2px;background:#FFE000;
-        box-shadow:0 0 6px #FFE00088;
-      "></div>
-
-      <!-- Price marker -->
-      <div style="
-        position:absolute;top:-4px;
-        left:calc({pct_pos:.1f}% - 5px);
-        width:10px;height:26px;
-      ">
-        <div style="
-          width:0;height:0;
-          border-left:5px solid transparent;
-          border-right:5px solid transparent;
-          border-top:8px solid {ze['color']};
-          filter:drop-shadow(0 0 4px {ze['color']});
-          margin-top:4px;
-        "></div>
-      </div>
-    </div>
-    <div style="
-      display:flex;justify-content:space-between;
-      font-size:9px;color:#303050;margin-top:3px;
-    ">
-      <span style="color:#FF003C">PDL {fmt(lv['pdl'])}</span>
-      <span style="color:#FFE000">MO {fmt(lv['midnight_open'])}</span>
-      <span style="color:#39FF14">PDH {fmt(lv['pdh'])}</span>
-    </div>
-  </div>
-
-  <!-- Biais -->
-  <div style="
-    display:inline-block;
-    padding:4px 12px;border-radius:3px;
-    background:{ze['bias_color']}18;
-    color:{ze['bias_color']};
-    font-weight:700;font-size:11px;letter-spacing:.12em;
-  ">BIAIS → {ze['bias']}</div>
-</div>
-                        """, unsafe_allow_html=True)
-
-                    # ── Footer timestamp ───────────────────────────
-                    st.markdown(f"""
-                    <div style="color:#2a2a4a;font-family:'IBM Plex Mono',monospace;
-                                font-size:10px;text-align:right;margin-top:8px;letter-spacing:.06em">
-                      {selected} · {datetime.now().strftime('%H:%M:%S')}
-                      · <span style="color:#FFE000">MO = 00:00 America/New_York</span>
-                    </div>
-                    """, unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
