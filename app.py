@@ -885,6 +885,8 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             adr_label   = "ADR"
             # ── ADR Consumed V16 ──────────────────────────────────
             adr_consumed = compute_adr_consumed(df_m15, midnight_open, adr_display)
+            if adr_consumed is not None and np.isnan(adr_consumed):
+                adr_consumed = None
 
         score, grade, score_detail = compute_score(
             flip_type, candles_ago, mtf_pct, mtf_dominant,
@@ -1218,8 +1220,10 @@ def main():
             f'monospace;font-size:13px">{formatted}</span>'
         )
 
-        if consumed is None:
+        if consumed is None or (isinstance(consumed, float) and np.isnan(consumed)):
             return tag_html
+
+        consumed = float(consumed)
 
         # Couleur selon consommation
         if consumed < 40:
@@ -1232,7 +1236,7 @@ def main():
             bar_color = "#9e4a3a"   # rouge — range épuisé
             pct_color = "#9e4a3a"
 
-        fill_width = int(consumed)
+        fill_width = int(min(max(consumed, 0), 100))
 
         gauge_html = (
             f'<div style="display:flex;align-items:center;gap:6px;margin-top:4px">'
