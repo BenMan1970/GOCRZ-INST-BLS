@@ -7,35 +7,66 @@ import oandapyV20.endpoints.accounts as accounts
 from datetime import datetime
 import pytz
 import time
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 
 # ================================================================
-#  BLUESTAR SNIPER V16  —  ICT SIGNAL ENGINE
-#  Modifications vs V15 :
-#  ✅  ADR Consumed : range journalier consommé depuis minuit NY
-#      Jauge visuelle dans la cellule ADR / ATR
-#      🟢 < 40% = range vierge   🟡 40–70% = range partiel
-#      🔴 > 70% = range épuisé + malus -5 pts sur le score
+#  BLUESTAR SNIPER V16  —  ICT SIGNAL ENGINE  (AUDIT-FIXED)
+#  Corrections appliquées :
+#  ✅  BUG-001  PDH/PDL : _d1_ref = -1 (J-1, pas J-2)
+#  ✅  BUG-002  MTF alignment calculé AVANT mutation 1H/15m
+#  ✅  BUG-003  except:pass remplacés par logs explicites
+#  ✅  BUG-004  ADX : exclusion mutuelle DM via np.where (Wilder)
+#  ✅  BUG-005  Client OANDA créé par thread (thread-safety)
+#  ✅  BUG-006  HMA : suppression du .ewm(5) non standard
+#  ✅  BUG-007  get_tf_trend 4H : filtrage temporel corrigé
+#  ✅  BUG-009  Swing points : comparaison float avec tolérance
+#  ✅  BUG-010  midnight_open : validation de l'heure exacte
+#  ✅  BUG-013  Staleness check sur df_m15 (données stale)
+#  ✅  BUG-014  find_last_hma_flip : candles_ago sécurisé
+#  ✅  BUG-015  Weekly Open : lundi uniquement, semaine courante
+#  ✅  BUG-016  RSI : loss=0 → RSI=100, min_periods correct
+#  ✅  BUG-017  Boucle asset parallélisée (ThreadPoolExecutor)
+#  ✅  BUG-018  Killzones en UTC fixe (DST-proof)
+#  ✅  BUG-019  Retry 429 : continue ajouté
+#  ✅  BUG-020  OANDA_ENVIRONMENT via st.secrets
+#  ✅  BUG-021  score_bar : score négatif affiché correctement
+#  ✅  BUG-022  is_valid_df() helper, duplication supprimée
+#  ✅  Dead code near_pdl/near_pdh supprimé de compute_score
 # ================================================================
+
+logger = logging.getLogger("bluestar_sniper")
+logging.basicConfig(level=logging.WARNING)
+
+# ----------------------------------------------------------------
+#  HELPER  (BUG-022)
+# ----------------------------------------------------------------
+def is_valid_df(df, min_rows: int = 1) -> bool:
+    """Retourne True si df est un DataFrame non-vide avec au moins min_rows lignes."""
+    return df is not None and isinstance(df, pd.DataFrame) and len(df) >= min_rows
 
 
 # ----------------------------------------------------------------
-#  KILLZONE DETECTOR  (UTC+1 — Paris / Tunis)
+#  KILLZONE DETECTOR  —  UTC fixe, DST-proof  (BUG-018)
 # ----------------------------------------------------------------
-KILLZONES_UTC1 = {
-    "London": ((8,  0), (9,  30)),
-    "NY AM":  ((13, 0), (14, 30)),
-    "Asia":   ((2,  0), (4,  0)),
+# Plages en UTC fixe :
+#   London  = 07:00-08:30 UTC  (03:00-04:30 ET)
+#   NY AM   = 13:30-15:00 UTC  (09:30-11:00 ET)
+#   Asia    = 00:00-02:00 UTC
+KILLZONES_UTC = {
+    "London": ((7,  0), (8,  30)),
+    "NY AM":  ((13, 30), (15, 0)),
+    "Asia":   ((0,  0),  (2,  0)),
 }
 
 INDICES = {"US30_USD", "NAS100_USD", "DE30_EUR"}
 
 def get_current_killzone() -> str:
-    tz_utc1 = pytz.timezone("Europe/Paris")
-    now = datetime.now(tz_utc1)
-    t = now.hour * 60 + now.minute
-    for name, (start, end) in KILLZONES_UTC1.items():
+    now_utc = datetime.now(pytz.UTC)
+    t = now_utc.hour * 60 + now_utc.minute
+    for name, (start, end) in KILLZONES_UTC.items():
         s = start[0] * 60 + start[1]
         e = end[0]   * 60 + end[1]
         if s <= t <= e:
@@ -67,12 +98,13 @@ class QuantEngine:
 
     @staticmethod
     def hma(series, period=20):
+        """HMA standard : WMA(2·WMA(n/2) - WMA(n), √n)  — sans EWM parasite (BUG-006)."""
         half   = int(period / 2)
         sqrt_p = int(np.sqrt(period))
         raw    = 2 * QuantEngine.wma(series, half) - QuantEngine.wma(series, period)
         if raw.isna().all():
             return pd.Series(np.nan, index=series.index)
-        return QuantEngine.wma(raw, sqrt_p).ewm(span=5, adjust=False).mean()
+        return QuantEngine.wma(raw, sqrt_p)          # ← EWM(5) non standard supprimé
 
     @staticmethod
     def atr(df, period=14):
@@ -86,23 +118,51 @@ class QuantEngine:
 
     @staticmethod
     def adx(df, period=14):
-        pdm = df['high'].diff()
-        mdm = -df['low'].diff()
-        pdm = pdm.where((pdm > mdm) & (pdm > 0), 0.0)
-        mdm = mdm.where((mdm > pdm) & (mdm > 0), 0.0)
-        atr = QuantEngine.atr(df, period)
-        pdi = 100 * pdm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
-        mdi = 100 * mdm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
+        """ADX Wilder avec exclusion mutuelle stricte des DM via np.where (BUG-004)."""
+        high      = df['high']
+        low       = df['low']
+        prev_high = high.shift(1)
+        prev_low  = low.shift(1)
+
+        up_move   = high - prev_high
+        down_move = prev_low - low
+
+        pdm = pd.Series(
+            np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+            index=df.index, dtype=np.float64
+        )
+        mdm = pd.Series(
+            np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+            index=df.index, dtype=np.float64
+        )
+
+        atr_v  = QuantEngine.atr(df, period)
+        pdm_s  = pdm.ewm(alpha=1 / period, adjust=False).mean()
+        mdm_s  = mdm.ewm(alpha=1 / period, adjust=False).mean()
+
+        safe_atr = atr_v.replace(0, np.nan)
+        pdi = 100 * pdm_s / safe_atr
+        mdi = 100 * mdm_s / safe_atr
         dx  = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-        return dx.ewm(alpha=1/period, adjust=False).mean(), pdi, mdi
+        adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+        return adx, pdi, mdi
 
     @staticmethod
     def rsi(series, period=14):
-        delta = series.diff()
-        gain  = delta.where(delta > 0, 0.0).ewm(alpha=1/period, adjust=False).mean()
-        loss  = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/period, adjust=False).mean()
-        rs    = gain / loss.replace(0, np.nan)
-        return 100 - (100 / (1 + rs))
+        """RSI Wilder : gestion loss=0 → RSI=100 ; min_periods correct (BUG-016)."""
+        delta    = series.diff()
+        gain     = delta.where(delta > 0, 0.0)
+        loss     = (-delta.where(delta < 0, 0.0))
+
+        avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+        rsi_out              = pd.Series(np.nan, index=series.index, dtype=float)
+        mask_zero            = avg_loss == 0
+        rsi_out[mask_zero]   = 100.0
+        mask_nz              = ~mask_zero & avg_loss.notna() & avg_gain.notna()
+        rsi_out[mask_nz]     = 100 - (100 / (1 + avg_gain[mask_nz] / avg_loss[mask_nz]))
+        return rsi_out
 
     @staticmethod
     def zlema(series, period=50, lag=17):
@@ -114,7 +174,7 @@ class QuantEngine:
 #  ADR — Average Daily Range (forex/metals uniquement)
 # ----------------------------------------------------------------
 def compute_adr(df_d: pd.DataFrame, period: int = 14) -> float:
-    if df_d is None or len(df_d) < 2:
+    if not is_valid_df(df_d, 2):
         return float("nan")
     ranges = (df_d["high"] - df_d["low"]).iloc[-(period + 1):-1]
     return float(ranges.mean()) if not ranges.empty else float("nan")
@@ -125,11 +185,7 @@ def compute_adr(df_d: pd.DataFrame, period: int = 14) -> float:
 # ----------------------------------------------------------------
 def compute_adr_consumed(df_m15: pd.DataFrame, midnight_open_price: float,
                          adr_value: float) -> float | None:
-    """
-    Range consommé depuis Minuit NY jusqu'à maintenant, exprimé en % de l'ADR.
-    Retourne None si données insuffisantes.
-    """
-    if df_m15 is None or df_m15.empty or adr_value is None or adr_value <= 0:
+    if not is_valid_df(df_m15) or adr_value is None or adr_value <= 0:
         return None
     try:
         ny_tz    = pytz.timezone("America/New_York")
@@ -139,8 +195,7 @@ def compute_adr_consumed(df_m15: pd.DataFrame, midnight_open_price: float,
         idx_ny   = idx.tz_convert(ny_tz)
         today_ny = datetime.now(ny_tz).date()
 
-        # Bougies depuis 00h00 NY aujourd'hui
-        mask = idx_ny.date == today_ny
+        mask       = idx_ny.date == today_ny
         today_bars = df_m15[mask]
         if today_bars.empty:
             return None
@@ -149,19 +204,20 @@ def compute_adr_consumed(df_m15: pd.DataFrame, midnight_open_price: float,
         today_l  = float(today_bars["low"].min())
         consumed = (today_h - today_l) / adr_value * 100.0
         return round(min(consumed, 100.0), 1)
-    except Exception:
+    except Exception as _e:
+        logger.warning("compute_adr_consumed error: %s", _e)
         return None
 
 
 # ----------------------------------------------------------------
 #  MTF INSTITUTIONAL TREND
 # ----------------------------------------------------------------
-TF_WEIGHTS = {"M": 4.0, "W": 3.5, "D": 3.0, "4H": 2.5, "1H": 2.0, "15m": 1.5}
+TF_WEIGHTS   = {"M": 4.0, "W": 3.5, "D": 3.0, "4H": 2.5, "1H": 2.0, "15m": 1.5}
 TOTAL_WEIGHT = sum(TF_WEIGHTS.values())
 
 
 def get_tf_trend(df: pd.DataFrame, tf_type: str):
-    if df is None or len(df) < 50:
+    if not is_valid_df(df, 50):
         return 0, 40.0, "NEUT"
     close = df['close']
 
@@ -182,14 +238,29 @@ def get_tf_trend(df: pd.DataFrame, tf_type: str):
         score = 0
         ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
         score += 1 if close.iloc[-1] > ema50 else -1
-        adx_s, pdi_s, mdi_s = QuantEngine.adx(df, 14)
-        score += 1 if pdi_s.iloc[-1] > mdi_s.iloc[-1] else -1
-        idx = df.index.tz_localize("UTC") if df.index.tz is None else df.index
-        today = idx[-1].date()
-        day_rows = df[idx.date == today]
-        if not day_rows.empty:
-            daily_open = day_rows['open'].iloc[0]
-            score += 1 if close.iloc[-1] > daily_open else -1
+        try:
+            adx_s, pdi_s, mdi_s = QuantEngine.adx(df, 14)
+            score += 1 if pdi_s.iloc[-1] > mdi_s.iloc[-1] else -1
+        except Exception as _e:
+            logger.warning("get_tf_trend 4H ADX error: %s", _e)
+
+        # BUG-007 : filtrage journalier timezone-aware correct
+        try:
+            df_tz = df.copy()
+            if df_tz.index.tz is None:
+                df_tz.index = df_tz.index.tz_localize("UTC")
+            today  = df_tz.index[-1].date()
+            mask   = pd.Series(
+                [ts.date() for ts in df_tz.index],
+                index=df_tz.index
+            ) == today
+            day_rows = df_tz[mask]
+            if not day_rows.empty:
+                daily_open = day_rows['open'].iloc[0]
+                score += 1 if close.iloc[-1] > daily_open else -1
+        except Exception as _e:
+            logger.warning("get_tf_trend 4H daily_open error: %s", _e)
+
         trend    = 1 if score > 0 else (-1 if score < 0 else 0)
         strength = 90.0 if abs(score) == 3 else (70.0 if abs(score) >= 1 else 40.0)
         label    = "BULL" if trend == 1 else ("BEAR" if trend == -1 else "NEUT")
@@ -203,14 +274,16 @@ def get_tf_trend(df: pd.DataFrame, tf_type: str):
         rsi_v = QuantEngine.rsi(close, 14)
         macd  = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
         sig   = macd.ewm(span=9, adjust=False).mean()
-        c = close.iloc[-1]
+        c     = close.iloc[-1]
         bullish = (c > zl.iloc[-1] and ema9.iloc[-1] > ema21.iloc[-1] and
-                   ema21.iloc[-1] > ema50.iloc[-1] and rsi_v.iloc[-1] > 50 and
-                   macd.iloc[-1]  > sig.iloc[-1])
+                   ema21.iloc[-1] > ema50.iloc[-1] and
+                   not pd.isna(rsi_v.iloc[-1]) and rsi_v.iloc[-1] > 50 and
+                   macd.iloc[-1] > sig.iloc[-1])
         bearish = (c < zl.iloc[-1] and ema9.iloc[-1] < ema21.iloc[-1] and
-                   ema21.iloc[-1] < ema50.iloc[-1] and rsi_v.iloc[-1] < 50 and
-                   macd.iloc[-1]  < sig.iloc[-1])
-        base_str = min(80.0, abs(c - zl.iloc[-1]) / c * 1000)
+                   ema21.iloc[-1] < ema50.iloc[-1] and
+                   not pd.isna(rsi_v.iloc[-1]) and rsi_v.iloc[-1] < 50 and
+                   macd.iloc[-1] < sig.iloc[-1])
+        base_str = min(80.0, abs(c - zl.iloc[-1]) / max(c, 1e-9) * 1000)
         strength = base_str if (bullish or bearish) else 30.0
         trend    = 1 if bullish else (-1 if bearish else 0)
         label    = "BULL" if trend == 1 else ("BEAR" if trend == -1 else "NEUT")
@@ -220,7 +293,7 @@ def get_tf_trend(df: pd.DataFrame, tf_type: str):
 def compute_mtf_analysis(dfs: dict):
     results = {}
     for tf, df in dfs.items():
-        t, s, lbl = get_tf_trend(df, tf)
+        t, s, lbl   = get_tf_trend(df, tf)
         results[tf] = {"trend": t, "strength": s, "label": lbl}
 
     macro_trend = 0
@@ -233,14 +306,20 @@ def compute_mtf_analysis(dfs: dict):
     t15m = results.get("15m", {}).get("trend", 0)
     f1h  = 0 if (macro_trend != 0 and macro_trend != t1h)  else t1h
     f15m = 0 if (macro_trend != 0 and macro_trend != t15m) else t15m
-    results["1H"]["trend"]  = f1h
-    results["15m"]["trend"] = f15m
 
-    bull_score = sum(TF_WEIGHTS[tf] for tf in TF_WEIGHTS if results.get(tf, {}).get("trend", 0) == 1)
-    bear_score = sum(TF_WEIGHTS[tf] for tf in TF_WEIGHTS if results.get(tf, {}).get("trend", 0) == -1)
-    alignment_pct = round(max(bull_score, bear_score) / TOTAL_WEIGHT * 100)
-    dominant      = ("Bullish" if bull_score > bear_score
-                     else "Bearish" if bear_score > bull_score else "Neutral")
+    # BUG-002 : alignment_pct calculé sur les tendances BRUTES avant mutation
+    raw_bull      = sum(TF_WEIGHTS[tf] for tf in TF_WEIGHTS
+                        if results.get(tf, {}).get("trend", 0) == 1)
+    raw_bear      = sum(TF_WEIGHTS[tf] for tf in TF_WEIGHTS
+                        if results.get(tf, {}).get("trend", 0) == -1)
+    alignment_pct = round(max(raw_bull, raw_bear) / TOTAL_WEIGHT * 100)
+    dominant      = ("Bullish" if raw_bull > raw_bear
+                     else "Bearish" if raw_bear > raw_bull else "Neutral")
+
+    # Mutation post-calcul
+    if "1H"  in results: results["1H"]["trend"]  = f1h
+    if "15m" in results: results["15m"]["trend"] = f15m
+
     return alignment_pct, dominant, results
 
 
@@ -248,7 +327,7 @@ def compute_mtf_analysis(dfs: dict):
 #  DAILY BIAS  (5 facteurs)
 # ----------------------------------------------------------------
 def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
-    if df_d is None or len(df_d) < 60:
+    if not is_valid_df(df_d, 60):
         return "NEUTRAL", {}
 
     close = df_d['close']
@@ -259,18 +338,21 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
 
     votes_bull = 0
     votes_bear = 0
-    detail = {}
+    detail     = {}
 
+    # BUG-009 : comparaison float avec tolérance ε
     def _swing_pts(series, wing=5):
         highs, lows = [], []
-        for i in range(wing, len(series) - wing):
-            w = series.iloc[i - wing: i + wing + 1]
-            if series.iloc[i] == w.max(): highs.append(i)
-            if series.iloc[i] == w.min(): lows.append(i)
+        arr = series.to_numpy(dtype=np.float64)
+        n   = len(arr)
+        for i in range(wing, n - wing):
+            window = arr[i - wing: i + wing + 1]
+            if abs(arr[i] - window.max()) < 1e-9: highs.append(i)
+            if abs(arr[i] - window.min()) < 1e-9: lows.append(i)
         return highs, lows
 
-    sh_idx, _   = _swing_pts(high)
-    _,  sl_idx  = _swing_pts(low)
+    sh_idx, _  = _swing_pts(high)
+    _, sl_idx  = _swing_pts(low)
 
     struct_vote = "NEUTRAL"
     if len(sh_idx) >= 2 and len(sl_idx) >= 2:
@@ -291,22 +373,28 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
     elif cur < ema21 < ema50: detail["EMA 21/50"] = "BEARISH"; votes_bear += 1
     else:                     detail["EMA 21/50"] = "NEUTRAL"
 
+    # BUG-015 : Weekly Open = premier open du lundi de la semaine courante
     wo_vote = "NEUTRAL"
     try:
         df_copy = df_d.copy()
         if df_copy.index.tz is None:
             df_copy.index = df_copy.index.tz_localize("UTC")
-        weekly_open_rows = df_copy[df_copy.index.dayofweek.isin([0, 6])]
-        if not weekly_open_rows.empty:
-            weekly_open = float(weekly_open_rows['open'].iloc[-1])
+        # Lundi uniquement (dayofweek == 0), semaine en cours
+        monday_rows = df_copy[df_copy.index.dayofweek == 0]
+        current_week_mondays = monday_rows[
+            monday_rows.index >= (datetime.now(pytz.UTC) - pd.Timedelta(days=7))
+        ]
+        if not current_week_mondays.empty:
+            weekly_open = float(current_week_mondays['open'].iloc[0])
             wo_vote = "BULLISH" if cur > weekly_open else "BEARISH"
             if wo_vote == "BULLISH": votes_bull += 1
-            else:                   votes_bear += 1
-    except Exception:
-        pass
-    detail["Weekly Open"] = wo_vote
+            else:                    votes_bear += 1
+        detail["Weekly Open"] = wo_vote
+    except Exception as _e:
+        logger.warning("get_daily_bias_v2 Weekly Open error: %s", _e)
+        detail["Weekly Open"] = "NEUTRAL"
 
-    if len(df_d) >= 2:
+    if is_valid_df(df_d, 2):
         midpoint = (float(high.iloc[-2]) + float(low.iloc[-2])) / 2
         if float(close.iloc[-2]) > midpoint:
             detail["Close J-1"] = "BULLISH"; votes_bull += 1
@@ -315,7 +403,9 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
     else:
         detail["Close J-1"] = "NEUTRAL"
 
+    # BUG-003 : slope_norm encapsulé correctement
     slope_vote = "NEUTRAL"
+    slope_norm = 0.0
     try:
         if len(ema50_series) >= 6:
             atr_d_val = float(
@@ -328,12 +418,11 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
             slope_5d = float(ema50_series.iloc[-1] - ema50_series.iloc[-6])
             if atr_d_val > 0:
                 slope_norm = slope_5d / atr_d_val
-                if   slope_norm >  0.05:
-                    slope_vote = "BULLISH"; votes_bull += 1
-                elif slope_norm < -0.05:
-                    slope_vote = "BEARISH"; votes_bear += 1
-            detail["EMA50 Slope"] = f"{slope_vote} ({slope_norm:+.3f})"
-    except Exception:
+                if   slope_norm >  0.05: slope_vote = "BULLISH"; votes_bull += 1
+                elif slope_norm < -0.05: slope_vote = "BEARISH"; votes_bear += 1
+        detail["EMA50 Slope"] = f"{slope_vote} ({slope_norm:+.3f})"
+    except Exception as _e:
+        logger.warning("get_daily_bias_v2 EMA50 Slope error: %s", _e)
         detail["EMA50 Slope"] = "NEUTRAL"
 
     detail["Votes"] = f"{votes_bull}B / {votes_bear}S"
@@ -368,15 +457,17 @@ def detect_fvg(df, price, lookback=80):
         c0 = float(sub["close"].iloc[i]);  c1 = float(sub["close"].iloc[i - 1])
         h2 = float(sub["high"].iloc[i - 2]); l2 = float(sub["low"].iloc[i - 2])
 
+        # Invalidation : bull FVG invalidé si close sous le bas du gap
         active_bulls = [(b, t) for b, t in active_bulls if c0 >= b]
+        # Invalidation : bear FVG invalidé si close au-dessus du haut du gap
         active_bears = [(b, t) for b, t in active_bears if c0 <= t]
 
         if l0 > h2 and c1 > h2:
-            size_pct = (l0 - h2) / h2 if h2 > 0 else 0.0
+            size_pct = (l0 - h2) / max(h2, 1e-9)
             if size_pct >= auto_thr:
                 active_bulls.insert(0, (h2, l0))
         elif h0 < l2 and c1 < l2:
-            size_pct = (l2 - h0) / h0 if h0 > 0 else 0.0
+            size_pct = (l2 - h0) / max(h0, 1e-9)
             if size_pct >= auto_thr:
                 active_bears.insert(0, (h0, l2))
 
@@ -404,11 +495,11 @@ STRENGTH_PAIRS = [
 ]
 
 def compute_currency_strength(dfs_h1: dict) -> dict:
-    raw = {c: 0.0 for c in CURRENCIES}
-    counts = {c: 0 for c in CURRENCIES}
+    raw    = {c: 0.0 for c in CURRENCIES}
+    counts = {c: 0   for c in CURRENCIES}
 
     for pair, df in dfs_h1.items():
-        if df is None or df.empty or len(df) < 60:
+        if not is_valid_df(df, 60):
             continue
         parts = pair.split("_")
         if len(parts) != 2:
@@ -417,27 +508,23 @@ def compute_currency_strength(dfs_h1: dict) -> dict:
         if base not in CURRENCIES or quote not in CURRENCIES:
             continue
 
-        close = df["close"]
-        ema9  = close.ewm(span=9,  adjust=False).mean().iloc[-1]
-        ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
-        ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
-        rsi_v = QuantEngine.rsi(close, 14).iloc[-1]
+        close  = df["close"]
+        ema9   = close.ewm(span=9,  adjust=False).mean().iloc[-1]
+        ema21  = close.ewm(span=21, adjust=False).mean().iloc[-1]
+        ema50  = close.ewm(span=50, adjust=False).mean().iloc[-1]
+        rsi_v  = QuantEngine.rsi(close, 14).iloc[-1]
 
-        bullish = ema9 > ema21 > ema50 and rsi_v > 50
-        bearish = ema9 < ema21 < ema50 and rsi_v < 50
-        contrib = 1.0 if bullish else (-1.0 if bearish else 0.0)
+        rsi_ok   = not pd.isna(rsi_v)
+        bullish  = ema9 > ema21 > ema50 and rsi_ok and rsi_v > 50
+        bearish  = ema9 < ema21 < ema50 and rsi_ok and rsi_v < 50
+        contrib  = 1.0 if bullish else (-1.0 if bearish else 0.0)
 
-        raw[base]  += contrib
-        raw[quote] -= contrib
-        counts[base]  += 1
-        counts[quote] += 1
+        raw[base]  += contrib;  raw[quote]  -= contrib
+        counts[base] += 1;      counts[quote] += 1
 
     scores = {}
     for c in CURRENCIES:
-        if counts[c] > 0:
-            scores[c] = raw[c] / counts[c]
-        else:
-            scores[c] = 0.0
+        scores[c] = raw[c] / counts[c] if counts[c] > 0 else 0.0
 
     vals = list(scores.values())
     s_min, s_max = min(vals), max(vals)
@@ -464,53 +551,35 @@ def get_strength_delta(ticker: str, strength_scores: dict) -> float | None:
 # ----------------------------------------------------------------
 def compute_momentum_score(df_h4, df_h1, df_m15, signal_is_bull: bool) -> int:
     score = 0
-
-    try:
-        if df_h4 is not None and len(df_h4) >= 20:
-            adx_h4, pdi_h4, mdi_h4 = QuantEngine.adx(df_h4, 14)
-            adx_v = float(adx_h4.iloc[-1])
-            di_ok = (pdi_h4.iloc[-1] > mdi_h4.iloc[-1]) if signal_is_bull else (mdi_h4.iloc[-1] > pdi_h4.iloc[-1])
+    for df_src in (df_h4, df_h1, df_m15):
+        if not is_valid_df(df_src, 20):
+            continue
+        try:
+            adx_s, pdi_s, mdi_s = QuantEngine.adx(df_src, 14)
+            adx_v = float(adx_s.iloc[-1])
+            di_ok = (pdi_s.iloc[-1] > mdi_s.iloc[-1]) if signal_is_bull \
+                    else (mdi_s.iloc[-1] > pdi_s.iloc[-1])
             if adx_v >= 25 and di_ok:
                 score += 1
-    except Exception:
-        pass
-
-    try:
-        if df_h1 is not None and len(df_h1) >= 20:
-            adx_h1, pdi_h1, mdi_h1 = QuantEngine.adx(df_h1, 14)
-            adx_v = float(adx_h1.iloc[-1])
-            di_ok = (pdi_h1.iloc[-1] > mdi_h1.iloc[-1]) if signal_is_bull else (mdi_h1.iloc[-1] > pdi_h1.iloc[-1])
-            if adx_v >= 25 and di_ok:
-                score += 1
-    except Exception:
-        pass
-
-    try:
-        if df_m15 is not None and len(df_m15) >= 20:
-            adx_m15, pdi_m15, mdi_m15 = QuantEngine.adx(df_m15, 14)
-            adx_v = float(adx_m15.iloc[-1])
-            di_ok = (pdi_m15.iloc[-1] > mdi_m15.iloc[-1]) if signal_is_bull else (mdi_m15.iloc[-1] > pdi_m15.iloc[-1])
-            if adx_v >= 25 and di_ok:
-                score += 1
-    except Exception:
-        pass
-
+        except Exception as _e:
+            logger.warning("compute_momentum_score error: %s", _e)
     return score
 
 
 # ----------------------------------------------------------------
 #  SYSTÈME DE NOTATION  V16
+#  near_pdl / near_pdh supprimés (dead code — BUG-022)
 # ----------------------------------------------------------------
 def compute_score(flip_type, candles_ago,
                   mtf_pct, mtf_dominant,
                   zone_discount, zone_premium,
-                  near_pdl, near_pdh, below_mid, above_mid,
+                  below_mid, above_mid,
                   in_bull_fvg, in_bear_fvg, fvg_near_bull, fvg_near_bear,
                   adx_val, pdi_val, mdi_val, atr_val, atr_mean,
                   midnight_bonus: bool = False,
                   adr_consumed: float | None = None):
 
-    score = 0
+    score        = 0
     score_detail = {}
 
     if flip_type is not None and candles_ago is not None:
@@ -578,7 +647,7 @@ def compute_score(flip_type, candles_ago,
     score += pts
     score_detail["ATR"] = pts
 
-    # ── Malus range épuisé (V16) ────────────────────────────────
+    # Malus range épuisé (V16)
     if adr_consumed is not None and adr_consumed > 70:
         score -= 5
         score_detail["ADR Malus"] = -5
@@ -598,30 +667,35 @@ def compute_score(flip_type, candles_ago,
 #  FLIP HMA
 # ----------------------------------------------------------------
 def find_last_hma_flip(hma_series, max_lookback=20):
+    """BUG-014 : candles_ago garanti ≥ 0."""
     colors = []
-    for i in range(len(hma_series) - 1,
-                   max(len(hma_series) - max_lookback - 2, 1), -1):
+    n      = len(hma_series)
+    for i in range(n - 1, max(n - max_lookback - 2, 1), -1):
         v_curr = hma_series.iloc[i]
         v_prev = hma_series.iloc[i - 1]
         if pd.isna(v_curr) or pd.isna(v_prev):
             continue
         colors.append((i, "GREEN" if v_curr > v_prev else "RED"))
+
     for j in range(len(colors) - 1):
         idx_curr, col_curr = colors[j]
         _,        col_prev = colors[j + 1]
         if col_curr != col_prev:
-            candles_ago = (len(hma_series) - 1) - idx_curr
+            candles_ago = max(0, (n - 1) - idx_curr)
             return ("BULL" if col_curr == "GREEN" else "BEAR"), candles_ago
     return None, None
 
 
 # ----------------------------------------------------------------
-#  FETCH OANDA
+#  FETCH OANDA — client créé par appel (thread-safe, BUG-005)
 # ----------------------------------------------------------------
 MAX_RETRIES = 3
 RETRY_DELAY = 1.5
 
-def fetch_oanda_data(client, instrument, granularity, count):
+def fetch_oanda_data(access_token: str, environment: str,
+                     instrument: str, granularity: str, count: int):
+    """Crée un client OANDA dédié pour chaque appel — thread-safe (BUG-005)."""
+    client = oandapyV20.API(access_token=access_token, environment=environment)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = instruments.InstrumentsCandles(
@@ -654,6 +728,7 @@ def fetch_oanda_data(client, instrument, granularity, count):
                 return pd.DataFrame(), "TOKEN_INVALID"
             elif "429" in err_str:
                 time.sleep(RETRY_DELAY * attempt * 3)
+                continue          # BUG-019 : continue explicite
             elif "500" in err_str or "503" in err_str:
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY * attempt)
@@ -663,7 +738,8 @@ def fetch_oanda_data(client, instrument, granularity, count):
     return pd.DataFrame(), "MAX_RETRIES"
 
 
-def test_oanda_connection(client, account_id=None):
+def test_oanda_connection(access_token: str, environment: str, account_id: str = None):
+    client = oandapyV20.API(access_token=access_token, environment=environment)
     try:
         if account_id:
             r = accounts.AccountDetails(account_id)
@@ -687,32 +763,41 @@ def test_oanda_connection(client, account_id=None):
 
 
 # ----------------------------------------------------------------
-#  FETCH STRENGTH
+#  FETCH STRENGTH — thread-safe via access_token (BUG-005)
 # ----------------------------------------------------------------
-def fetch_strength_data(client) -> dict:
+def fetch_strength_data(access_token: str, environment: str) -> dict:
     dfs = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {
-            ex.submit(fetch_oanda_data, client, pair, "H1", 100): pair
+            ex.submit(fetch_oanda_data, access_token, environment, pair, "H1", 100): pair
             for pair in STRENGTH_PAIRS
         }
         for fut in as_completed(futures):
             pair = futures[fut]
-            df, err = fut.result()
-            if not df.empty:
-                dfs[pair] = df
+            try:
+                df, err = fut.result()
+                if not df.empty:
+                    dfs[pair] = df
+            except Exception as _e:
+                logger.warning("fetch_strength_data %s: %s", pair, _e)
     return dfs
 
 
 # ----------------------------------------------------------------
-#  ANALYSE PRINCIPALE
+#  ANALYSE PRINCIPALE — thread-safe (BUG-005)
 # ----------------------------------------------------------------
-def analyze_asset(client, ticker, freshness_limit_min=30,
-                  strength_scores=None, debug_log=None):
+def analyze_asset(access_token: str, environment: str,
+                  ticker: str, freshness_limit_min: int = 30,
+                  strength_scores: dict = None,
+                  debug_log: list = None, _lock: threading.Lock = None):
 
     def _reject(reason):
         if debug_log is not None:
-            debug_log.append((ticker, reason))
+            if _lock:
+                with _lock:
+                    debug_log.append((ticker, reason))
+            else:
+                debug_log.append((ticker, reason))
         return None
 
     try:
@@ -723,37 +808,53 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         fetch_results = {}
         with ThreadPoolExecutor(max_workers=6) as ex:
             futures = {
-                ex.submit(fetch_oanda_data, client, ticker, gran, cnt): gran
+                ex.submit(fetch_oanda_data,
+                          access_token, environment, ticker, gran, cnt): gran
                 for gran, cnt in fetch_specs
             }
             for fut in as_completed(futures):
                 gran = futures[fut]
-                fetch_results[gran] = fut.result()
+                try:
+                    fetch_results[gran] = fut.result()
+                except Exception as _e:
+                    logger.error("[%s] fetch %s exception: %s", ticker, gran, _e)
+                    fetch_results[gran] = (pd.DataFrame(), str(_e))
 
-        df_m15, err_m15 = fetch_results["M15"]
-        df_h1,  _       = fetch_results["H1"]
-        df_d,   err_d   = fetch_results["D"]
-        df_4h,  _       = fetch_results["H4"]
-        df_w,   _       = fetch_results["W"]
-        df_mo,  _       = fetch_results["M"]
+        df_m15, err_m15 = fetch_results.get("M15", (pd.DataFrame(), "missing"))
+        df_h1,  _       = fetch_results.get("H1",  (pd.DataFrame(), None))
+        df_d,   err_d   = fetch_results.get("D",   (pd.DataFrame(), "missing"))
+        df_4h,  _       = fetch_results.get("H4",  (pd.DataFrame(), None))
+        df_w,   _       = fetch_results.get("W",   (pd.DataFrame(), None))
+        df_mo,  _       = fetch_results.get("M",   (pd.DataFrame(), None))
 
-        if df_m15.empty: return _reject(f"FETCH_M15: {err_m15}")
-        if df_d.empty:   return _reject(f"FETCH_D: {err_d}")
+        if not is_valid_df(df_m15): return _reject(f"FETCH_M15: {err_m15}")
+        if not is_valid_df(df_d):   return _reject(f"FETCH_D: {err_d}")
 
-        price = df_m15['close'].iloc[-1]
+        # BUG-013 : staleness check — données fraîches < 30 min
+        try:
+            last_candle_time = df_m15.index[-1]
+            if last_candle_time.tz is None:
+                last_candle_time = last_candle_time.tz_localize("UTC")
+            now_utc           = datetime.now(pytz.UTC)
+            staleness_minutes = (now_utc - last_candle_time).total_seconds() / 60
+            if staleness_minutes > 30:
+                return _reject(f"STALE_DATA: {staleness_minutes:.0f}min")
+        except Exception as _e:
+            logger.warning("[%s] staleness check error: %s", ticker, _e)
 
-        current_price_proxy = float(df_m15['close'].iloc[-1])
-        bias, bias_detail = get_daily_bias_v2(df_d, current_price=current_price_proxy)
+        price = float(df_m15['close'].iloc[-1])
+
+        bias, bias_detail = get_daily_bias_v2(df_d, current_price=price)
         bias_bull = bias in ("BULLISH", "STRONG BULLISH")
         bias_bear = bias in ("BEARISH", "STRONG BEARISH")
 
         dfs_mtf = {
-            "M":   df_mo  if not (df_mo  is None or (hasattr(df_mo,  'empty') and df_mo.empty))  else None,
-            "W":   df_w   if not (df_w   is None or (hasattr(df_w,   'empty') and df_w.empty))   else None,
-            "D":   df_d   if not df_d.empty  else None,
-            "4H":  df_4h  if not (df_4h  is None or (hasattr(df_4h,  'empty') and df_4h.empty))  else None,
-            "1H":  df_h1  if not (df_h1  is None or (hasattr(df_h1,  'empty') and df_h1.empty))  else None,
-            "15m": df_m15 if not df_m15.empty else None,
+            "M":   df_mo  if is_valid_df(df_mo)  else None,
+            "W":   df_w   if is_valid_df(df_w)   else None,
+            "D":   df_d   if is_valid_df(df_d)   else None,
+            "4H":  df_4h  if is_valid_df(df_4h)  else None,
+            "1H":  df_h1  if is_valid_df(df_h1)  else None,
+            "15m": df_m15 if is_valid_df(df_m15) else None,
         }
         mtf_pct, mtf_dominant, mtf_details = compute_mtf_analysis(dfs_mtf)
 
@@ -768,7 +869,7 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         if bias == "NEUTRAL":
             return _reject("BIAS_NEUTRAL")
 
-        if   (flip_type == "BULL" and bias_bull) or (flip_type == "BEAR" and bias_bear):
+        if (flip_type == "BULL" and bias_bull) or (flip_type == "BEAR" and bias_bear):
             bias_alignment = "ALIGNED"
         else:
             bias_alignment = "COUNTER"
@@ -784,8 +885,8 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             return _reject("PRICE_ABOVE_HMA_ON_BEAR")
 
         atr_m15  = QuantEngine.atr(df_m15, 14)
-        atr_val  = atr_m15.iloc[-1]
-        atr_mean = atr_m15.iloc[-50:].mean()
+        atr_val  = float(atr_m15.iloc[-1])
+        atr_mean = float(atr_m15.iloc[-50:].mean())
 
         in_bull_fvg, in_bear_fvg, nb_fvg, nr_fvg = detect_fvg(df_m15, price, lookback=80)
         fvg_near_bull = (nb_fvg is not None and
@@ -793,10 +894,9 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         fvg_near_bear = (nr_fvg is not None and
                          abs(price - (nr_fvg[0] + nr_fvg[1]) / 2) < atr_val * 1.0)
 
-        # ══════════════════════════════════════════════════════════════
-        #  MIDNIGHT OPEN — calculé EN PREMIER (avant la zone)
-        # ══════════════════════════════════════════════════════════════
-        midnight_open = None
+        # ── MIDNIGHT OPEN — avec validation heure exacte (BUG-010) ──
+        midnight_open             = None
+        midnight_open_approximate = False
         try:
             ny_tz     = pytz.timezone("America/New_York")
             _m15_raw  = pd.to_datetime(df_m15.index)
@@ -806,28 +906,33 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
                 m15_times = _m15_raw.tz_convert(ny_tz)
             today_ny = datetime.now(ny_tz).date()
             mn_mask  = (
-                (m15_times.date == today_ny) &
-                (m15_times.hour  == 0) &
-                (m15_times.minute == 0)
+                (np.array([t.date() for t in m15_times]) == today_ny) &
+                (np.array([t.hour   for t in m15_times]) == 0) &
+                (np.array([t.minute for t in m15_times]) == 0)
             )
             mn_c = df_m15[mn_mask]
             if mn_c.empty:
-                today_c = df_m15[m15_times.date == today_ny]
+                # Fallback : première bougie du jour — approximatif
+                today_mask = np.array([t.date() for t in m15_times]) == today_ny
+                today_c    = df_m15[today_mask]
                 if not today_c.empty:
+                    first_time = m15_times[today_mask][0]
+                    # BUG-010 : signaler l'approximation si heure != 00:00
+                    if first_time.hour != 0 or first_time.minute != 0:
+                        midnight_open_approximate = True
                     midnight_open = float(today_c["open"].iloc[0])
             else:
                 midnight_open = float(mn_c["open"].iloc[0])
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning("[%s] midnight_open error: %s", ticker, _e)
 
-        # ══════════════════════════════════════════════════════════════
-        #  ZONE DISCOUNT / PREMIUM — ICT pur
-        # ══════════════════════════════════════════════════════════════
-        _d1_ref = -2 if len(df_d) >= 2 else -1
-        pdh = float(df_d["high"].iloc[_d1_ref])
-        pdl = float(df_d["low"].iloc[_d1_ref])
+        # ── ZONE DISCOUNT / PREMIUM — BUG-001 : _d1_ref = -1 ──────
+        # df_d ne contient que des bougies complètes → iloc[-1] = J-1 (correct)
+        assert is_valid_df(df_d, 1), "df_d vide — PDH/PDL invalide"
+        pdh = float(df_d["high"].iloc[-1])
+        pdl = float(df_d["low"].iloc[-1])
 
-        if midnight_open is not None:
+        if midnight_open is not None and not midnight_open_approximate:
             in_premium       = (price > midnight_open) and (price <= pdh)
             in_discount      = (price < midnight_open) and (price >= pdl)
             in_extended_high = price > pdh
@@ -848,7 +953,6 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
             zone_premium  = in_premium
             below_mid     = in_discount
             above_mid     = in_premium
-
         else:
             d1_mid        = (pdh + pdl) / 2.0
             in_discount   = price < d1_mid
@@ -861,29 +965,28 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
                              "PREMIUM"  if in_premium  else "EQUILIBRE")
 
         midnight_bonus = False
-        if midnight_open is not None:
+        if midnight_open is not None and not midnight_open_approximate:
             if flip_type == "BULL" and price < midnight_open:
                 midnight_bonus = True
             elif flip_type == "BEAR" and price > midnight_open:
                 midnight_bonus = True
 
-        df_adx_src           = df_h1 if not (df_h1 is None or (hasattr(df_h1, 'empty') and df_h1.empty)) and len(df_h1) >= 20 else df_m15
-        adx_s, pdi_s, mdi_s = QuantEngine.adx(df_adx_src, 14)
-        adx_val_score = round(adx_s.iloc[-1], 1)
-        pdi_val = round(pdi_s.iloc[-1], 1)
-        mdi_val = round(mdi_s.iloc[-1], 1)
+        df_adx_src            = df_h1 if is_valid_df(df_h1, 20) else df_m15
+        adx_s, pdi_s, mdi_s  = QuantEngine.adx(df_adx_src, 14)
+        adx_val_score = round(float(adx_s.iloc[-1]), 1)
+        pdi_val       = round(float(pdi_s.iloc[-1]), 1)
+        mdi_val       = round(float(mdi_s.iloc[-1]), 1)
 
         # ADR (forex/metals) ou ATR (indices)
         if ticker in INDICES:
-            _atr_d_raw  = QuantEngine.atr(df_d, 14).iloc[-1]
-            adr_display = round(float(_atr_d_raw), 2) if not pd.isna(_atr_d_raw) else None
-            adr_label   = "ATR"
-            adr_consumed = None   # pas de calcul consumed pour les indices
+            _atr_d_raw   = QuantEngine.atr(df_d, 14).iloc[-1]
+            adr_display  = round(float(_atr_d_raw), 2) if not pd.isna(_atr_d_raw) else None
+            adr_label    = "ATR"
+            adr_consumed = None
         else:
             _adr_raw    = compute_adr(df_d, period=14)
-            adr_display = round(float(_adr_raw), 5) if not pd.isna(_adr_raw) else None
+            adr_display = round(float(_adr_raw), 5) if not np.isnan(_adr_raw) else None
             adr_label   = "ADR"
-            # ── ADR Consumed V16 ──────────────────────────────────
             adr_consumed = compute_adr_consumed(df_m15, midnight_open, adr_display)
             if adr_consumed is not None and np.isnan(adr_consumed):
                 adr_consumed = None
@@ -891,7 +994,6 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         score, grade, score_detail = compute_score(
             flip_type, candles_ago, mtf_pct, mtf_dominant,
             zone_discount, zone_premium,
-            False, False,
             below_mid, above_mid,
             in_bull_fvg, in_bear_fvg, fvg_near_bull, fvg_near_bear,
             adx_val_score, pdi_val, mdi_val, atr_val, atr_mean,
@@ -903,9 +1005,9 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         if strength_scores:
             strength_delta = get_strength_delta(ticker, strength_scores)
 
-        signal_is_bull = (flip_type == "BULL")
-        _df_h4 = df_4h if not (df_4h is None or (hasattr(df_4h, 'empty') and df_4h.empty)) else None
-        _df_h1 = df_h1 if not (df_h1 is None or (hasattr(df_h1, 'empty') and df_h1.empty)) else None
+        signal_is_bull = (flip_type == "BULL")   # calculé une seule fois (BUG-022)
+        _df_h4  = df_4h if is_valid_df(df_4h) else None
+        _df_h1  = df_h1 if is_valid_df(df_h1) else None
         momentum = compute_momentum_score(_df_h4, _df_h1, df_m15, signal_is_bull)
 
         sig = (("▲ LONG"  if flip_type == "BULL" else "▼ SHORT")
@@ -935,8 +1037,13 @@ def analyze_asset(client, ticker, freshness_limit_min=30,
         }
 
     except Exception as e:
+        logger.error("[%s] analyze_asset EXCEPTION: %s", ticker, e, exc_info=True)
         if debug_log is not None:
-            debug_log.append((ticker, f"EXCEPTION: {e}"))
+            if _lock:
+                with _lock:
+                    debug_log.append((ticker, f"EXCEPTION: {e}"))
+            else:
+                debug_log.append((ticker, f"EXCEPTION: {e}"))
         return None
 
 
@@ -980,6 +1087,7 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
+    # Killzone calculée une seule fois (BUG-022 — duplication supprimée)
     kz_now  = get_current_killzone()
     kz_html = (f'<span style="font-size:12px;font-family:\'IBM Plex Mono\',monospace;'
                f'color:#5a9e7a;letter-spacing:.08em;margin-left:14px">'
@@ -1008,7 +1116,14 @@ def main():
 
     ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
     ACCOUNT_ID   = st.secrets["OANDA_ACCOUNT_ID"]
-    env          = "practice"
+
+    # BUG-020 : environnement configurable via secrets
+    env = st.secrets.get("OANDA_ENVIRONMENT", "practice")
+    if env not in ("practice", "live"):
+        st.error(f"⚠️ OANDA_ENVIRONMENT invalide : `{env}` — doit être `practice` ou `live`")
+        st.stop()
+    if env == "live":
+        st.warning("⚠️ **CONNEXION COMPTE RÉEL (live)** — opérations sur capital réel")
 
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
@@ -1051,8 +1166,6 @@ def main():
         """, unsafe_allow_html=True)
         return
 
-    client = oandapyV20.API(access_token=ACCESS_TOKEN, environment=env)
-
     assets = [
         "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF",
         "AUD_USD", "USD_CAD", "NZD_USD",
@@ -1069,28 +1182,41 @@ def main():
 
     results   = []
     debug_log = []
+    _lock     = threading.Lock()
     progress  = st.progress(0)
     status    = st.empty()
     t_start   = time.time()
 
     strength_scores = {}
     with st.spinner("Calcul Currency Strength H1…"):
-        dfs_h1 = fetch_strength_data(client)
+        dfs_h1 = fetch_strength_data(ACCESS_TOKEN, env)
         strength_scores = compute_currency_strength(dfs_h1)
 
+    # BUG-017 : boucle asset parallélisée — suppression du sleep(0.15)
     with st.spinner("Analyse MTF en cours…"):
-        for i, ticker in enumerate(assets):
-            status.caption(f"⏳ {ticker}… ({i+1}/{len(assets)})")
-            res = analyze_asset(
-                client, ticker,
-                freshness_limit_min=freshness,
-                strength_scores=strength_scores,
-                debug_log=debug_log
-            )
-            if res:
-                results.append(res)
-            time.sleep(0.15)
-            progress.progress((i + 1) / len(assets))
+        completed_count = 0
+        max_workers     = min(8, len(assets))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {
+                ex.submit(
+                    analyze_asset,
+                    ACCESS_TOKEN, env, ticker,
+                    freshness, strength_scores, debug_log, _lock
+                ): ticker
+                for ticker in assets
+            }
+            for fut in as_completed(future_map):
+                ticker = future_map[fut]
+                try:
+                    res = fut.result()
+                    if res:
+                        with _lock:
+                            results.append(res)
+                except Exception as _e:
+                    logger.error("Outer future %s: %s", ticker, _e)
+                completed_count += 1
+                progress.progress(completed_count / len(assets))
+                status.caption(f"⏳ {ticker}… ({completed_count}/{len(assets)})")
 
     elapsed = round(time.time() - t_start, 1)
     status.empty()
@@ -1197,13 +1323,15 @@ def main():
         return "color:#9a7820;font-weight:700" if "⚡" in f else "color:#303040"
 
     def score_bar(score):
+        """BUG-021 : gestion correcte des scores négatifs."""
         color = "#5a9e7a" if score >= 70 else "#9a7820" if score >= 40 else "#9e4a3a"
-        width = max(4, score)
+        width = max(4, min(score, 100)) if score >= 0 else 4
+        label = str(score)                                   # affiche -5, -3, etc.
         return f"""<div style="display:flex;align-items:center;gap:8px">
           <div style="width:60px;height:4px;background:#1a1a22;border-radius:2px;overflow:hidden">
             <div style="width:{width}%;height:100%;background:{color};border-radius:2px"></div>
           </div>
-          <span style="color:{color};font-weight:700;font-size:15px">{score}</span>
+          <span style="color:{color};font-weight:700;font-size:15px">{label}</span>
         </div>"""
 
     def adr_cell(v, label="ADR", consumed: float | None = None):
@@ -1225,15 +1353,14 @@ def main():
 
         consumed = float(consumed)
 
-        # Couleur selon consommation
         if consumed < 40:
-            bar_color = "#5a9e7a"   # vert — range vierge
+            bar_color = "#5a9e7a"
             pct_color = "#5a9e7a"
         elif consumed < 70:
-            bar_color = "#9a7820"   # orange — range partiel
+            bar_color = "#9a7820"
             pct_color = "#9a7820"
         else:
-            bar_color = "#9e4a3a"   # rouge — range épuisé
+            bar_color = "#9e4a3a"
             pct_color = "#9e4a3a"
 
         fill_width = int(min(max(consumed, 0), 100))
@@ -1315,7 +1442,6 @@ def main():
   <th>Force</th>
 </tr></thead><tbody>
 """
-    active_kz = get_current_killzone()
 
     for _, row in df.iterrows():
         grade       = str(row.get("Grade", "C"))
@@ -1340,8 +1466,8 @@ def main():
         if alignment == "COUNTER":
             align_tag = '<span style="font-size:10px;color:#9e4a3a;font-weight:700;margin-left:6px">⚠ COUNTER</span>'
 
-        kz_tag = (f'<span class="kz-badge">{killzone_badge(active_kz)}</span>'
-                  if active_kz and fresh else "")
+        kz_tag = (f'<span class="kz-badge">{killzone_badge(kz_now)}</span>'
+                  if kz_now and fresh else "")
 
         mn_tag = ('<span style="font-size:10px;color:#5a7898;font-weight:700;'
                   'margin-left:6px;vertical-align:middle">🌙</span>'
@@ -1371,7 +1497,7 @@ def main():
     <div style="color:#2a2a4a;font-family:'IBM Plex Mono',monospace;font-size:10px;
                 text-align:right;margin-top:6px;letter-spacing:.06em">
       {len(df)} signal(s) · scanné en {elapsed}s · {datetime.now().strftime('%H:%M:%S')}
-      {'· <span style="color:#5a9e7a">KZ ' + active_kz + ' ACTIVE</span>' if active_kz else ''}
+      {'· <span style="color:#5a9e7a">KZ ' + kz_now + ' ACTIVE</span>' if kz_now else ''}
     </div>
     """, unsafe_allow_html=True)
 
