@@ -13,8 +13,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
 # ================================================================
-#  BLUESTAR SNIPER V16  —  ICT SIGNAL ENGINE  (AUDIT-FIXED)
-#  Corrections appliquées :
+#  BLUESTAR SNIPER V16  —  ICT SIGNAL ENGINE  (PRODUCTION READY)
+#
+#  ── AUDIT 1 (corrections V15 → FIXED) ──────────────────────────
 #  ✅  BUG-001  PDH/PDL : _d1_ref = -1 (J-1, pas J-2)
 #  ✅  BUG-002  MTF alignment calculé AVANT mutation 1H/15m
 #  ✅  BUG-003  except:pass remplacés par logs explicites
@@ -22,10 +23,10 @@ import logging
 #  ✅  BUG-005  Client OANDA créé par thread (thread-safety)
 #  ✅  BUG-006  HMA : suppression du .ewm(5) non standard
 #  ✅  BUG-007  get_tf_trend 4H : filtrage temporel corrigé
-#  ✅  BUG-009  Swing points : comparaison float avec tolérance
+#  ✅  BUG-009  Swing points : comparaison float avec tolérance ε
 #  ✅  BUG-010  midnight_open : validation de l'heure exacte
 #  ✅  BUG-013  Staleness check sur df_m15 (données stale)
-#  ✅  BUG-014  find_last_hma_flip : candles_ago sécurisé
+#  ✅  BUG-014  find_last_hma_flip : candles_ago garanti ≥ 0
 #  ✅  BUG-015  Weekly Open : lundi uniquement, semaine courante
 #  ✅  BUG-016  RSI : loss=0 → RSI=100, min_periods correct
 #  ✅  BUG-017  Boucle asset parallélisée (ThreadPoolExecutor)
@@ -35,10 +36,31 @@ import logging
 #  ✅  BUG-021  score_bar : score négatif affiché correctement
 #  ✅  BUG-022  is_valid_df() helper, duplication supprimée
 #  ✅  Dead code near_pdl/near_pdh supprimé de compute_score
+#
+#  ── AUDIT 2 (corrections FIXED → PRODUCTION) ────────────────────
+#  ✅  NEW-001  Outer pool limité à 3 workers (3×6=18 conn. OANDA)
+#  ✅  NEW-002  assert redondant supprimé (désactivé par Python -O)
+#  ✅  NEW-003  Weekly Open : > strict (exclut lundi J-7)
+#  ✅  NEW-004  compute_adr_consumed : paramètre mort supprimé
+#  ✅  NEW-005  HMA plate (v==v) : continue (faux flip supprimé)
+#  ✅  NEW-006  Logger : StreamHandler explicite (no-op basicConfig)
+#  ✅  NEW-007  ADX score : try/except explicite avec fallback 0.0
+#  ✅  NEW-008  Staleness : seuil 30→45 min (hors killzones)
+#  ✅  NEW-009  Monthly min_bars : commentaire SMA80 vs SMA200
 # ================================================================
 
 logger = logging.getLogger("bluestar_sniper")
-logging.basicConfig(level=logging.WARNING)
+# NEW-006 : handler explicite — logging.basicConfig() est une no-op en Streamlit Cloud
+# car Streamlit configure ses propres handlers avant l'import du module.
+if not logger.handlers:
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+    logger.addHandler(_log_handler)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False   # ne pas propager au root logger Streamlit
 
 # ----------------------------------------------------------------
 #  HELPER  (BUG-022)
@@ -183,8 +205,13 @@ def compute_adr(df_d: pd.DataFrame, period: int = 14) -> float:
 # ----------------------------------------------------------------
 #  ADR CONSUMED  (V16) — range consommé depuis minuit NY
 # ----------------------------------------------------------------
-def compute_adr_consumed(df_m15: pd.DataFrame, midnight_open_price: float,
+def compute_adr_consumed(df_m15: pd.DataFrame,
                          adr_value: float) -> float | None:
+    """
+    Range intraday consommé depuis minuit NY, en % de l'ADR.
+    Calcul : (high_jour - low_jour) / ADR × 100.
+    NEW-004 : paramètre mort midnight_open_price supprimé.
+    """
     if not is_valid_df(df_m15) or adr_value is None or adr_value <= 0:
         return None
     try:
@@ -222,7 +249,9 @@ def get_tf_trend(df: pd.DataFrame, tf_type: str):
     close = df['close']
 
     if tf_type in ("M", "W"):
-        min_bars = 52 if tf_type == "M" else 200
+        # NEW-009 : pour Monthly, on fetch 80 bars → SMA sera min(200,80)=SMA80, pas SMA200
+        # Le nommage sma200 est conservé pour cohérence mais représente SMA(min(200, n))
+        min_bars = 52 if tf_type == "M" else 200   # 52 months ≈ 4 ans d'historique minimum
         if len(df) < min_bars:
             return 0, 40.0, "NEUT"
         sma200 = close.rolling(min(200, len(df))).mean().iloc[-1]
@@ -382,7 +411,9 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
         # Lundi uniquement (dayofweek == 0), semaine en cours
         monday_rows = df_copy[df_copy.index.dayofweek == 0]
         current_week_mondays = monday_rows[
-            monday_rows.index >= (datetime.now(pytz.UTC) - pd.Timedelta(days=7))
+            monday_rows.index > (datetime.now(pytz.UTC) - pd.Timedelta(days=7))
+            # NEW-003 : > strict (au lieu de >=) pour exclure le lundi J-7
+            # qui correspond à la semaine PRÉCÉDENTE quand lancé un lundi
         ]
         if not current_week_mondays.empty:
             weekly_open = float(current_week_mondays['open'].iloc[0])
@@ -667,13 +698,19 @@ def compute_score(flip_type, candles_ago,
 #  FLIP HMA
 # ----------------------------------------------------------------
 def find_last_hma_flip(hma_series, max_lookback=20):
-    """BUG-014 : candles_ago garanti ≥ 0."""
+    """
+    BUG-014 : candles_ago garanti ≥ 0.
+    NEW-005  : HMA plate (v_curr == v_prev) ignorée pour éviter les faux flips.
+    """
     colors = []
     n      = len(hma_series)
     for i in range(n - 1, max(n - max_lookback - 2, 1), -1):
         v_curr = hma_series.iloc[i]
         v_prev = hma_series.iloc[i - 1]
         if pd.isna(v_curr) or pd.isna(v_prev):
+            continue
+        # HMA plate → on ignore cette bougie (ni GREEN ni RED)
+        if v_curr == v_prev:
             continue
         colors.append((i, "GREEN" if v_curr > v_prev else "RED"))
 
@@ -830,14 +867,15 @@ def analyze_asset(access_token: str, environment: str,
         if not is_valid_df(df_m15): return _reject(f"FETCH_M15: {err_m15}")
         if not is_valid_df(df_d):   return _reject(f"FETCH_D: {err_d}")
 
-        # BUG-013 : staleness check — données fraîches < 30 min
+        # BUG-013 / NEW-008 : staleness check — seuil 45 min (30 trop agressif hors KZ)
+        STALENESS_LIMIT_MIN = 45
         try:
             last_candle_time = df_m15.index[-1]
             if last_candle_time.tz is None:
                 last_candle_time = last_candle_time.tz_localize("UTC")
             now_utc           = datetime.now(pytz.UTC)
             staleness_minutes = (now_utc - last_candle_time).total_seconds() / 60
-            if staleness_minutes > 30:
+            if staleness_minutes > STALENESS_LIMIT_MIN:
                 return _reject(f"STALE_DATA: {staleness_minutes:.0f}min")
         except Exception as _e:
             logger.warning("[%s] staleness check error: %s", ticker, _e)
@@ -926,9 +964,8 @@ def analyze_asset(access_token: str, environment: str,
         except Exception as _e:
             logger.warning("[%s] midnight_open error: %s", ticker, _e)
 
-        # ── ZONE DISCOUNT / PREMIUM — BUG-001 : _d1_ref = -1 ──────
-        # df_d ne contient que des bougies complètes → iloc[-1] = J-1 (correct)
-        assert is_valid_df(df_d, 1), "df_d vide — PDH/PDL invalide"
+        # NEW-002 : assert supprimé — df_d est déjà validé ligne ~831 via is_valid_df()
+        # Un assert est désactivé par Python -O (Streamlit Cloud optimisé) → fausse sécurité
         pdh = float(df_d["high"].iloc[-1])
         pdl = float(df_d["low"].iloc[-1])
 
@@ -971,11 +1008,16 @@ def analyze_asset(access_token: str, environment: str,
             elif flip_type == "BEAR" and price > midnight_open:
                 midnight_bonus = True
 
-        df_adx_src            = df_h1 if is_valid_df(df_h1, 20) else df_m15
-        adx_s, pdi_s, mdi_s  = QuantEngine.adx(df_adx_src, 14)
-        adx_val_score = round(float(adx_s.iloc[-1]), 1)
-        pdi_val       = round(float(pdi_s.iloc[-1]), 1)
-        mdi_val       = round(float(mdi_s.iloc[-1]), 1)
+        # NEW-007 : protection explicite du calcul ADX score
+        try:
+            df_adx_src            = df_h1 if is_valid_df(df_h1, 20) else df_m15
+            adx_s, pdi_s, mdi_s  = QuantEngine.adx(df_adx_src, 14)
+            adx_val_score = round(float(adx_s.iloc[-1]), 1)
+            pdi_val       = round(float(pdi_s.iloc[-1]), 1)
+            mdi_val       = round(float(mdi_s.iloc[-1]), 1)
+        except Exception as _e:
+            logger.warning("[%s] ADX score computation failed: %s", ticker, _e)
+            adx_val_score, pdi_val, mdi_val = 0.0, 0.0, 0.0
 
         # ADR (forex/metals) ou ATR (indices)
         if ticker in INDICES:
@@ -987,7 +1029,7 @@ def analyze_asset(access_token: str, environment: str,
             _adr_raw    = compute_adr(df_d, period=14)
             adr_display = round(float(_adr_raw), 5) if not np.isnan(_adr_raw) else None
             adr_label   = "ADR"
-            adr_consumed = compute_adr_consumed(df_m15, midnight_open, adr_display)
+            adr_consumed = compute_adr_consumed(df_m15, adr_display)  # NEW-004
             if adr_consumed is not None and np.isnan(adr_consumed):
                 adr_consumed = None
 
@@ -1192,11 +1234,14 @@ def main():
         dfs_h1 = fetch_strength_data(ACCESS_TOKEN, env)
         strength_scores = compute_currency_strength(dfs_h1)
 
-    # BUG-017 : boucle asset parallélisée — suppression du sleep(0.15)
+    # NEW-001 : outer pool limité à 3 workers.
+    # Chaque analyze_asset() spawne un inner pool de 6 threads OANDA.
+    # 3 × 6 = 18 connexions simultanées max → dans les limites OANDA sans 429.
+    # Avec 8 outer workers (ancienne valeur) : 48 connexions → freeze garanti.
+    MAX_OUTER_WORKERS = 3
     with st.spinner("Analyse MTF en cours…"):
         completed_count = 0
-        max_workers     = min(8, len(assets))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        with ThreadPoolExecutor(max_workers=MAX_OUTER_WORKERS) as ex:
             future_map = {
                 ex.submit(
                     analyze_asset,
