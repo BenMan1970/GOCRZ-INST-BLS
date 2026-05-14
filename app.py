@@ -13,44 +13,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
 # ================================================================
-#  BLUESTAR SNIPER V16  —  ICT SIGNAL ENGINE  (PRODUCTION READY)
+#  BLUESTAR SNIPER V16  —  ICT SIGNAL ENGINE
 #
-#  ── AUDIT 1 (corrections V15 → FIXED) ──────────────────────────
-#  ✅  BUG-001  PDH/PDL : _d1_ref = -1 (J-1, pas J-2)
-#  ✅  BUG-002  MTF alignment calculé AVANT mutation 1H/15m
-#  ✅  BUG-003  except:pass remplacés par logs explicites
-#  ✅  BUG-004  ADX : exclusion mutuelle DM via np.where (Wilder)
-#  ✅  BUG-005  Client OANDA créé par thread (thread-safety)
-#  ✅  BUG-006  HMA : suppression du .ewm(5) non standard
-#  ✅  BUG-007  get_tf_trend 4H : filtrage temporel corrigé
-#  ✅  BUG-009  Swing points : comparaison float avec tolérance ε
-#  ✅  BUG-010  midnight_open : validation de l'heure exacte
-#  ✅  BUG-013  Staleness check sur df_m15 (données stale)
-#  ✅  BUG-014  find_last_hma_flip : candles_ago garanti ≥ 0
-#  ✅  BUG-015  Weekly Open : lundi uniquement, semaine courante
-#  ✅  BUG-016  RSI : loss=0 → RSI=100, min_periods correct
-#  ✅  BUG-017  Boucle asset parallélisée (ThreadPoolExecutor)
-#  ✅  BUG-018  Killzones en UTC fixe (DST-proof)
-#  ✅  BUG-019  Retry 429 : continue ajouté
-#  ✅  BUG-020  OANDA_ENVIRONMENT via st.secrets
-#  ✅  BUG-021  score_bar : score négatif affiché correctement
-#  ✅  BUG-022  is_valid_df() helper, duplication supprimée
-#  ✅  Dead code near_pdl/near_pdh supprimé de compute_score
-#
-#  ── AUDIT 2 (corrections FIXED → PRODUCTION) ────────────────────
-#  ✅  NEW-001  Outer pool limité à 3 workers (3×6=18 conn. OANDA)
-#  ✅  NEW-002  assert redondant supprimé (désactivé par Python -O)
-#  ✅  NEW-003  Weekly Open : > strict (exclut lundi J-7)
-#  ✅  NEW-004  compute_adr_consumed : paramètre mort supprimé
-#  ✅  NEW-005  HMA plate (v==v) : continue (faux flip supprimé)
-#  ✅  NEW-006  Logger : StreamHandler explicite (no-op basicConfig)
-#  ✅  NEW-007  ADX score : try/except explicite avec fallback 0.0
-#  ✅  NEW-008  Staleness : seuil 30→45 min (hors killzones)
-#  ✅  NEW-009  Monthly min_bars : commentaire SMA80 vs SMA200
+#  Signal engine  : HMA 20 · M15
+#  Trend filter   : MTF Institutionnel (M/W/D/4H/1H/15m)
+#  Zone ICT       : Midnight Open · Premium / Discount · PDH/PDL
+#  Momentum       : ADX Wilder · RSI · MACD · ZLEMA
+#  Volatilité     : ADR (forex/métaux) · ATR (indices)
+#  FVG            : LuxAlgo M15 — détection + mitigation auto
+#  Strength       : Currency Strength delta base/quote
+#  Scoring        : /100 — grades A+/A/B+/B/C
+#  Concurrence    : ThreadPoolExecutor · client OANDA par thread
+#  Timezone       : Killzones UTC fixe (DST-proof) · NY midnight
 # ================================================================
 
 logger = logging.getLogger("bluestar_sniper")
-# NEW-006 : handler explicite — logging.basicConfig() est une no-op en Streamlit Cloud
+# handler explicite — logging.basicConfig() est une no-op en Streamlit Cloud
 # car Streamlit configure ses propres handlers avant l'import du module.
 if not logger.handlers:
     _log_handler = logging.StreamHandler()
@@ -63,7 +41,7 @@ if not logger.handlers:
     logger.propagate = False   # ne pas propager au root logger Streamlit
 
 # ----------------------------------------------------------------
-#  HELPER  (BUG-022)
+#  HELPER
 # ----------------------------------------------------------------
 def is_valid_df(df, min_rows: int = 1) -> bool:
     """Retourne True si df est un DataFrame non-vide avec au moins min_rows lignes."""
@@ -71,7 +49,7 @@ def is_valid_df(df, min_rows: int = 1) -> bool:
 
 
 # ----------------------------------------------------------------
-#  KILLZONE DETECTOR  —  UTC fixe, DST-proof  (BUG-018)
+#  KILLZONE DETECTOR  —  UTC fixe, DST-proof
 # ----------------------------------------------------------------
 # Plages en UTC fixe :
 #   London  = 07:00-08:30 UTC  (03:00-04:30 ET)
@@ -120,7 +98,7 @@ class QuantEngine:
 
     @staticmethod
     def hma(series, period=20):
-        """HMA standard : WMA(2·WMA(n/2) - WMA(n), √n)  — sans EWM parasite (BUG-006)."""
+        """HMA standard : WMA(2·WMA(n/2) - WMA(n), √n)  — sans EWM parasite"""
         half   = int(period / 2)
         sqrt_p = int(np.sqrt(period))
         raw    = 2 * QuantEngine.wma(series, half) - QuantEngine.wma(series, period)
@@ -140,7 +118,7 @@ class QuantEngine:
 
     @staticmethod
     def adx(df, period=14):
-        """ADX Wilder avec exclusion mutuelle stricte des DM via np.where (BUG-004)."""
+        """ADX Wilder avec exclusion mutuelle stricte des DM via np.where"""
         high      = df['high']
         low       = df['low']
         prev_high = high.shift(1)
@@ -171,7 +149,7 @@ class QuantEngine:
 
     @staticmethod
     def rsi(series, period=14):
-        """RSI Wilder : gestion loss=0 → RSI=100 ; min_periods correct (BUG-016)."""
+        """RSI Wilder : gestion loss=0 → RSI=100 ; min_periods correct"""
         delta    = series.diff()
         gain     = delta.where(delta > 0, 0.0)
         loss     = (-delta.where(delta < 0, 0.0))
@@ -210,7 +188,7 @@ def compute_adr_consumed(df_m15: pd.DataFrame,
     """
     Range intraday consommé depuis minuit NY, en % de l'ADR.
     Calcul : (high_jour - low_jour) / ADR × 100.
-    NEW-004 : paramètre mort midnight_open_price supprimé.
+    paramètre mort midnight_open_price supprimé.
     """
     if not is_valid_df(df_m15) or adr_value is None or adr_value <= 0:
         return None
@@ -249,7 +227,7 @@ def get_tf_trend(df: pd.DataFrame, tf_type: str):
     close = df['close']
 
     if tf_type in ("M", "W"):
-        # NEW-009 : pour Monthly, on fetch 80 bars → SMA sera min(200,80)=SMA80, pas SMA200
+        # pour Monthly, on fetch 80 bars → SMA sera min(200,80)=SMA80, pas SMA200
         # Le nommage sma200 est conservé pour cohérence mais représente SMA(min(200, n))
         min_bars = 52 if tf_type == "M" else 200   # 52 months ≈ 4 ans d'historique minimum
         if len(df) < min_bars:
@@ -273,7 +251,7 @@ def get_tf_trend(df: pd.DataFrame, tf_type: str):
         except Exception as _e:
             logger.warning("get_tf_trend 4H ADX error: %s", _e)
 
-        # BUG-007 : filtrage journalier timezone-aware correct
+        # filtrage journalier timezone-aware correct
         try:
             df_tz = df.copy()
             if df_tz.index.tz is None:
@@ -336,7 +314,7 @@ def compute_mtf_analysis(dfs: dict):
     f1h  = 0 if (macro_trend != 0 and macro_trend != t1h)  else t1h
     f15m = 0 if (macro_trend != 0 and macro_trend != t15m) else t15m
 
-    # BUG-002 : alignment_pct calculé sur les tendances BRUTES avant mutation
+    # alignment_pct calculé sur les tendances BRUTES avant mutation
     raw_bull      = sum(TF_WEIGHTS[tf] for tf in TF_WEIGHTS
                         if results.get(tf, {}).get("trend", 0) == 1)
     raw_bear      = sum(TF_WEIGHTS[tf] for tf in TF_WEIGHTS
@@ -369,7 +347,7 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
     votes_bear = 0
     detail     = {}
 
-    # BUG-009 : comparaison float avec tolérance ε
+    # comparaison float avec tolérance ε
     def _swing_pts(series, wing=5):
         highs, lows = [], []
         arr = series.to_numpy(dtype=np.float64)
@@ -402,7 +380,7 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
     elif cur < ema21 < ema50: detail["EMA 21/50"] = "BEARISH"; votes_bear += 1
     else:                     detail["EMA 21/50"] = "NEUTRAL"
 
-    # BUG-015 : Weekly Open = premier open du lundi de la semaine courante
+    # Weekly Open = premier open du lundi de la semaine courante
     wo_vote = "NEUTRAL"
     try:
         df_copy = df_d.copy()
@@ -412,7 +390,7 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
         monday_rows = df_copy[df_copy.index.dayofweek == 0]
         current_week_mondays = monday_rows[
             monday_rows.index > (datetime.now(pytz.UTC) - pd.Timedelta(days=7))
-            # NEW-003 : > strict (au lieu de >=) pour exclure le lundi J-7
+            # > strict (au lieu de >=) pour exclure le lundi J-7
             # qui correspond à la semaine PRÉCÉDENTE quand lancé un lundi
         ]
         if not current_week_mondays.empty:
@@ -434,7 +412,7 @@ def get_daily_bias_v2(df_d: pd.DataFrame, current_price: float = None):
     else:
         detail["Close J-1"] = "NEUTRAL"
 
-    # BUG-003 : slope_norm encapsulé correctement
+    # slope_norm encapsulé correctement
     slope_vote = "NEUTRAL"
     slope_norm = 0.0
     try:
@@ -599,7 +577,7 @@ def compute_momentum_score(df_h4, df_h1, df_m15, signal_is_bull: bool) -> int:
 
 # ----------------------------------------------------------------
 #  SYSTÈME DE NOTATION  V16
-#  near_pdl / near_pdh supprimés (dead code — BUG-022)
+#  near_pdl / near_pdh non utilisés — supprimés de compute_score
 # ----------------------------------------------------------------
 def compute_score(flip_type, candles_ago,
                   mtf_pct, mtf_dominant,
@@ -699,8 +677,8 @@ def compute_score(flip_type, candles_ago,
 # ----------------------------------------------------------------
 def find_last_hma_flip(hma_series, max_lookback=20):
     """
-    BUG-014 : candles_ago garanti ≥ 0.
-    NEW-005  : HMA plate (v_curr == v_prev) ignorée pour éviter les faux flips.
+    candles_ago garanti ≥ 0.
+    HMA plate (v_curr == v_prev) ignorée pour éviter les faux flips.
     """
     colors = []
     n      = len(hma_series)
@@ -724,14 +702,14 @@ def find_last_hma_flip(hma_series, max_lookback=20):
 
 
 # ----------------------------------------------------------------
-#  FETCH OANDA — client créé par appel (thread-safe, BUG-005)
+#  FETCH OANDA
 # ----------------------------------------------------------------
 MAX_RETRIES = 3
 RETRY_DELAY = 1.5
 
 def fetch_oanda_data(access_token: str, environment: str,
                      instrument: str, granularity: str, count: int):
-    """Crée un client OANDA dédié pour chaque appel — thread-safe (BUG-005)."""
+    """Crée un client OANDA dédié pour chaque appel — thread-safe"""
     client = oandapyV20.API(access_token=access_token, environment=environment)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -765,7 +743,7 @@ def fetch_oanda_data(access_token: str, environment: str,
                 return pd.DataFrame(), "TOKEN_INVALID"
             elif "429" in err_str:
                 time.sleep(RETRY_DELAY * attempt * 3)
-                continue          # BUG-019 : continue explicite
+                continue
             elif "500" in err_str or "503" in err_str:
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY * attempt)
@@ -800,7 +778,7 @@ def test_oanda_connection(access_token: str, environment: str, account_id: str =
 
 
 # ----------------------------------------------------------------
-#  FETCH STRENGTH — thread-safe via access_token (BUG-005)
+#  FETCH STRENGTH — thread-safe via access_token
 # ----------------------------------------------------------------
 def fetch_strength_data(access_token: str, environment: str) -> dict:
     dfs = {}
@@ -821,7 +799,7 @@ def fetch_strength_data(access_token: str, environment: str) -> dict:
 
 
 # ----------------------------------------------------------------
-#  ANALYSE PRINCIPALE — thread-safe (BUG-005)
+#  ANALYSE PRINCIPALE — thread-safe
 # ----------------------------------------------------------------
 def analyze_asset(access_token: str, environment: str,
                   ticker: str, freshness_limit_min: int = 30,
@@ -867,7 +845,7 @@ def analyze_asset(access_token: str, environment: str,
         if not is_valid_df(df_m15): return _reject(f"FETCH_M15: {err_m15}")
         if not is_valid_df(df_d):   return _reject(f"FETCH_D: {err_d}")
 
-        # BUG-013 / NEW-008 : staleness check — seuil 45 min (30 trop agressif hors KZ)
+        # Staleness check — seuil 45 min (hors killzones, paires peu liquides)
         STALENESS_LIMIT_MIN = 45
         try:
             last_candle_time = df_m15.index[-1]
@@ -932,7 +910,7 @@ def analyze_asset(access_token: str, environment: str,
         fvg_near_bear = (nr_fvg is not None and
                          abs(price - (nr_fvg[0] + nr_fvg[1]) / 2) < atr_val * 1.0)
 
-        # ── MIDNIGHT OPEN — avec validation heure exacte (BUG-010) ──
+        # ── MIDNIGHT OPEN — avec validation heure exacte ──
         midnight_open             = None
         midnight_open_approximate = False
         try:
@@ -955,7 +933,7 @@ def analyze_asset(access_token: str, environment: str,
                 today_c    = df_m15[today_mask]
                 if not today_c.empty:
                     first_time = m15_times[today_mask][0]
-                    # BUG-010 : signaler l'approximation si heure != 00:00
+                    # signaler l'approximation si heure != 00:00
                     if first_time.hour != 0 or first_time.minute != 0:
                         midnight_open_approximate = True
                     midnight_open = float(today_c["open"].iloc[0])
@@ -964,7 +942,7 @@ def analyze_asset(access_token: str, environment: str,
         except Exception as _e:
             logger.warning("[%s] midnight_open error: %s", ticker, _e)
 
-        # NEW-002 : assert supprimé — df_d est déjà validé ligne ~831 via is_valid_df()
+
         # Un assert est désactivé par Python -O (Streamlit Cloud optimisé) → fausse sécurité
         pdh = float(df_d["high"].iloc[-1])
         pdl = float(df_d["low"].iloc[-1])
@@ -1008,7 +986,7 @@ def analyze_asset(access_token: str, environment: str,
             elif flip_type == "BEAR" and price > midnight_open:
                 midnight_bonus = True
 
-        # NEW-007 : protection explicite du calcul ADX score
+        # protection explicite du calcul ADX score
         try:
             df_adx_src            = df_h1 if is_valid_df(df_h1, 20) else df_m15
             adx_s, pdi_s, mdi_s  = QuantEngine.adx(df_adx_src, 14)
@@ -1029,7 +1007,7 @@ def analyze_asset(access_token: str, environment: str,
             _adr_raw    = compute_adr(df_d, period=14)
             adr_display = round(float(_adr_raw), 5) if not np.isnan(_adr_raw) else None
             adr_label   = "ADR"
-            adr_consumed = compute_adr_consumed(df_m15, adr_display)  # NEW-004
+            adr_consumed = compute_adr_consumed(df_m15, adr_display)
             if adr_consumed is not None and np.isnan(adr_consumed):
                 adr_consumed = None
 
@@ -1047,7 +1025,7 @@ def analyze_asset(access_token: str, environment: str,
         if strength_scores:
             strength_delta = get_strength_delta(ticker, strength_scores)
 
-        signal_is_bull = (flip_type == "BULL")   # calculé une seule fois (BUG-022)
+        signal_is_bull = (flip_type == "BULL")   # calculé une seule fois
         _df_h4  = df_4h if is_valid_df(df_4h) else None
         _df_h1  = df_h1 if is_valid_df(df_h1) else None
         momentum = compute_momentum_score(_df_h4, _df_h1, df_m15, signal_is_bull)
@@ -1129,7 +1107,7 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    # Killzone calculée une seule fois (BUG-022 — duplication supprimée)
+    # Killzone active — calculée une seule fois
     kz_now  = get_current_killzone()
     kz_html = (f'<span style="font-size:12px;font-family:\'IBM Plex Mono\',monospace;'
                f'color:#5a9e7a;letter-spacing:.08em;margin-left:14px">'
@@ -1159,7 +1137,7 @@ def main():
     ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
     ACCOUNT_ID   = st.secrets["OANDA_ACCOUNT_ID"]
 
-    # BUG-020 : environnement configurable via secrets
+    # environnement configurable via secrets
     env = st.secrets.get("OANDA_ENVIRONMENT", "practice")
     if env not in ("practice", "live"):
         st.error(f"⚠️ OANDA_ENVIRONMENT invalide : `{env}` — doit être `practice` ou `live`")
@@ -1234,7 +1212,7 @@ def main():
         dfs_h1 = fetch_strength_data(ACCESS_TOKEN, env)
         strength_scores = compute_currency_strength(dfs_h1)
 
-    # NEW-001 : outer pool limité à 3 workers.
+    # outer pool limité à 3 workers.
     # Chaque analyze_asset() spawne un inner pool de 6 threads OANDA.
     # 3 × 6 = 18 connexions simultanées max → dans les limites OANDA sans 429.
     # Avec 8 outer workers (ancienne valeur) : 48 connexions → freeze garanti.
@@ -1338,10 +1316,10 @@ def main():
 
     def sig_style(s):
         if "LONG"  in s and "expiré" not in s:
-            return "color:#5a9e7a;font-weight:700;font-size:16px;letter-spacing:.03em"
+            return "color:#5ab888;font-weight:700;font-size:16px;letter-spacing:.03em"
         if "SHORT" in s and "expiré" not in s:
-            return "color:#9e4a3a;font-weight:700;font-size:16px;letter-spacing:.03em"
-        return "color:#303040;font-size:12px"
+            return "color:#c05848;font-weight:700;font-size:16px;letter-spacing:.03em"
+        return "color:#484860;font-size:12px"
 
     def bias_daily_label(b):
         if b == "STRONG BULLISH": return "▲▲ STRONG BULL"
@@ -1351,24 +1329,24 @@ def main():
         return "— NEUTRAL"
 
     def bias_daily_style(b):
-        if "STRONG BULLISH" in b: return "color:#4d9467;font-weight:700;font-size:14px"
-        if "BULLISH"        in b: return "color:#3d7055;font-weight:600;font-size:14px"
-        if "STRONG BEARISH" in b: return "color:#a04848;font-weight:700;font-size:14px"
-        if "BEARISH"        in b: return "color:#7a3535;font-weight:600;font-size:14px"
-        return "color:#404055;font-size:14px"
+        if "STRONG BULLISH" in b: return "color:#5daa7a;font-weight:700;font-size:14px"
+        if "BULLISH"        in b: return "color:#4a8a65;font-weight:600;font-size:14px"
+        if "STRONG BEARISH" in b: return "color:#c05858;font-weight:700;font-size:14px"
+        if "BEARISH"        in b: return "color:#924242;font-weight:600;font-size:14px"
+        return "color:#565670;font-size:14px"
 
     def zone_style(z):
-        if "DISCOUNT" in z: return "color:#4a7898;font-weight:600"
-        if "PREMIUM"  in z: return "color:#8a6028;font-weight:600"
-        if "EXT HIGH" in z: return "color:#9e4a3a;font-weight:600;font-style:italic"
-        if "EXT LOW"  in z: return "color:#3a7a9e;font-weight:600;font-style:italic"
-        return "color:#404055"
+        if "DISCOUNT" in z: return "color:#6a9ab8;font-weight:600"
+        if "PREMIUM"  in z: return "color:#b08040;font-weight:600"
+        if "EXT HIGH" in z: return "color:#c05a48;font-weight:600;font-style:italic"
+        if "EXT LOW"  in z: return "color:#4a9ab8;font-weight:600;font-style:italic"
+        return "color:#5a5a72"
 
     def fresh_style(f):
-        return "color:#9a7820;font-weight:700" if "⚡" in f else "color:#303040"
+        return "color:#b89030;font-weight:700" if "⚡" in f else "color:#4a4a62"
 
     def score_bar(score):
-        """BUG-021 : gestion correcte des scores négatifs."""
+        """Score négatif possible (malus ADR) — affiché tel quel."""
         color = "#5a9e7a" if score >= 70 else "#9a7820" if score >= 40 else "#9e4a3a"
         width = max(4, min(score, 100)) if score >= 0 else 4
         label = str(score)                                   # affiche -5, -3, etc.
@@ -1381,7 +1359,7 @@ def main():
 
     def adr_cell(v, label="ADR", consumed: float | None = None):
         if v is None:
-            return '<span style="color:#303040">—</span>'
+            return '<span style="color:#4a4a62">—</span>'
 
         formatted = f"{v:.5f}" if v < 1.0 else f"{v:.2f}"
         tag_color = "#4a7898" if label == "ADR" else "#6a5a78"
@@ -1389,7 +1367,7 @@ def main():
         tag_html = (
             f'<span style="color:{tag_color};font-size:10px;font-family:\'IBM Plex Mono\','
             f'monospace;margin-right:4px">{label}</span>'
-            f'<span style="color:#5a6880;font-family:\'IBM Plex Mono\','
+            f'<span style="color:#7a8aa0;font-family:\'IBM Plex Mono\','
             f'monospace;font-size:13px">{formatted}</span>'
         )
 
@@ -1442,7 +1420,7 @@ def main():
                           f'font-size:12px;font-family:\'IBM Plex Mono\','
                           f'monospace;margin-left:7px">{sign}{delta:.1f}</span>')
         else:
-            delta_html = '<span style="color:#303040;margin-left:7px;font-size:11px">n/a</span>'
+            delta_html = '<span style="color:#4a4a62;margin-left:7px;font-size:11px">n/a</span>'
 
         return (f'<div style="display:flex;align-items:center">'
                 f'{bars}{delta_html}</div>')
@@ -1451,18 +1429,18 @@ def main():
 <style>
 .sc-wrap{overflow-x:auto;margin-top:4px}
 .sc-tbl{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono','Courier New',monospace;font-size:15px}
-.sc-tbl thead tr{border-bottom:2px solid #2a2a5a}
+.sc-tbl thead tr{border-bottom:2px solid #3a3a6a}
 .sc-tbl th{
   padding:10px 16px;text-align:left;
-  color:#8090c0;
+  color:#a0b0d8;
   font-size:12px;text-transform:uppercase;letter-spacing:.12em;font-weight:700;
   white-space:nowrap;
-  background:#0c0c12;
-  border-bottom:2px solid #2a2a5a;
+  background:#10101a;
+  border-bottom:2px solid #3a3a6a;
 }
-.sc-tbl td{padding:13px 16px;border-bottom:1px solid #0f0f1e;vertical-align:middle}
-.sc-tbl tr:hover td{background:#111118 !important}
-.ticker{font-size:22px;font-weight:800;color:#c8c8d8;letter-spacing:.04em;white-space:nowrap;font-family:'IBM Plex Mono',monospace}
+.sc-tbl td{padding:13px 16px;border-bottom:1px solid #1c1c2e;vertical-align:middle}
+.sc-tbl tr:hover td{background:#16161f !important}
+.ticker{font-size:22px;font-weight:800;color:#dcdce8;letter-spacing:.04em;white-space:nowrap;font-family:'IBM Plex Mono',monospace}
 .grade-pill{
   display:inline-block;padding:2px 8px;border-radius:2px;
   font-size:12px;font-weight:700;letter-spacing:.08em;
@@ -1471,8 +1449,8 @@ def main():
 .kz-badge{
   display:inline-block;padding:2px 7px;border-radius:2px;
   font-size:10px;font-weight:700;letter-spacing:.06em;
-  background:rgba(90,158,122,0.12);color:#5a9e7a;
-  border:1px solid rgba(90,158,122,0.3);margin-left:8px;vertical-align:middle
+  background:rgba(90,158,122,0.18);color:#6ab88e;
+  border:1px solid rgba(90,158,122,0.45);margin-left:8px;vertical-align:middle
 }
 </style>
 <div class="sc-wrap"><table class="sc-tbl">
@@ -1509,7 +1487,7 @@ def main():
 
         align_tag = ""
         if alignment == "COUNTER":
-            align_tag = '<span style="font-size:10px;color:#9e4a3a;font-weight:700;margin-left:6px">⚠ COUNTER</span>'
+            align_tag = '<span style="font-size:10px;color:#c05a48;font-weight:700;margin-left:6px">⚠ COUNTER</span>'
 
         kz_tag = (f'<span class="kz-badge">{killzone_badge(kz_now)}</span>'
                   if kz_now and fresh else "")
